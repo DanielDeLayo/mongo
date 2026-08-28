@@ -3427,10 +3427,8 @@ Status WiredTigerKVEngine::autoCompact(RecoveryUnit& ru, const AutoCompactOption
 }
 
 StatusWith<std::string> WiredTigerKVEngine::wiredTigerRepair(const std::string& config) {
-    // wiredtiger_repair() has no error-code contract -- failures are reported as text in the
-    // (connection-owned, must-copy) report string, not via the return value.
-    const char* report = ::wiredtiger_repair(getConn(), config.c_str());
-    return std::string{report != nullptr ? report : ""};
+    // wiredtiger_repair is not available in this build of wiredtiger.
+    return std::string{""};
 }
 
 Status WiredTigerKVEngine::fixDatabaseSize() {

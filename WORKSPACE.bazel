@@ -222,3 +222,22 @@ mongot_extension_signing_key()
 load("//bazel/db_contrib_tool:db_contrib_tool.bzl", "db_contrib_tool")
 
 db_contrib_tool()
+
+local_repository(
+    name = "increment_and_freeze",
+    path = "/Users/danieldelayo/Gits/Increment-and-Freeze",
+)
+
+new_local_repository(
+    name = "wiredtiger_local",
+    path = "/Users/danieldelayo/Gits/wiredtiger",
+    build_file_content = """
+package(default_visibility = ["//visibility:public"])
+filegroup(
+    name = "headers",
+    srcs = glob(["**/*.h", "**/*.i", "**/*.in"]),
+)
+exports_files(glob(["**"]))
+""",
+)
+

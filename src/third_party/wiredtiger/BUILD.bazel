@@ -2,7 +2,7 @@ load("@bazel_skylib//lib:selects.bzl", "selects")
 load("//bazel:mongo_src_rules.bzl", "TCMALLOC_DEPS", "mongo_cc_binary", "mongo_cc_library", "symlink")
 load("//bazel/config:generate_config_header.bzl", "generate_config_header")
 load(
-    "//src/third_party/wiredtiger:dist/filelist.bzl",
+    "@wiredtiger_local//:dist/filelist.bzl",
     "WT_FILELIST",
     "WT_FILELIST_ARM64_HOST",
     "WT_FILELIST_DARWIN_HOST",
@@ -26,6 +26,7 @@ selects.config_setting_group(
 
 WT_DEFINES = [
     "HAVE_VERBOSE",
+    "HAVE_ANALYZE_CACHE",
     "HAVE_BUILTIN_EXTENSION_ZLIB",
     "HAVE_BUILTIN_EXTENSION_SNAPPY",
     "HAVE_BUILTIN_EXTENSION_ZSTD",
@@ -53,6 +54,7 @@ WT_DEFINES = [
 })
 
 WT_CCFLAGS = [
+    "-Iexternal/wiredtiger_local/src/include",
     "-Isrc/third_party/wiredtiger/src/include",
 ] + select({
     "@platforms//os:windows": ["/wd4090"],
@@ -60,9 +62,9 @@ WT_CCFLAGS = [
 }) + select({
     "@platforms//os:linux": ["-Isrc/third_party/wiredtiger/build_linux"],
     "@platforms//os:windows": ["-Isrc/third_party/wiredtiger/build_win"],
-    "@platforms//os:macos": ["-Isrc/third_party/wiredtiger/build_darwin"],
+    "@platforms//os:macos": ["-Isrc/third_party/wiredtiger/build_darwin", "-Iexternal/wiredtiger_local/oss/apple"],
 }) + select({
-    "@platforms//cpu:s390x": ["-Isrc/third_party/wiredtiger/src/checksum/zseries"],
+    "@platforms//cpu:s390x": ["-Iexternal/wiredtiger_local/src/checksum/zseries", "-Isrc/third_party/wiredtiger/src/checksum/zseries"],
     "//conditions:default": [],
 }) + select({
     "@platforms//os:linux": [
@@ -88,17 +90,17 @@ generate_config_header(
 
 generate_config_header(
     name = "wt_version_header",
-    additional_inputs = ["cmake/configs/version.cmake"],
+    additional_inputs = ["@wiredtiger_local//:cmake/configs/version.cmake"],
     checks = ":wt_version_header.py",
     extra_definitions = {},
     logfile = "wt_version.log",
     output = "wiredtiger.h",
-    template = "src/include/wiredtiger.h.in",
+    template = "@wiredtiger_local//:src/include/wiredtiger.h.in",
 )
 
 symlink(
     name = "wiredtiger_ext_header",
-    input = "src/include/wiredtiger_ext.h",
+    input = "@wiredtiger_local//:src/include/wiredtiger_ext.h",
     output = "wiredtiger_ext.h",
 )
 
@@ -110,8 +112,8 @@ WT_PUBLIC_HEADERS = [
 mongo_cc_library(
     name = "wiredtiger_checksum",
     srcs = [
-        "src/checksum/software/checksum.c",
-    ] + glob(["**/*.h"]) + [
+        "@wiredtiger_local//:src/checksum/software/checksum.c",
+        "@wiredtiger_local//:headers",
         "wt_config_header",
     ],
     hdrs = WT_PUBLIC_HEADERS,
@@ -120,12 +122,12 @@ mongo_cc_library(
     local_defines = WT_DEFINES,
     srcs_select = [
         {
-            "@platforms//cpu:aarch64": WT_FILELIST_ARM64_HOST,
-            "@platforms//cpu:x86_64": WT_FILELIST_X86_HOST,
-            "@platforms//cpu:ppc64le": WT_FILELIST_POWERPC_HOST,
+            "@platforms//cpu:aarch64": ["@wiredtiger_local//:" + f for f in WT_FILELIST_ARM64_HOST],
+            "@platforms//cpu:x86_64": ["@wiredtiger_local//:" + f for f in WT_FILELIST_X86_HOST],
+            "@platforms//cpu:ppc64le": ["@wiredtiger_local//:" + f for f in WT_FILELIST_POWERPC_HOST],
             "@platforms//cpu:s390x": [
-                WT_FILELIST_ZSERIES_HOST[0],
-                WT_FILELIST_ZSERIES_HOST[1],
+                "@wiredtiger_local//:" + WT_FILELIST_ZSERIES_HOST[0],
+                "@wiredtiger_local//:" + WT_FILELIST_ZSERIES_HOST[1],
             ],
         },
     ],
@@ -133,15 +135,17 @@ mongo_cc_library(
 
 mongo_cc_library(
     name = "wiredtiger",
-    srcs = [file for file in WT_FILELIST if file != "src/checksum/software/checksum.c"] + [
-        "ext/compressors/snappy/snappy_compress.c",
-        "ext/compressors/zlib/zlib_compress.c",
-        "ext/compressors/zstd/zstd_compress.c",
-    ] + glob(["**/*.h"]) + ["wt_config_header"],
+    srcs = ["@wiredtiger_local//:" + file for file in WT_FILELIST if file != "src/checksum/software/checksum.c"] + [
+        "@wiredtiger_local//:ext/compressors/snappy/snappy_compress.c",
+        "@wiredtiger_local//:ext/compressors/zlib/zlib_compress.c",
+        "@wiredtiger_local//:ext/compressors/zstd/zstd_compress.c",
+        "@wiredtiger_local//:headers",
+        "wt_config_header",
+    ],
     hdrs = WT_PUBLIC_HEADERS,
     copts = WT_CCFLAGS,
     includes = ["."] + select({
-        "@platforms//os:macos": ["oss/apple"],
+        "@platforms//os:macos": ["oss/apple", "external/wiredtiger_local/oss/apple"],
         "//conditions:default": [],
     }),
     linkopts = select({
@@ -151,9 +155,9 @@ mongo_cc_library(
     local_defines = WT_DEFINES,
     srcs_select = [
         {
-            "@platforms//os:linux": WT_FILELIST_POSIX_HOST + WT_FILELIST_LINUX_HOST,
-            "@platforms//os:macos": WT_FILELIST_POSIX_HOST + WT_FILELIST_DARWIN_HOST,
-            "@platforms//os:windows": [file for file in WT_FILELIST_WINDOWS_HOST if file != "src/os_win/os_futex.c"],
+            "@platforms//os:linux": ["@wiredtiger_local//:" + f for f in (WT_FILELIST_POSIX_HOST + WT_FILELIST_LINUX_HOST)],
+            "@platforms//os:macos": ["@wiredtiger_local//:" + f for f in (WT_FILELIST_POSIX_HOST + WT_FILELIST_DARWIN_HOST)],
+            "@platforms//os:windows": ["@wiredtiger_local//:" + file for file in WT_FILELIST_WINDOWS_HOST if file != "src/os_win/os_futex.c"],
         },
     ],
     deps = [
@@ -161,12 +165,13 @@ mongo_cc_library(
         "//src/third_party/snappy",
         "//src/third_party/zstandard:zstd",
         "@zlib",
+        "@increment_and_freeze//:iaf_api",
     ] + TCMALLOC_DEPS,
 )
 
 mongo_cc_binary(
     name = "wt",
-    srcs = glob(["src/utilities/*.c"]) + glob(["**/*.h"]) + ["wt_config_header"],
+    srcs = ["@wiredtiger_local//:src/utilities/main.c", "@wiredtiger_local//:headers", "wt_config_header"],
     copts = WT_CCFLAGS + select({
         "@platforms//os:windows": ["/wd4996"],
         "//conditions:default": [],

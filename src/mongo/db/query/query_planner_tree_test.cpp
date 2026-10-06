@@ -862,6 +862,59 @@ TEST_F(QueryPlannerTest, TooManyToExplode) {
         "{pattern: {a: 1, b: 1, c:1, d:1}}}}}}}");
 }
 
+// The number of index scans explodeForSort would create is the product of the per-field point
+// counts. When that product overflows size_t it can wrap to a small value (e.g. 65536^4 == 2^64
+// == 0), bypassing the maxScansToExplode guard. We cap the scan count to prevent this and fall
+// back to a blocking sort.
+TEST_F(QueryPlannerTest, ExplodeScanCountDoesNotOverflow) {
+    addIndex(BSON("a" << 1 << "b" << 1 << "c" << 1 << "d" << 1 << "e" << 1));
+
+    BSONObjBuilder queryBob;
+    for (std::string_view field : {"a", "b", "c", "d"}) {
+        BSONObjBuilder fieldBob(queryBob.subobjStart(field));
+        BSONArrayBuilder inArr(fieldBob.subarrayStart("$in"));
+        for (int i = 0; i < 65536; ++i) {
+            inArr.append(i);
+        }
+    }
+
+    runQuerySortProj(queryBob.obj(), BSON("e" << 1), BSONObj());
+
+    // The planner must cap here: a collection scan with a blocking sort, and a single index scan
+    // with a blocking sort. Crucially, no mergeSort.
+    assertNumSolutions(2U);
+    assertSolutionExists(R"(
+        {
+            sort: {
+                pattern: {e: 1},
+                limit: 0,
+                type: 'simple',
+                node: {
+                    cscan: {dir: 1}
+                }
+            }
+        }
+    )");
+    assertSolutionExists(R"(
+        {
+            fetch: {
+                node: {
+                    sort: {
+                        pattern: {e: 1},
+                        limit: 0,
+                        type: 'default',
+                        node: {
+                            ixscan: {
+                                pattern: {a: 1, b: 1, c: 1, d: 1, e: 1}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    )");
+}
+
 // SERVER-13618: test that exploding scans for sort works even
 // if we must reverse the scan direction.
 TEST_F(QueryPlannerTest, ExplodeMustReverseScans) {
@@ -3008,6 +3061,49 @@ TEST_F(QueryPlannerTest, LockstepOrEnumerationWithNestedOrWhereInnerOrHitsEnumer
         }
     }
     )");
+}
+
+// Lockstep OR enumeration composes with index intersection: each $or branch enumerates its
+// single-index plans as well as an intersection plan, and lockstep iteration walks all
+// combinations, including one where every branch uses an intersection.
+TEST_F(QueryPlannerTest, LockstepOrEnumerationWithIndexIntersection) {
+    params.mainCollectionInfo.options = QueryPlannerParams::NO_TABLE_SCAN |
+        QueryPlannerParams::ENUMERATE_OR_CHILDREN_LOCKSTEP | QueryPlannerParams::INDEX_INTERSECTION;
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("b" << 1));
+    addIndex(BSON("c" << 1));
+    addIndex(BSON("d" << 1));
+
+    runQuery(fromjson("{$or: [{a: 1, b: 1}, {c: 1, d: 1}]}"));
+
+    // Each branch has three choices (index on the first field, index on the second field, and an
+    // andSorted intersection of both), giving 3 * 3 = 9 combinations, all within the OR
+    // enumeration limit.
+    assertNumSolutions(9U);
+
+    // The lockstep-prioritized "both branches use their first index" plan.
+    assertSolutionExists(
+        "{or: {nodes: ["
+        "{fetch: {filter: {b: 1}, node: {ixscan: {filter: null, pattern: {a: 1}}}}},"
+        "{fetch: {filter: {d: 1}, node: {ixscan: {filter: null, pattern: {c: 1}}}}}]}}");
+
+    // Both branches use an index intersection.
+    assertSolutionExists(
+        "{or: {nodes: ["
+        "{fetch: {filter: {a: 1, b: 1}, node: {andSorted: {nodes: ["
+        "{ixscan: {filter: null, pattern: {a: 1}}},"
+        "{ixscan: {filter: null, pattern: {b: 1}}}]}}}},"
+        "{fetch: {filter: {c: 1, d: 1}, node: {andSorted: {nodes: ["
+        "{ixscan: {filter: null, pattern: {c: 1}}},"
+        "{ixscan: {filter: null, pattern: {d: 1}}}]}}}}]}}");
+
+    // A mixed combination: one branch intersected, the other on a single index.
+    assertSolutionExists(
+        "{or: {nodes: ["
+        "{fetch: {filter: {a: 1, b: 1}, node: {andSorted: {nodes: ["
+        "{ixscan: {filter: null, pattern: {a: 1}}},"
+        "{ixscan: {filter: null, pattern: {b: 1}}}]}}}},"
+        "{fetch: {filter: {d: 1}, node: {ixscan: {filter: null, pattern: {c: 1}}}}}]}}");
 }
 
 TEST_F(QueryPlannerTest, NoOrSolutionsIfMaxOrSolutionsIsZero) {

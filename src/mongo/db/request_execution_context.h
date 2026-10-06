@@ -41,7 +41,8 @@ public:
         : _opCtx(opCtx),
           _message(std::move(message)),
           _dbmsg(std::make_unique<DbMessage>(_message.get())),
-          _started(started) {}
+          _started(started),
+          _hasMoreToComeFlag(OpMsg::isFlagSet(_message.get(), OpMsg::kMoreToCome)) {}
 
     auto getOpCtx() const {
         dassert(_isOnClientThread());
@@ -60,6 +61,11 @@ public:
     DbMessage& getDbMessage() const {
         dassert(_isOnClientThread() && _dbmsg);
         return *_dbmsg.get();
+    }
+
+    bool hasMoreToComeFlag() const {
+        dassert(_isOnClientThread());
+        return _hasMoreToComeFlag;
     }
 
     void setRequest(OpMsgRequest request) {
@@ -86,6 +92,19 @@ public:
     otel::traces::Span& getOtelSpan() {
         dassert(_isOnClientThread() && _otelSpan);
         return *_otelSpan;
+    }
+
+    void setTelemetryContext(std::shared_ptr<otel::TelemetryContext> telemetryContext) {
+        dassert(_isOnClientThread());
+        _telemetryContext = std::move(telemetryContext);
+    }
+    std::shared_ptr<otel::TelemetryContext>& getTelemetryContext() {
+        dassert(_isOnClientThread());
+        return _telemetryContext;
+    }
+    const std::shared_ptr<otel::TelemetryContext>& getTelemetryContext() const {
+        dassert(_isOnClientThread());
+        return _telemetryContext;
     }
 
     void setCommand(Command* command) {
@@ -115,9 +134,11 @@ private:
     boost::optional<Message> _message;
     std::unique_ptr<DbMessage> _dbmsg;
     const Date_t _started;
+    bool _hasMoreToComeFlag;
     boost::optional<OpMsgRequest> _request;
     Command* _command = nullptr;
     std::unique_ptr<rpc::ReplyBuilderInterface> _replyBuilder;
+    std::shared_ptr<otel::TelemetryContext> _telemetryContext;
     boost::optional<otel::traces::Span> _otelSpan;
 };
 

@@ -6,6 +6,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/sharding_environment/shard_id.h"
 #include "mongo/util/modules.h"
 
@@ -14,6 +15,10 @@
 namespace mongo {
 
 namespace [[MONGO_MOD_PARENT_PRIVATE]] shard_catalog_commit {
+
+void logShardCatalogCommandOplogEntry(OperationContext* opCtx,
+                                      repl::MutableOplogEntry& oplogEntry,
+                                      const char* opName);
 
 /**
  * Deletes the collection and chunk metadata from the shard catalog
@@ -62,7 +67,8 @@ void commitRenameOfCollectionMetadata(OperationContext* opCtx,
  */
 void commitCollectionMetadataLocally(OperationContext* opCtx,
                                      const NamespaceString& nss,
-                                     bool isDbPrimaryShard = false);
+                                     bool isDbPrimaryShard = false,
+                                     bool commitAllowChunkOperations = false);
 
 /**
  * Persists collection and chunk metadata into the durable shard catalog during the setFCV
@@ -103,6 +109,12 @@ void commitChunkOperationsMetadataLocally(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           const std::vector<BSONObj>& newChunks,
                                           bool receivingFirstChunk = false);
+
+/**
+ * Clears every known CSR entry on the node, based on local CSS knowledge, without changing
+ * durable shard catalog metadata (config.shard.catalog.collections/chunks).
+ */
+void commitInvalidateAllCollectionMetadata(OperationContext* opCtx);
 
 }  // namespace shard_catalog_commit
 

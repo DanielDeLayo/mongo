@@ -36,6 +36,7 @@ export const commandsRemovedFromMongodSinceLastLTS = [
     "mergeChunks",
     "testCommandFeatureFlaggedOnLatestFCV",
     "testCommandFeatureFlaggedOnLatestFCV82",
+    "testCommandFeatureFlaggedOnLatestFCV83",
     "getChangeStreamState", // Removed in v8.3
     "setChangeStreamState", // Removed in v8.3
     "_configsvrCleanupReshardCollection",
@@ -78,7 +79,7 @@ export const commandsAddedToMongodSinceLastLTS = [
     "_configsvrStopShardDraining",
     "_shardsvrMergeChunks",
     "_configsvrCommitShardRemoval",
-    "testCommandFeatureFlaggedOnLatestFCV83",
+    "testCommandFeatureFlaggedOnLatestFCV91",
     "_shardsvrRecreateRangeDeletionTasks",
     "_shardsvrRecreateRangeDeletionTasksParticipant",
     "_shardsvrUpgradeDowngradeViewlessTimeseries",
@@ -101,4 +102,8 @@ export const commandsAddedToMongodSinceLastLTS = [
     "_configsvrCommitSplitChunk",
     "_shardsvrCheckMetadataConsistencySecondaryParticipant",
     "wiredTigerRepair",
+    "getMetricsFilteringAllowlist",
+    "updateMetricsFilteringAllowlist",
+    "clearJoinPlanCache",
+    "repairReplicatedMetadata",
 ];

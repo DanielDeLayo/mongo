@@ -1,14 +1,6 @@
 // Copyright (c) MongoDB, Inc.
 // SPDX-License-Identifier: SSPL-1.0
 
-#include <boost/cstdint.hpp>
-#include <boost/move/utility_core.hpp>
-#include <boost/none.hpp>
-#include <boost/optional.hpp>
-#include <boost/optional/optional.hpp>
-#include <boost/smart_ptr.hpp>
-#include <fmt/format.h>
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
@@ -138,6 +130,15 @@
 #include <utility>
 #include <vector>
 
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <fmt/format.h>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 
@@ -261,11 +262,10 @@ Status ShardingCatalogManager::createIndexOnUuidForConfigShards(OperationContext
 
     if (performCreation) {
         const bool unique = true;
-        const auto result =
-            createIndexOnConfigCollection(opCtx,
-                                          NamespaceString::kConfigsvrShardsNamespace,
-                                          BSON(ShardType::uuid() << 1),
-                                          unique);
+        const auto result = sharding_util::createIndexesOnCollectionAtStepUp(
+            opCtx,
+            NamespaceString::kConfigsvrShardsNamespace,
+            {IndexSpec_ForCatalog{BSON(ShardType::uuid() << 1), unique}});
         if (!result.isOK()) {
             return result.withContext("couldn't create uuid_1 index on config.shards");
         }
@@ -532,7 +532,7 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
     auto newTopologyTime = VectorClockMutable::get(opCtx)->tickClusterTime(1);
 
     ShardType shardType;
-    shardType.setHandle(ShardHandle(ShardId(shardName), boost::none));
+    shardType.setName(shardName);
     shardType.setHost(targeter->connectionString().toString());
     shardType.setTopologyTime(newTopologyTime.asTimestamp());
 
@@ -598,7 +598,7 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
     shardRegistry->reload(opCtx);
     tassert(9870600,
             "Shard not found in ShardRegistry after committing addShard",
-            shardRegistry->getShard(opCtx, ShardRef(shardType.getName())).isOK());
+            shardRegistry->getShard(opCtx, shardType.getName()).isOK());
 
     topology_change_helpers::hangAddShardBeforeUpdatingClusterCardinalityParameterFailpoint(opCtx);
 

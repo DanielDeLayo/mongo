@@ -33,9 +33,17 @@ ReplicaSetWriteBlockState* ReplicaSetWriteBlockState::get(OperationContext* opCt
 
 void ReplicaSetWriteBlockState::enableReplicaSetWriteBlocking(
     ReplicaSetWritesBlockReasonEnum reason) {
-    _writeBlockInfo.store(WriteBlockInfo{.blocked = true, .reason = reason});
+    const auto previousInfo =
+        _writeBlockInfo.swap(WriteBlockInfo{.blocked = true, .reason = reason});
+    if (!previousInfo.blocked) {
+        _replicaSetWritesBlockCounters[static_cast<size_t>(reason)].fetchAndAdd(1);
+        LOGV2(12097000, "Blocking replica set writes", "reason"_attr = idl::serialize(reason));
+    }
+}
+
+void ReplicaSetWriteBlockState::incrementReplicaSetWritesBlockCounter(
+    ReplicaSetWritesBlockReasonEnum reason) {
     _replicaSetWritesBlockCounters[static_cast<size_t>(reason)].fetchAndAdd(1);
-    LOGV2(12097000, "Blocking replica set writes", "reason"_attr = idl::serialize(reason));
 }
 
 void ReplicaSetWriteBlockState::disableReplicaSetWriteBlocking() {
@@ -44,9 +52,6 @@ void ReplicaSetWriteBlockState::disableReplicaSetWriteBlocking() {
         LOGV2(12097001,
               "Unblocking replica set writes",
               "reason"_attr = idl::serialize(previousInfo.reason));
-    } else {
-        LOGV2(12097003,
-              "disableReplicaSetWriteBlocking called but replica set writes were not blocked");
     }
 }
 
@@ -61,15 +66,15 @@ void ReplicaSetWriteBlockState::checkReplicaSetWritesAllowed(
     if (!writesAllowed) {
         switch (opType) {
             case ReplicaSetWriteBlockRejectedWriteOp::kInsert:
-                _replicaSetWriteBlockRejectedInserts.fetchAndAdd(1);
+                _replicaSetWritesBlockRejectedInserts.fetchAndAdd(1);
                 break;
             case ReplicaSetWriteBlockRejectedWriteOp::kUpdate:
-                _replicaSetWriteBlockRejectedUpdates.fetchAndAdd(1);
+                _replicaSetWritesBlockRejectedUpdates.fetchAndAdd(1);
                 break;
         }
         uasserted(
             ErrorCodes::ReplicaSetWritesBlocked,
-            fmt::format("Replica set write blocked, reason: {}", idl::serialize(info.reason)));
+            fmt::format("Replica set writes blocked, reason: {}", idl::serialize(info.reason)));
     }
 }
 
@@ -97,7 +102,9 @@ Status ReplicaSetWriteBlockState::checkIfConvertToCappedAllowedToStart(
         !nss.isOnInternalDb()) {
         return Status(
             ErrorCodes::ReplicaSetWritesBlocked,
-            fmt::format("convertToCapped blocked, reason: {}", idl::serialize(info.reason)));
+            fmt::format(
+                "convertToCapped blocked because replica set writes are blocked, reason: {}",
+                idl::serialize(info.reason)));
     }
     return Status::OK();
 }
@@ -117,14 +124,14 @@ void ReplicaSetWriteBlockState::checkReplicaSetDeletionsAllowed(OperationContext
         nss.isSystemDotProfile();
     if (!deletesAllowed) {
         const auto info = _writeBlockInfo.load();
-        _replicaSetWriteBlockRejectedDeletes.fetchAndAdd(1);
+        _replicaSetWritesBlockRejectedDeletes.fetchAndAdd(1);
         uasserted(
             ErrorCodes::ReplicaSetWritesBlocked,
             fmt::format("Replica set writes blocked, reason: {}", idl::serialize(info.reason)));
     }
 }
 
-bool ReplicaSetWriteBlockState::isReplicaSetDeletionsBlockingEnabled_forTest() const {
+bool ReplicaSetWriteBlockState::isReplicaSetDeletionsBlockingEnabled() const {
     return _deletionsBlocked.load();
 }
 
@@ -152,11 +159,11 @@ void ReplicaSetWriteBlockState::appendReplicaSetWriteBlockRejectionMetrics(
     BSONObjBuilder& bob) const {
     BSONObjBuilder sub(bob.subobjStart("replicaSetWritesBlockRejected"));
     sub.appendNumber("inserts",
-                     static_cast<long long>(_replicaSetWriteBlockRejectedInserts.load()));
+                     static_cast<long long>(_replicaSetWritesBlockRejectedInserts.load()));
     sub.appendNumber("updates",
-                     static_cast<long long>(_replicaSetWriteBlockRejectedUpdates.load()));
+                     static_cast<long long>(_replicaSetWritesBlockRejectedUpdates.load()));
     sub.appendNumber("deletes",
-                     static_cast<long long>(_replicaSetWriteBlockRejectedDeletes.load()));
+                     static_cast<long long>(_replicaSetWritesBlockRejectedDeletes.load()));
 }
 
 

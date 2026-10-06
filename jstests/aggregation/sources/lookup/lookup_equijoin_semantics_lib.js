@@ -34,6 +34,13 @@ export const JoinAlgorithm = {
         sparse: true,
         strategy: "DynamicIndexedLoopJoin",
     },
+    // A single-path wildcard index is also sparse-like, so DILJ applies the same null/missing
+    // guard as DILJ_Asc.
+    DILJ_Wildcard: {
+        name: "DILJ_Wildcard",
+        wildcard: true,
+        strategy: "DynamicIndexedLoopJoin",
+    },
 };
 
 export function setupCollections(testConfig, localRecords, foreignRecords, foreignField) {
@@ -43,7 +50,9 @@ export function setupCollections(testConfig, localRecords, foreignRecords, forei
 
     foreignColl.drop();
     assert.commandWorked(foreignColl.insert(foreignRecords));
-    if (currentJoinAlgorithm.indexType) {
+    if (currentJoinAlgorithm.wildcard) {
+        assert.commandWorked(foreignColl.createIndex({"$**": 1}));
+    } else if (currentJoinAlgorithm.indexType) {
         const indexSpec = {[foreignField]: currentJoinAlgorithm.indexType};
         const indexOptions = currentJoinAlgorithm.sparse ? {sparse: true} : {};
         assert.commandWorked(foreignColl.createIndex(indexSpec, indexOptions));
@@ -738,7 +747,7 @@ export function runTests(testConfig) {
             localField: "b",
             foreignRecords: docs,
             foreignField: "a.x",
-            idsExpectedToMatch: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            idsExpectedToMatch: [0, 1, 2, 3, 4, 5, 6, 7, 8],
         });
 
         runTest_SingleForeignRecord(testConfig, {
@@ -755,7 +764,7 @@ export function runTests(testConfig) {
             localField: "b",
             foreignRecords: docs,
             foreignField: "a.x",
-            idsExpectedToMatch: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            idsExpectedToMatch: [0, 1, 2, 3, 4, 5, 6, 7, 8],
         });
     })();
 
@@ -787,7 +796,7 @@ export function runTests(testConfig) {
             localField: "b",
             foreignRecords: docs,
             foreignField: "a.b.c",
-            idsExpectedToMatch: [0, 1, 2, 3, 4, 5, 6, 7],
+            idsExpectedToMatch: [0, 1, 3, 4, 6, 7],
         });
     })();
 
@@ -939,7 +948,7 @@ export function runTests(testConfig) {
             localField: "b",
             foreignRecords: docs,
             foreignField: "a.x",
-            idsExpectedToMatch: [3, 4, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33, 34],
+            idsExpectedToMatch: [3, 4, 12, 13, 20, 21, 22, 23],
         });
 
         runTest_SingleForeignRecord(testConfig, {
@@ -1018,12 +1027,14 @@ export function runTests(testConfig) {
             idsExpectedToMatch: [0, 1, 2, 3, 4, 5],
         });
         // Matching to null is inconsistent between collection-scan-based joins (NLJ/HJ), which
-        // match [10, 11], and index-based joins (INLJ), which do not. DILJ_Asc falls back to a
-        // collection scan for null/missing local keys, so it matches the scan-based result.
+        // match [10, 11], and index-based joins (INLJ), which do not. DILJ_Asc/DILJ_Wildcard fall
+        // back to a collection scan for null/missing local keys, so they match the scan-based
+        // result.
         const S64221 =
             currentJoinAlgorithm == JoinAlgorithm.NLJ ||
             currentJoinAlgorithm == JoinAlgorithm.HJ ||
-            currentJoinAlgorithm == JoinAlgorithm.DILJ_Asc
+            currentJoinAlgorithm == JoinAlgorithm.DILJ_Asc ||
+            currentJoinAlgorithm == JoinAlgorithm.DILJ_Wildcard
                 ? [10, 11]
                 : [];
         runTest_SingleLocalRecord(testConfig, {
@@ -1032,7 +1043,7 @@ export function runTests(testConfig) {
             localField: "b",
             foreignRecords: docs,
             foreignField: "a.0.x",
-            idsExpectedToMatch: [0, 1, 2, 3, 4, 5].concat(S64221),
+            idsExpectedToMatch: [0, 1, 2, 3, 4].concat(S64221),
         });
     })();
 

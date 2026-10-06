@@ -118,7 +118,6 @@ enum [[MONGO_MOD_NEEDS_REPLACEMENT]] StageType {
     STAGE_EQ_LOOKUP,
     STAGE_EQ_LOOKUP_UNWIND,
     STAGE_SEARCH,
-    STAGE_WINDOW,
     STAGE_SENTINEL,
     STAGE_HASH_JOIN_EMBEDDING_NODE,
     STAGE_NESTED_LOOP_JOIN_EMBEDDING_NODE,
@@ -151,6 +150,6 @@ inline bool isSortStageType(StageType stageType) {
 
 struct QuerySolutionNode;
 
-std::string_view nodeStageTypeToString(const QuerySolutionNode* node);
+std::string_view nodeStageTypeToString(const QuerySolutionNode* node, bool brief = false);
 
 }  // namespace mongo

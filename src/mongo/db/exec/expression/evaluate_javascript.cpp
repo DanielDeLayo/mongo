@@ -1,6 +1,7 @@
 // Copyright (c) MongoDB, Inc.
 // SPDX-License-Identifier: SSPL-1.0
 
+#include "mongo/db/exec/convert_utils.h"
 #include "mongo/db/exec/expression/evaluate.h"
 #include "mongo/db/pipeline/make_js_function.h"
 #include "mongo/db/query/query_execution_knobs_gen.h"
@@ -37,10 +38,8 @@ Value evaluate(const ExpressionFunction& expr,
     if (expr.getAssignFirstArgToThis()) {
         // For defense-in-depth, The $where case will pass a field path expr carrying $$CURRENT as
         // the only element of the array.
-        auto args = argValue.getArray();
-        uassert(31422,
-                "field path $$CURRENT must be the only element in args",
-                argValue.getArrayLength() == 1);
+        const auto& args = argValue.getArray();
+        uassert(31422, "field path $$CURRENT must be the only element in args", args.size() == 1);
 
         BSONObj thisBSON = args[0].getDocument().toBson();
         scope->setObject("obj", thisBSON);
@@ -130,6 +129,8 @@ void extract2Args(const BSONObj& args, BSONElement* elts) {
 BSONObj emitFromJS(const BSONObj& args, void* data) {
     BSONElement elts[2];
     extract2Args(args, elts);
+    convert_utils::uassertValidUserConstructedBinData(elts[0]);
+    convert_utils::uassertValidUserConstructedBinData(elts[1]);
     EmitState* emitState = EmitStateGuard::get();
     MutableDocument md;
     if (elts[0].type() == BSONType::undefined) {

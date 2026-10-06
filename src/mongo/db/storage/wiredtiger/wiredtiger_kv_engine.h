@@ -250,6 +250,8 @@ public:
     StatusWith<int64_t> getIndexStorageSize(
         OperationContext* opCtx, const std::vector<std::string>& indexIdents) const override;
 
+    StatusWith<int64_t> getSharedHistoryStoreStorageSize(OperationContext* opCtx) const override;
+
     void setRecordStoreExtraOptions(const std::string& options);
 
     bool isEphemeral() const override {
@@ -258,26 +260,9 @@ public:
 
     BlindWritePolicy chooseBlindWritePolicy(OperationContext* opCtx) override;
 
-    Status insertIntoIdent(RecoveryUnit& ru,
-                           std::string_view ident,
-                           IdentKey key,
-                           std::span<const char> value,
-                           BlindWritePolicy policy) override;
-
-    Status updateInIdent(RecoveryUnit& ru,
-                         std::string_view ident,
-                         IdentKey key,
-                         std::span<const char> value,
-                         BlindWritePolicy policy) override;
-
-    StatusWith<UniqueBuffer> getFromIdent(RecoveryUnit& ru,
-                                          std::string_view ident,
-                                          IdentKey key) override;
-
-    Status deleteFromIdent(RecoveryUnit& ru,
-                           std::string_view ident,
-                           IdentKey key,
-                           BlindWritePolicy policy) override;
+    std::unique_ptr<KVEngineDirectCrudCursor> getDirectCursor(RecoveryUnit& ru,
+                                                              std::string_view ident,
+                                                              BlindWritePolicy policy) override;
 
     virtual Status alterMetadata(std::string_view uri, std::string_view config) {
         MONGO_UNREACHABLE;
@@ -341,7 +326,7 @@ public:
      * schemaEpoch.
      */
     virtual void publishIdent(WiredTigerRecoveryUnit& ru,
-                              std::string_view ident,
+                              const std::string& uri,
                               uint64_t schemaEpoch) = 0;
 
 protected:
@@ -513,7 +498,6 @@ public:
     Status dropIdent(RecoveryUnit& ru,
                      std::string_view ident,
                      bool identHasSizeInfo,
-                     const StorageEngine::DropIdentCallback& onDrop,
                      boost::optional<uint64_t> schemaEpoch,
                      bool waitForLocks) override;
 
@@ -571,13 +555,15 @@ public:
 
     void setLastMaterializedLsn(uint64_t lsn) final;
 
-    void setRecoveryCheckpointMetadata(std::string_view checkpointMetadata) final;
+    Status setRecoveryCheckpointMetadata(std::string_view checkpointMetadata) final;
 
     void promoteToLeader() final;
 
+    void demoteToFollower() final;
+
     void setStableTimestamp(Timestamp stableTimestamp, bool force) override;
 
-    void setStepDownTimestamp(Timestamp stepDownTimestamp) override;
+    void setStepDownTimestamp(WithLock, Timestamp stepDownTimestamp) override;
 
     void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
 
@@ -618,12 +604,14 @@ public:
     void pinAllDurableTimestamp(uint64_t ts) override;
     void unpinAllDurableTimestamp(uint64_t ts) override;
     void publishIdent(WiredTigerRecoveryUnit& ru,
-                      std::string_view ident,
+                      const std::string& uri,
                       uint64_t schemaEpoch) override;
 
     bool usesSchemaEpochs() const override {
         return _usesSchemaEpochs;
     }
+    boost::optional<uint64_t> getStableSchemaEpoch() override;
+    void setStableSchemaEpoch(uint64_t schemaEpoch) override;
 
     bool supportsReadConcernSnapshot() const final;
 
@@ -643,6 +631,7 @@ public:
     Timestamp getStepDownTimestamp() const override;
     Timestamp getOldestTimestamp() const override;
     Timestamp getCheckpointTimestamp() const override;
+    boost::optional<uint64_t> getStepDownEpoch() const;
 
     void syncSizeInfo(bool sync) const;
 
@@ -680,19 +669,7 @@ public:
      * Controls whether or not WiredTigerConnection::waitUntilDurable() updates the
      * JournalListener.
      */
-    enum class UseJournalListener {
-        // Standard path: JournalListener may take Global IX (e.g. to write the oplog
-        // truncate-after point on a primary). Used by JournalFlusher's periodic cycle and any
-        // direct waitUntilDurable() caller that does not already hold the global lock.
-        kUpdate,
-
-        // Caller already holds the global lock in a mode incompatible with IX (typically MODE_S
-        // held by fsyncLockWorker). JournalListener must take a path that does not require IX,
-        // so it skips the oplog truncate-after-point write. It still produces a token so
-        // onDurable advances durableOpTime in-memory. The truncate-after-point write is deferred
-        // to JournalFlusher's next cycle after the global lock is released.
-        kUpdateUnderReadLock,
-    };
+    enum class UseJournalListener { kUpdate, kSkip };
 
     /**
      * Waits until all commits that happened before this call are made durable.
@@ -755,13 +732,7 @@ public:
 
     Status fixDatabaseSize() override;
 
-    Status pauseOrResumeAutoCompactForWriteBlock(
-        RecoveryUnit&, bool pause, const std::vector<std::string_view>& excludedIdents) override;
-
-    boost::optional<AutoCompactOptions> getActiveAutoCompactOptions() const {
-        std::lock_guard lk(_autoCompactMutex);
-        return _activeAutoCompactOptions;
-    }
+    Status pauseAutoCompactForReplicaSetWritesBlock(RecoveryUnit&) override;
 
     bool hasOngoingLiveRestore() override;
 
@@ -843,12 +814,11 @@ public:
         return _eventHandler.isWtConnReadyForStatsCollection();
     }
 
-private:
-    struct IdentToDrop {
-        std::string uri;
-        StorageEngine::DropIdentCallback callback;
-    };
+    std::unique_lock<std::mutex> lockStepDown() override {
+        return std::unique_lock(_stepdownMutex);
+    }
 
+private:
     Status _reconfigureAutoCompact(RecoveryUnit& ru, const AutoCompactOptions& options);
 
     Status _createRecordStore(const rss::PersistenceProvider& provider,
@@ -930,6 +900,8 @@ private:
     // Wrapped method call to WT_SESSION::drop that handles sub-level error codes if applicable.
     Status _drop(WiredTigerSession& session, const char* uri, const char* config);
 
+    int _publishIdent(WiredTigerRecoveryUnit& ru, const std::string& uri, uint64_t schemaEpoch);
+
     mutable std::mutex _oldestActiveTransactionTimestampCallbackMutex;
     StorageEngine::OldestActiveTransactionTimestampCallback
         _oldestActiveTransactionTimestampCallback;
@@ -965,7 +937,11 @@ private:
     Atomic<std::uint64_t> _stableTimestamp;
 
     // The last stepdown timestamp we've set for the storage engine, if any.
-    Atomic<std::uint64_t> _stepDownTimestamp;
+    Atomic<Timestamp> _stepDownTimestamp;
+    std::mutex _stepdownMutex;
+
+    // Last successful publication. Retained across role changes.
+    synchronized_value<std::uint64_t> _lastPublishedMaterializedLsn{0};
 
     // Timestamp of data at startup. Used internally to advise checkpointing and recovery to a
     // timestamp. Provided by replication layer because WT does not persist timestamps.
@@ -1028,10 +1004,6 @@ private:
 
     const bool _supportsTableLogging;
     const bool _usesSchemaEpochs;
-
-    mutable std::mutex _autoCompactMutex;
-    boost::optional<AutoCompactOptions> _activeAutoCompactOptions;
-    boost::optional<AutoCompactOptions> _autoCompactOptionsForRestore;
 
     // Protects _pinnedAllDurableTimestamps. Only acquired by pin/unpin writers.
     // Readers use _minPinnedTimestamp instead, which writers publish atomically

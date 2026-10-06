@@ -6,7 +6,6 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/crypto/fle_field_schema_gen.h"
-#include "mongo/db/admission/write_throttler_admission_context.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -214,7 +213,13 @@ public:
 
     class Invocation final : public InvocationBaseGen {
     public:
-        using InvocationBaseGen::InvocationBaseGen;
+        Invocation(OperationContext* opCtx,
+                   const Command* command,
+                   const OpMsgRequest& opMsgRequest)
+            : InvocationBaseGen(opCtx, command, opMsgRequest) {
+            Variables::validateRuntimeConstantsArePermitted(opCtx,
+                                                            request().getLegacyRuntimeConstants());
+        }
 
         bool supportsWriteConcern() const final {
             return true;
@@ -304,15 +309,8 @@ void CmdFindAndModify::Invocation::explain(OperationContext* opCtx,
     curOp->beginQueryPlanningTimer();
 
     auto requestAndMsg = [&]() {
-        if (request().getEncryptionInformation()) {
-            {
-                std::lock_guard<Client> lk(*opCtx->getClient());
-                CurOp::get(opCtx)->setShouldOmitDiagnosticInformation(lk, true);
-            }
-
-            if (!request().getEncryptionInformation()->getCrudProcessed().value_or(false)) {
-                return processFLEFindAndModifyExplainMongod(opCtx, request());
-            }
+        if (prepareForFLERewrite(opCtx, request().getEncryptionInformation())) {
+            return processFLEFindAndModifyExplainMongod(opCtx, request());
         }
 
         return std::pair{request(), OpMsgRequest()};
@@ -448,14 +446,8 @@ write_ops::FindAndModifyCommandReply CmdFindAndModify::Invocation::typedRun(
     auto [preConditions, isTimeseriesLogicalRequest] =
         timeseries::getCollectionPreConditionsAndIsTimeseriesLogicalRequest(
             opCtx, req.getNamespace(), request(), /*expectedUUID=*/boost::none);
-    if (req.getEncryptionInformation().has_value()) {
-        {
-            std::lock_guard<Client> lk(*opCtx->getClient());
-            curOp.setShouldOmitDiagnosticInformation(lk, true);
-        }
-        if (!req.getEncryptionInformation()->getCrudProcessed().get_value_or(false)) {
-            return processFLEFindAndModify(opCtx, req);
-        }
+    if (prepareForFLERewrite(opCtx, req.getEncryptionInformation())) {
+        return processFLEFindAndModify(opCtx, req);
     }
 
     auto nsString = req.getNamespace();
@@ -465,8 +457,7 @@ write_ops::FindAndModifyCommandReply CmdFindAndModify::Invocation::typedRun(
     static_cast<const CmdFindAndModify*>(definition())->collectMetrics(req);
 
     auto disableDocumentValidation = req.getBypassDocumentValidation().value_or(false);
-    auto fleCrudProcessed = write_ops_exec::getFleCrudProcessed(
-        opCtx, req.getEncryptionInformation(), nsString.tenantId());
+    auto fleCrudProcessed = write_ops_exec::getFleCrudProcessed(req.getEncryptionInformation());
 
     DisableDocumentSchemaValidationRequestedByUserIfTrue docSchemaValidationDisabler(
         opCtx, disableDocumentValidation);
@@ -478,10 +469,13 @@ write_ops::FindAndModifyCommandReply CmdFindAndModify::Invocation::typedRun(
 
     const auto stmtId = req.getStmtId().value_or(0);
     if (opCtx->isRetryableWrite()) {
+        RetryableWritesStats::get(opCtx)->incrementRetryableCommandsCount();
         const auto txnParticipant = TransactionParticipant::get(opCtx);
         if (auto entry = txnParticipant.checkStatementExecutedAndFetchOplogEntry(opCtx, stmtId)) {
             RetryableWritesStats::get(opCtx)->incrementRetriedCommandsCount();
             RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
+            RetryableWritesStats::get(opCtx)->recordRetriedWriteDelay(
+                opCtx->fastClockSource().now() - entry->getWallClockTime());
 
             // Use a SideTransactionBlock since 'parseOplogEntryForFindAndModify' might need to
             // fetch a pre/post image from the oplog and if this is a retry inside an in-progress
@@ -550,11 +544,6 @@ write_ops::FindAndModifyCommandReply CmdFindAndModify::Invocation::typedRun(
                                           docFound,
                                           preConditions,
                                           isTimeseriesLogicalRequest);
-            if (!isTimeseriesLogicalRequest) {
-                // TODO(SERVER-130908): Remove this temporary recording once write counts are
-                // tracked with higher fidelity.
-                recordWriteThrottlerCostForReconciliation(opCtx, &curOp);
-            }
             recordStatsForTopCommand(opCtx);
             return buildResponse(boost::none, true /* isRemove */, docFound);
         } else {
@@ -595,11 +584,6 @@ write_ops::FindAndModifyCommandReply CmdFindAndModify::Invocation::typedRun(
                                                       &updateRequest,
                                                       preConditions,
                                                       isTimeseriesLogicalRequest);
-                    if (!isTimeseriesLogicalRequest) {
-                        // TODO(SERVER-130908): Remove this temporary recording once write counts
-                        // are tracked with higher fidelity.
-                        recordWriteThrottlerCostForReconciliation(opCtx, &curOp);
-                    }
                     recordStatsForTopCommand(opCtx);
                     return buildResponse(updateResult, req.getRemove().value_or(false), docFound);
 

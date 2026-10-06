@@ -412,4 +412,59 @@ TEST(HistogramImplWithAttributesTest, SerializationWithMultipleAttributesBucketC
                                      << 4LL)));
 }
 
+template <typename T>
+class NoopHistogramTest : public testing::Test {};
+
+TYPED_TEST_SUITE(NoopHistogramTest, HistogramTypes);
+
+TYPED_TEST(NoopHistogramTest, RecordDoesNotThrow) {
+    Histogram<TypeParam>& histogram = *NoopHistogram<TypeParam>::instance();
+    // The Histogram interface exposes no read-back, so there is nothing on the NoopHistogram itself
+    // to observe; this only confirms record() is callable and does not throw.
+    histogram.record(0);
+    histogram.record(std::numeric_limits<TypeParam>::max());
+    histogram.record(42, {});
+}
+
+TYPED_TEST(NoopHistogramTest, InstanceIsShared) {
+    EXPECT_EQ(NoopHistogram<TypeParam>::instance(), NoopHistogram<TypeParam>::instance());
+}
+
+TEST(HistogramBucketKeyCacheTest, BucketCountsOutputIsStableAcrossRepeatedSerialization) {
+    auto histogram = createHistogramBucketCountsFormatExplicitBoundaries<int64_t>({2, 4});
+    histogram->record(3);
+
+    BSONObj first = histogram->serializeToBson("h");
+    BSONObj second = histogram->serializeToBson("h");
+
+    ASSERT_BSONOBJ_EQ(first, second);
+    ASSERT_EQ(first.getObjectField("h").getIntField("totalCount"), 1);
+}
+
+#ifdef MONGO_CONFIG_OTEL
+TEST(HistogramBucketKeyCacheTest, BucketKeysSurviveReset) {
+    auto histogram = createHistogramBucketCountsFormatExplicitBoundaries<int64_t>({2, 4});
+    histogram->record(3);
+    BSONObj before = histogram->serializeToBson("h");
+
+    auto meter = opentelemetry::metrics::Provider::GetMeterProvider()->GetMeter("test_meter");
+    histogram->reset(meter.get());
+
+    BSONObj after = histogram->serializeToBson("h");
+    // Same field names, counts zeroed.
+    ASSERT_EQ(before.getObjectField("h").nFields(), after.getObjectField("h").nFields());
+    ASSERT_EQ(after.getObjectField("h").getIntField("totalCount"), 0);
+}
+#endif  // MONGO_CONFIG_OTEL
+
+TEST(HistogramBucketCountsTest, EmitsZeroBuckets) {
+    auto histogram = createHistogramBucketCountsFormatExplicitBoundaries<int64_t>({2, 4});
+    histogram->record(3);
+
+    BSONObj hist = histogram->serializeToBson("h").getObjectField("h").getOwned();
+
+    ASSERT_TRUE(hist.hasField("(-inf, 2)"));
+    ASSERT_TRUE(hist.hasField("[4, inf)"));
+}
+
 }  // namespace mongo::otel::metrics

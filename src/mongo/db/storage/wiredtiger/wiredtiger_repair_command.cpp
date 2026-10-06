@@ -1,31 +1,5 @@
-/**
- *    Copyright (C) 2026-present MongoDB, Inc.
- *
- *    This program is free software: you can redistribute it and/or modify
- *    it under the terms of the Server Side Public License, version 1,
- *    as published by MongoDB, Inc.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    Server Side Public License for more details.
- *
- *    You should have received a copy of the Server Side Public License
- *    along with this program. If not, see
- *    <http://www.mongodb.com/licensing/server-side-public-license>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the Server Side Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_contract.h"
@@ -107,17 +81,26 @@ std::string quoteConfigValue(std::string_view value) {
     return quoted;
 }
 
-// Builds the wiredtiger_repair() config for whichever read-only sub-command is present. The caller
-// (typedRun) has already enforced that exactly one of the fetch sub-commands is set.
+// Builds the wiredtiger_repair() config for whichever sub-command is present. The caller
+// (typedRun) has already enforced that exactly one sub-command is set.
 std::string buildRepairConfig(const WiredTigerRepairCommandRequest& request) {
     const auto& fetchDatabaseSize = request.getFetchDatabaseSize();
     const auto& fetchMetadata = request.getFetchMetadata();
+    const auto& fixBtreeSize = request.getFixBtreeSize();
 
     WtConfigBuilder config;
     if (fetchDatabaseSize) {
         WtConfigBuilder sub;
         sub.append("local", fetchDatabaseSize->getLocal() ? "true" : "false");
         config.append("fetch_database_size", sub);
+    } else if (fixBtreeSize) {
+        WtConfigBuilder sub;
+        if (auto uri = fixBtreeSize->getUri()) {
+            // An omitted uri means "repair every stable file", an explicitly empty one is rejected.
+            uassert(ErrorCodes::BadValue, "fixBtreeSize uri must not be empty", !uri->empty());
+            sub.append("uri", quoteConfigValue(*uri));
+        }
+        config.append("fix_btree_size", sub);
     } else {
         WtConfigBuilder sub;
         sub.append("local", fetchMetadata->getLocal() ? "true" : "false");
@@ -147,8 +130,9 @@ public:
         return "WiredTiger maintenance command. Requires the 'wiredtiger' action privilege "
                "(ActionType::wiredtiger), which is not held by any built-in role by default. "
                "Provide exactly one of fetchDatabaseSize / fetchMetadata (read-only, via "
-               "wiredtiger_repair) or fixDatabaseSize (recomputes the disaggregated database size "
-               "via a checkpoint).";
+               "wiredtiger_repair), fixBtreeSize (repairs a btree's size metadata via "
+               "wiredtiger_repair; omit uri to repair every stable file), or fixDatabaseSize "
+               "(recomputes the disaggregated database size via a checkpoint).";
     }
 
     bool adminOnly() const override {
@@ -173,27 +157,31 @@ public:
         Response typedRun(OperationContext* opCtx) {
             const auto& req = request();
             const bool fixDatabaseSize = req.getFixDatabaseSize().value_or(false);
+            const bool fixBtreeSize = req.getFixBtreeSize().has_value();
             const int subCommands = req.getFetchDatabaseSize().has_value() +
-                req.getFetchMetadata().has_value() + (fixDatabaseSize ? 1 : 0);
+                req.getFetchMetadata().has_value() + (fixDatabaseSize ? 1 : 0) +
+                (fixBtreeSize ? 1 : 0);
             uassert(ErrorCodes::InvalidOptions,
                     "wiredTigerRepair requires exactly one sub-command (fetchDatabaseSize, "
-                    "fetchMetadata, or fixDatabaseSize)",
+                    "fetchMetadata, fixBtreeSize, or fixDatabaseSize)",
                     subCommands == 1);
 
             auto* storageEngine = opCtx->getServiceContext()->getStorageEngine();
 
             // Global lock keeps the storage engine from shutting down mid-operation.
-            // fixDatabaseSize (a checkpoint) needs MODE_IX with an explicit LocalWrite intent --
+            // The fixing sub-commands (fixDatabaseSize and fixBtreeSize both persist corrected
+            // metadata via a checkpoint) need MODE_IX with an explicit LocalWrite intent --
             // otherwise the IntentRegistry treats it as a replicated write and rejects it on
             // secondaries.
+            const bool writes = fixDatabaseSize || fixBtreeSize;
             Lock::GlobalLock globalLock{
                 opCtx,
-                fixDatabaseSize ? MODE_IX : MODE_IS,
+                writes ? MODE_IX : MODE_IS,
                 Date_t::max(),
                 Lock::InterruptBehavior::kThrow,
                 Lock::GlobalLockOptions{.skipFlowControlTicket = true,
                                         .skipRSTLLock = true,
-                                        .explicitIntent = fixDatabaseSize
+                                        .explicitIntent = writes
                                             ? rss::consensus::IntentRegistry::Intent::LocalWrite
                                             : rss::consensus::IntentRegistry::Intent::Read}};
 

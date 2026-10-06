@@ -1,9 +1,11 @@
 // Tests server parameter information shown by explain.
 // @tags: [
+//   uses_explain,
 //   does_not_support_stepdowns,
 //   # TODO SERVER-30466
 //   does_not_support_causal_consistency,
-//   requires_fcv_62,
+//   # The cost-based ranker parameters were added to explain in 9.1.
+//   requires_fcv_91,
 // ]
 
 const coll = db.explain_server_params;
@@ -19,6 +21,10 @@ const expectedParamList = [
     "internalQueryProhibitBlockingMergeOnMongoS",
     "internalQueryFacetMaxOutputDocSizeBytes",
     "internalQueryFrameworkControl",
+    "internalQueryPlanRanker",
+    "internalQueryCBRCEMode",
+    "internalQueryMixedPlanRankingStrategy",
+    "featureFlagCostBasedRanker",
 ];
 
 assert(result.hasOwnProperty("serverParameters"), result);

@@ -1,5 +1,5 @@
 export var MetadataConsistencyChecker = (function () {
-    const run = (mongos, ignoreInconsistenciesTempWorkaround = false) => {
+    const run = (mongos) => {
         const adminDB = mongos.getDB("admin");
 
         // The isTransientError() function is responsible for setting an error as transient and
@@ -10,6 +10,15 @@ export var MetadataConsistencyChecker = (function () {
             // Treat this as transient for gRPC so metadata consistency hooks don’t fail spuriously.
             if (mongos.isGRPC() && e.code == ErrorCodes.CallbackCanceled) {
                 jsTest.log("Treating `CallbackCanceled` as transient for gRPC streams!");
+                return true;
+            }
+
+            const isStepdownSuite =
+                Boolean(TestData.runningWithShardStepdowns) ||
+                Boolean(TestData.runningWithStepdowns);
+            if (isStepdownSuite && e.code === ErrorCodes.CallbackCanceled) {
+                // Metadata consistency check can fail with CallbackCanceled if a node gets
+                // killed or steps down while the check is establishing cursors on it.
                 return true;
             }
 
@@ -63,7 +72,9 @@ export var MetadataConsistencyChecker = (function () {
 
             // Since bucket collections are not created atomically with their view, it may happen
             // that checkMetadataConsistency interleaves with the creation steps in case of stepdown
-            const isStepdownSuite = Boolean(TestData.runningWithShardStepdowns);
+            const isStepdownSuite =
+                Boolean(TestData.runningWithShardStepdowns) ||
+                Boolean(TestData.runningWithStepdowns);
             if (isStepdownSuite) {
                 for (let i = inconsistencies.length - 1; i >= 0; i--) {
                     if (inconsistencies[i].type == "MalformedTimeseriesBucketsCollection") {
@@ -84,52 +95,6 @@ export var MetadataConsistencyChecker = (function () {
                         inconsistencies.splice(i, 1); // Remove inconsistency
                     }
                 }
-            }
-
-            // Temporary workaround: tolerate these inconsistencies until linked tickets are fixed.
-            const shouldIgnoreInconsistencyTempWorkaround = (inconsistency) => {
-                if (inconsistency.type !== "InconsistentShardCatalogCollectionMetadata") {
-                    return false;
-                }
-                const details = inconsistency.details;
-                if (!details) {
-                    return false;
-                }
-                const innerDetails = details.details;
-                if (!innerDetails) {
-                    return false;
-                }
-
-                // TODO (SERVER-130722): Re-enable this check.
-                const isSessionsCollectionPrimaryMismatch =
-                    details.namespace === "config.system.sessions" &&
-                    innerDetails.field === "isPrimary" &&
-                    innerDetails.source === "inMemoryShardCatalog" &&
-                    innerDetails.isUnowned === true &&
-                    innerDetails.isPrimary === true;
-
-                // TODO (SERVER-131045): Re-enable this check.
-                const isPausedMigrationShardCatalogEntryMismatch =
-                    innerDetails.field === "shardCatalogEntry" &&
-                    innerDetails.source === "inMemoryShardCatalog" &&
-                    innerDetails.shardCatalog &&
-                    innerDetails.globalCatalog &&
-                    !innerDetails.shardCatalog.hasOwnProperty("allowChunkOperations") &&
-                    innerDetails.globalCatalog.allowChunkOperations === false;
-
-                return (
-                    isSessionsCollectionPrimaryMismatch ||
-                    isPausedMigrationShardCatalogEntryMismatch
-                );
-            };
-            if (ignoreInconsistenciesTempWorkaround) {
-                inconsistencies = inconsistencies.filter((inconsistency) => {
-                    if (!shouldIgnoreInconsistencyTempWorkaround(inconsistency)) {
-                        return true;
-                    }
-                    jsTest.log.info("Ignored metadata inconsistency (workaround)", {inconsistency});
-                    return false;
-                });
             }
 
             assert.eq(

@@ -9,11 +9,14 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/matcher/path.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/modules.h"
 
 #include <cstddef>
 
 namespace mongo {
+
+struct DepsTracker;
 
 /**
  * TODO SERVER-114832 Break audit dependency on this class.
@@ -25,6 +28,13 @@ public:
     virtual ~MatchableDocument() {}
 
     virtual BSONObj toBSON() const = 0;
+
+    /**
+     * @return the source Document, if any
+     */
+    virtual boost::optional<const Document&> getSourceDocument() const {
+        return boost::none;
+    }
 
     /**
      * The newly returned ElementIterator is allowed to keep a pointer to path.
@@ -58,11 +68,28 @@ public:
 
 class BSONMatchableDocument : public MatchableDocument {
 public:
-    BSONMatchableDocument(const BSONObj& obj);
-    ~BSONMatchableDocument() override;
+    BSONMatchableDocument(const BSONObj& obj, const Document* source = nullptr)
+        : _obj(obj), _source(source) {}
+
+    ~BSONMatchableDocument() override = default;
+
+    void reset(BSONObj obj, const Document* source = nullptr) {
+        tassert(13179700,
+                "Cannot reset BSONMatchableDocument while iterator is in use",
+                !_iteratorUsed);
+        _obj = std::move(obj);
+        _source = source;
+    }
 
     BSONObj toBSON() const override {
         return _obj;
+    }
+
+    boost::optional<const Document&> getSourceDocument() const override {
+        if (!_source) {
+            return boost::none;
+        }
+        return *_source;
     }
 
     ElementIterator* allocateIterator(const ElementPath* path) const override {
@@ -83,8 +110,9 @@ public:
 
 private:
     BSONObj _obj;
+    const Document* _source;
     mutable BSONElementIterator _iterator;
-    mutable bool _iteratorUsed;
+    mutable bool _iteratorUsed = false;
 };
 
 /**

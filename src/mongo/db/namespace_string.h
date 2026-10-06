@@ -58,13 +58,11 @@ public:
     // Name for the collection storing persistent document samples.
     static constexpr std::string_view kStatsSamplesCollectionName{"system.stats.samples"};
 
+    // Name for the collection storing persistent per-field statistics, e.g. NDV sketches.
+    static constexpr std::string_view kStatsFieldStatsCollectionName{"system.stats.field_stats"};
+
     // Name for the profile collection
     static constexpr std::string_view kSystemDotProfileCollectionName{"system.profile"};
-
-    // Name for fastcount - replicated collection size and count - collections.
-    static constexpr std::string_view kReplicatedFastCountStore{"fast_count_metadata_store"};
-    static constexpr std::string_view kReplicatedFastCountStoreTimestamps{
-        "fast_count_metadata_store_timestamps"};
 
     // Names of privilege document collections
     static constexpr std::string_view kSystemUsers{"system.users"};
@@ -96,6 +94,16 @@ public:
 
     // Prefix for the temporary collection used by the $out stage.
     static constexpr std::string_view kOutTmpCollectionPrefix{"tmp.agg_out."};
+
+    // Prefix of temporary collection names used by convertToCapped
+    // (tmp%%%%%.convertToCapped.<originalColl>).
+    static constexpr std::string_view kConvertToCappedTmpCollectionModelPrefix{
+        "tmp%%%%%.convertToCapped."};
+
+    // Temporary collection name model used by renameCollection
+    // (tmp%%%%%.renameCollection, including system.buckets.* for timeseries).
+    static constexpr std::string_view kRenameCollectionTmpCollectionModel{
+        "tmp%%%%%.renameCollection"};
 
     // Maintainers Note: The large set of `NamespaceString`-typed static data
     // members of the `NamespaceString` class representing system-reserved
@@ -434,6 +442,9 @@ public:
     bool isStatsSamplesCollection() const {
         return coll() == kStatsSamplesCollectionName;
     }
+    bool isFieldStatsCollection() const {
+        return coll() == kStatsFieldStatsCollectionName;
+    }
     bool isPrivilegeCollection() const {
         if (!isAdminDB()) {
             return false;
@@ -534,7 +545,9 @@ public:
     static bool isFLE2StateCollection(std::string_view coll);
 
     /**
-     * Returns true if the namespace is a system.statistics collection, false otherwise.
+     * Returns true for the collections storing optimizer statistics: histograms
+     * (system.statistics.*) and per-field statistics (system.stats.field_stats).
+     * TODO SERVER-127371: collapse once the statistics namespaces are consolidated.
      */
     bool isSystemStatsCollection() const;
 
@@ -543,6 +556,18 @@ public:
      * ("tmp.agg_out") and legacy ("system.buckets.tmp.agg_out") timeseries namespaces.
      */
     bool isOutStageTmpCollection() const;
+
+    /**
+     * Returns true if the collection is a temporary convertToCapped collection
+     * (tmp%%%%%.convertToCapped.<originalColl>).
+     */
+    bool isConvertToCappedTmpCollection() const;
+
+    /**
+     * Returns true if the collection is a temporary renameCollection collection
+     * (tmp%%%%%.renameCollection, including system.buckets.tmp%%%%%.renameCollection).
+     */
+    bool isRenameCollectionTmpCollection() const;
 
     /**
      * Returns the time-series buckets namespace for this view.

@@ -389,6 +389,54 @@ TEST_F(MemoryUsageTrackerTest, WithinMemoryLimitOnStandaloneTrackerIsLocalOnly) 
     ASSERT_FALSE(tracker.withinMemoryLimit(nullptr));
 }
 
+TEST_F(MemoryUsageTrackerTest, RemainingMemoryUsageBytesReflectsAncestorLimit) {
+    // Operation-wide tracker enforces a 100 byte cap; stage limit is much larger, so the ancestor
+    // is the binding constraint and 'remaining' should reflect that, not the stage's own headroom.
+    SimpleMemoryUsageTracker opTracker{MemoryUsageLimit{100}};
+    SimpleMemoryUsageTracker stageTracker{&opTracker, MemoryUsageLimit{10 * 1024}};
+
+    stageTracker.add(50);
+    // Stage has 10 * 1024 - 50 bytes of local headroom, but the op tracker only has 50 left.
+    ASSERT_EQ(stageTracker.remainingMemoryUsageBytes(nullptr), 50);
+
+    stageTracker.add(51);
+    // Now over the op limit: remaining goes negative even though the stage's own limit isn't hit.
+    ASSERT_EQ(stageTracker.remainingMemoryUsageBytes(nullptr), -1);
+}
+
+TEST_F(MemoryUsageTrackerTest, RemainingMemoryUsageBytesReflectsLocalLimitWhenTighter) {
+    // Op limit is effectively unbounded, so the stage's own (tighter) limit is what binds.
+    SimpleMemoryUsageTracker opTracker{MemoryUsageLimit{std::numeric_limits<int64_t>::max()}};
+    SimpleMemoryUsageTracker stageTracker{&opTracker, MemoryUsageLimit{100}};
+
+    stageTracker.add(50);
+    ASSERT_EQ(stageTracker.remainingMemoryUsageBytes(nullptr), 50);
+
+    stageTracker.add(51);
+    ASSERT_EQ(stageTracker.remainingMemoryUsageBytes(nullptr), -1);
+}
+
+TEST_F(MemoryUsageTrackerTest, RemainingMemoryUsageBytesOnStandaloneTrackerIsLocalOnly) {
+    // No base: the chain walk collapses to the local check, same as withinMemoryLimit().
+    SimpleMemoryUsageTracker tracker{MemoryUsageLimit{100}};
+    tracker.add(50);
+    ASSERT_EQ(tracker.remainingMemoryUsageBytes(nullptr), 50);
+    tracker.add(51);
+    ASSERT_EQ(tracker.remainingMemoryUsageBytes(nullptr), -1);
+}
+
+TEST_F(MemoryUsageTrackerTest, RemainingMemoryUsageBytesTakesMinimumAcrossChain) {
+    // A three-level chain where the middle tracker is the tightest: 'remaining' should reflect
+    // the minimum across all levels, not just the immediate tracker or the root.
+    SimpleMemoryUsageTracker opTracker{MemoryUsageLimit{10 * 1024}};
+    SimpleMemoryUsageTracker midTracker{&opTracker, MemoryUsageLimit{100}};
+    SimpleMemoryUsageTracker leafTracker{&midTracker, MemoryUsageLimit{10 * 1024}};
+
+    leafTracker.add(60);
+    // op: 10*1024 - 60, mid: 100 - 60 = 40, leaf: 10*1024 - 60. The minimum (mid) is 40.
+    ASSERT_EQ(leafTracker.remainingMemoryUsageBytes(nullptr), 40);
+}
+
 TEST_F(MemoryUsageTrackerTest, WithinMemoryLimitOnMemoryUsageTracker) {
     // MemoryUsageTracker is the per-function variant whose internal _baseTracker is linked to
     // the op-wide tracker. The forwarder should pick up the op-wide breach too.
@@ -620,6 +668,112 @@ TEST(SimpleMemoryUsageTrackerTest, ChunkingReportsZeroWhenFullyReleased) {
     ASSERT_EQ(stageTracker.inUseTrackedMemoryBytes(), 0);
     ASSERT_EQ(opTracker.inUseTrackedMemoryBytes(), 0);
     ASSERT_EQ(lastReportedInUse, 0);
+}
+
+
+constexpr int64_t kChunkSizeForTest = 100;
+
+/**
+ * The chunk-crossing path reaches the new lower bound by stepping one chunk when the crossing is to
+ * an adjacent chunk and by dividing otherwise. Walk usage across boundaries in both directions, by
+ * one chunk and by many, and assert that every crossing reports the exact total -- i.e. that all
+ * three ways of computing the bound agree.
+ */
+std::pair<int64_t, int64_t> getLastReportedValues(int64_t initialValue, int64_t nextValue) {
+    constexpr int64_t kBig = 10 * 1024 * 1024;
+
+    int64_t lastReportedInUse = -1;
+
+    TestableMemoryUsageTracker opTracker{MemoryUsageLimit{kBig}};
+    opTracker.setWriteToCurOp([&](int64_t inUse, int64_t peak) { lastReportedInUse = inUse; });
+    SimpleMemoryUsageTracker stageTracker{&opTracker, MemoryUsageLimit{kBig}, kChunkSizeForTest};
+
+    stageTracker.add(initialValue);
+    stageTracker.add(nextValue);
+    return {lastReportedInUse, stageTracker.inUseTrackedMemoryBytes()};
+}
+
+TEST(SimpleMemoryUsageTrackerTest, ChunkingReportsInitialCrossing) {
+    ASSERT_THAT(getLastReportedValues(0, kChunkSizeForTest + 20),
+                std::pair(kChunkSizeForTest + 20, kChunkSizeForTest + 20))
+        << "Single chunk up, from chunk [0, 100) to [100, 200).";
+}
+
+TEST(SimpleMemoryUsageTrackerTest, ChunkingReportsUpwardCrossing) {
+    ASSERT_THAT(getLastReportedValues(kChunkSizeForTest + 20, 8 * kChunkSizeForTest + 30),
+                std::pair(9 * kChunkSizeForTest + 50, 9 * kChunkSizeForTest + 50))
+        << "Several chunks up at once: [100, 200) to [900, 1000). Too far to step, so this "
+           "divides.";
+}
+
+TEST(SimpleMemoryUsageTrackerTest, ChunkingDoesNotReportNonCrossing) {
+    ASSERT_THAT(getLastReportedValues(9 * kChunkSizeForTest + 50, 20),
+                std::pair(9 * kChunkSizeForTest + 50, 9 * kChunkSizeForTest + 70))
+        << "Within the new chunk: no crossing, no report.";
+}
+
+TEST(SimpleMemoryUsageTrackerTest, ChunkingReportsDownwardCrossing) {
+    ASSERT_THAT(getLastReportedValues(9 * kChunkSizeForTest + 70, -kChunkSizeForTest),
+                std::pair(8 * kChunkSizeForTest + 70, 8 * kChunkSizeForTest + 70))
+        << "Single chunk down, to [800, 900).";
+}
+
+TEST(SimpleMemoryUsageTrackerTest, ChunkingDoesNotReportDownwardCrossingOnBoundary) {
+    ASSERT_THAT(getLastReportedValues(8 * kChunkSizeForTest + 70, -70),
+                std::pair(8 * kChunkSizeForTest + 70, 8 * kChunkSizeForTest))
+        << "Exactly onto a boundary: 800 is the base of [800, 900), which is the chunk already "
+           "reported, so this is not a crossing.";
+}
+
+TEST(SimpleMemoryUsageTrackerTest, ChunkingReportsDownwardCrossingFromBoundary) {
+    ASSERT_THAT(getLastReportedValues(8 * kChunkSizeForTest, -1),
+                std::pair(8 * kChunkSizeForTest - 1, 8 * kChunkSizeForTest - 1))
+        << "One byte below that boundary crosses down into [700, 800).";
+}
+
+TEST(SimpleMemoryUsageTrackerTest, ChunkingReportsDownwardCrossingAcrossMultipleChunks) {
+    ASSERT_THAT(getLastReportedValues(8 * kChunkSizeForTest - 1, -7 * kChunkSizeForTest - 49),
+                std::pair(50, 50))
+        << "Several chunks down at once, back into the first chunk but not to zero.";
+}
+
+TEST(SimpleMemoryUsageTrackerTest, ChunkingDoesNotReportGoingToZeroInSameChunk) {
+    ASSERT_THAT(getLastReportedValues(50, -50), std::pair(0, 0))
+        << "From within the first chunk down to zero.";
+}
+
+TEST(SimpleMemoryUsageTrackerTest, ChunkingReportsWhenCrossingMultipleBoundariesAtOnce) {
+    ASSERT_THAT(getLastReportedValues(0, 50 * kChunkSizeForTest),
+                std::pair(50 * kChunkSizeForTest, 50 * kChunkSizeForTest))
+        << "Many chunk crossings up at once.";
+}
+
+TEST(SimpleMemoryUsageTrackerTest, ChunkingReportsWhenCrossingSingleBoundaryAtChunkSize) {
+    ASSERT_THAT(getLastReportedValues(kChunkSizeForTest, kChunkSizeForTest),
+                std::pair(2 * kChunkSizeForTest, 2 * kChunkSizeForTest))
+        << "Single chunk crossing up, from boundary to next boundary.";
+}
+
+TEST(SimpleMemoryUsageTrackerTest, ChunkingDoesNotReportWhenAddingOneBelowChunkSize) {
+    ASSERT_THAT(getLastReportedValues(kChunkSizeForTest, kChunkSizeForTest - 1),
+                std::pair(kChunkSizeForTest, 2 * kChunkSizeForTest - 1))
+        << "Adding one less then chunkSize.";
+}
+
+TEST(SimpleMemoryUsageTrackerTest, ChunkingDoesNotReportWhenAddingZero) {
+    ASSERT_THAT(getLastReportedValues(kChunkSizeForTest, 0),
+                std::pair(kChunkSizeForTest, kChunkSizeForTest))
+        << "Adding zero does not report.";
+}
+
+/**
+ * A release from far above straight to zero crosses many chunks at once and lands exactly on the
+ * boundary at zero. This is the one case where the divide-based bound and the return-to-zero rule
+ * both apply, so it must still report exactly once.
+ */
+TEST(SimpleMemoryUsageTrackerTest, ChunkingReportsZeroWhenReleasedFromManyChunksAbove) {
+    ASSERT_THAT(getLastReportedValues(5000, -5000), std::pair(0, 0))
+        << "Many chunk crossings down at once, back to zero.";
 }
 
 TEST(SimpleMemoryUsageTrackerTest, AssertWithinMemoryLimitDoesNotThrowWhenUnderLimit) {

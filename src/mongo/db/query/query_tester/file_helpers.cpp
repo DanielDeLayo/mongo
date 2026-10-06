@@ -94,6 +94,35 @@ std::string discoverMongoRepoRoot() {
     boost::algorithm::trim_right(repoRoot);
     return repoRoot;
 }
+
+std::filesystem::path resolveSymlinks(const std::filesystem::path& path) {
+    auto ec = std::error_code{};
+    // weakly_canonical tolerates non-existent paths; fall back to the original on any error.
+    if (auto resolved = std::filesystem::weakly_canonical(path, ec); !ec) {
+        return resolved;
+    }
+    return path;
+}
+
+/**
+ * Gives `actual` the same permissions as `expected`, plus owner write.
+ *
+ * `git diff --no-index` otherwise reports a file-mode difference as a diff even when the contents
+ * are identical.
+ *
+ * If the status of `expected` cannot be checked or the permissions of `actual` fail to set, the
+ * `actual` file is left unmodified. The testcase may then fail due to the file-mode differences.
+ */
+void matchPermissions(const std::filesystem::path& expected, const std::filesystem::path& actual) {
+    auto ec = std::error_code{};
+    if (const auto expectedStatus = std::filesystem::status(expected, ec); !ec) {
+
+        // Error code from setting permissions is unchecked. If it fails, the diff may report
+        // file-mode differences only.
+        std::filesystem::permissions(
+            actual, expectedStatus.permissions() | std::filesystem::perms::owner_write, ec);
+    }
+}
 }  // namespace
 
 ConditionalColor applyBold() {
@@ -150,6 +179,12 @@ std::string getMongoRepoRoot() {
 std::string gitDiff(const std::filesystem::path& expected,
                     const std::filesystem::path& actual,
                     const DiffStyle diffStyle) {
+    // `git diff` compares symlinks by their target path rather than by the contents they point at.
+    // Under Bazel the expected .results files are runfiles symlinks into the source tree, so
+    // resolve both paths first to make sure we diff file contents.
+    const auto expectedResolved = resolveSymlinks(expected);
+    const auto actualResolved = resolveSymlinks(actual);
+    matchPermissions(expectedResolved, actualResolved);
     const auto gitDiffCmd =
         (std::stringstream{}
          << "git"
@@ -165,8 +200,8 @@ std::string gitDiff(const std::filesystem::path& expected,
          << " --no-index "
          << (diffStyle == DiffStyle::kWord ? "--word-diff=color" : "--no-color")
          // Use character-based-diff when in non-CI mode for (hopefully) clearer diffs.
-         << (diffStyle == DiffStyle::kPlain ? "" : " --word-diff-regex=.") << " -U0 -- " << expected
-         << " " << actual << " 2>&1")
+         << (diffStyle == DiffStyle::kPlain ? "" : " --word-diff-regex=.") << " -U0 -- "
+         << expectedResolved << " " << actualResolved << " 2>&1")
             .str();
 
     // Need to ignore exit status because the implied --exit-code will return an error sttatus when

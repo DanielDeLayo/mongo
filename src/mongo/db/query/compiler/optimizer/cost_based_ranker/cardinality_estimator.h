@@ -61,6 +61,13 @@ public:
     CardinalityEstimator& operator=(CardinalityEstimator&&) = delete;
 
     CEResult estimatePlan(const QuerySolution& plan);
+    /**
+     * Estimate the cardinality of a standalone filter (no QuerySolution), scaled to the
+     * collection cardinality. Resets per-estimation state, so the estimator may be reused.
+     * Applies the same zero-clamping policy as estimatePlan(): an approximate-source zero
+     * ("not observed in the sample") is floored to kMinCE.
+     */
+    CEResult estimateFilter(const MatchExpression* filter);
 
 protected:
     // QuerySolutionNodes
@@ -121,6 +128,13 @@ protected:
      * additive per-stage minimum so structurally different plans still receive distinct costs.
      */
     void clampZeroEstimates();
+
+    /**
+     * Apply the "at least one row" floor to a single estimate: zero-valued approximate-source
+     * (Sampling / Histogram / Heuristics / Mixed) estimates become 'kMinCE'; authoritative
+     * (Metadata / Code) zeros are returned untouched.
+     */
+    CardinalityEstimate clampZeroEstimate(CardinalityEstimate ce);
 
     CEResult estimateIndexSeeks(const IndexBounds& bounds, bool multiKey);
 
@@ -210,7 +224,7 @@ protected:
     // this node is under an $elemMatch, if so it will return that path.
     std::string_view getPath(const MatchExpression* node);
 
-    const CardinalityEstimate _collCard;
+    CardinalityEstimate _collCard;
 
     // The input cardinality of the last complete conjunction. This conjunction may consist of a
     // chain of QSN nodes (an implicit conjunction) including all intervals and filter expressions

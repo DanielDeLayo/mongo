@@ -11,6 +11,7 @@
 #include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
 #include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
 #include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/sharding_environment/shard_id.h"
 #include "mongo/db/sharding_environment/sharding_feature_flags_gen.h"
 #include "mongo/db/sharding_environment/sharding_statistics.h"
 #include "mongo/db/topology/cluster_role.h"
@@ -351,9 +352,10 @@ void DatabaseShardingRuntime::clearDbInfo_DEPRECATED(OperationContext* opCtx,
 }
 
 void DatabaseShardingRuntime::setDbMetadataRefreshFuture_DEPRECATED(
-    SharedSemiFuture<void> future, CancellationSource cancellationSource) {
+    SharedSemiFuture<void> future,
+    ShardCatalogRecovererTracker::Acquisition recovererTrackerAcquisition) {
     invariant(!_dbMetadataRefresh);
-    _dbMetadataRefresh.emplace(std::move(future), std::move(cancellationSource));
+    _dbMetadataRefresh.emplace(std::move(future), std::move(recovererTrackerAcquisition));
 }
 
 boost::optional<SharedSemiFuture<void>> DatabaseShardingRuntime::getMetadataRefreshFuture() const {
@@ -367,7 +369,7 @@ void DatabaseShardingRuntime::resetDbMetadataRefreshFuture_DEPRECATED() {
 
 void DatabaseShardingRuntime::_cancelDbMetadataRefresh_DEPRECATED() {
     if (_dbMetadataRefresh) {
-        _dbMetadataRefresh->cancellationSource.cancel();
+        _dbMetadataRefresh->recovererTrackerAcquisition.cancel();
     }
 }
 

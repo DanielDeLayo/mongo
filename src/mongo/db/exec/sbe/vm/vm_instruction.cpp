@@ -142,6 +142,7 @@ int Instruction::stackOffset[Instruction::Tags::lastInstruction] = {
     0,  // isMaxKey
     0,  // isTimestamp
     0,  // isKeyString
+    0,  // mqlComparisonRank
     0,  // typeMatchImm
 
     0,  // function is special, the stack offset is encoded in the instruction itself
@@ -200,7 +201,7 @@ MONGO_COMPILER_NORETURN void ByteCode::runFailInstruction() {
     tassert(11086800, "Unexpected error message type", value::isString(tagMsg));
 
     ErrorCodes::Error code{static_cast<ErrorCodes::Error>(value::bitcastTo<int64_t>(valCode))};
-    std::string message{value::getStringView(tagMsg, valMsg)};
+    std::string_view message{value::getStringView(tagMsg, valMsg)};
 
     uasserted(code, message);
 }
@@ -327,6 +328,7 @@ void ByteCode::runInternal(const CodeFragment* code, int64_t position) {
                                         &&do_isMaxKey,
                                         &&do_isTimestamp,
                                         &&do_isKeyString,
+                                        &&do_mqlComparisonRank,
                                         &&do_typeMatchImm,
 
                                         &&do_function,
@@ -1243,6 +1245,21 @@ void ByteCode::runInternal(const CodeFragment* code, int64_t position) {
         runTagCheck(pcPointer, value::TypeTags::keyString);
     }
     DISPATCH();
+    INSTRUCTION(mqlComparisonRank) {
+        auto [popParam, moveFromParam, offsetParam] =
+            Instruction::Parameter::decodeParam(pcPointer);
+        auto val = getMaybeOwnedFromStack(offsetParam, popParam);
+
+        // Ranks the value's position relative to a missing/"Nothing" value in MQL comparison
+        // semantics: MinKey (0) < Nothing/missing/bsonUndefined (1) < any other value (2). Unlike
+        // a plain type check this always returns a value (never Nothing), so it can be used to
+        // correctly order a missing operand against MinKey when the primary comparison yielded
+        // Nothing.
+        pushStack(false,
+                  value::TypeTags::NumberInt32,
+                  value::bitcastFrom<int32_t>(mqlComparisonRank(val.tag())));
+    }
+    DISPATCH();
     INSTRUCTION(typeMatchImm) {
         auto [popParam, moveFromParam, offsetParam] =
             Instruction::Parameter::decodeParam(pcPointer);
@@ -1366,8 +1383,7 @@ void ByteCode::runInternal(const CodeFragment* code, int64_t position) {
         auto date = getMaybeOwnedFromStack(0);
 
         auto [owned, tag, val] =
-            dateTrunc(date.tag(), date.value(), unit, binSize, timezone, startOfWeek)
-                .releaseToRaw();
+            dateTrunc(date.view(), unit, binSize, timezone, startOfWeek).releaseToRaw();
 
         topStack(owned, tag, val);
     }
@@ -1589,6 +1605,8 @@ const char* Instruction::toString() const {
             return "isTimestamp";
         case isKeyString:
             return "isKeyString";
+        case mqlComparisonRank:
+            return "mqlComparisonRank";
         case typeMatchImm:
             return "typeMatchImm";
         case function:

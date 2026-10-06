@@ -4,9 +4,6 @@
 #include "mongo/otel/traces/telemetry_context_serialization.h"
 
 #include "mongo/bson/bsonobj.h"
-#include "mongo/idl/generic_argument_gen.h"
-#include "mongo/logv2/log.h"
-#include "mongo/otel/telemetry_context_holder.h"
 #include "mongo/otel/traces/bson_text_map_carrier.h"
 #include "mongo/otel/traces/span/span_telemetry_context_impl.h"
 #include "mongo/otel/traces/traceparent.h"
@@ -15,8 +12,6 @@
 #include <opentelemetry/context/propagation/text_map_propagator.h>
 #include <opentelemetry/trace/context.h>
 #include <opentelemetry/trace/propagation/http_trace_context.h>
-
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 namespace mongo {
 namespace otel {
@@ -93,26 +88,6 @@ BSONObj TelemetryContextSerializer::toBSON(const std::shared_ptr<TelemetryContex
     return traces::toBSON(*context, propagator);
 }
 
-BSONObj TelemetryContextSerializer::appendTelemetryContext(OperationContext* opCtx, BSONObj bson) {
-    invariant(opCtx);
-    auto& telemetryCtxHolder = TelemetryContextHolder::getDecoration(opCtx);
-    if (!telemetryCtxHolder.getTelemetryContext()) {
-        return bson;
-    }
-
-    BSONObjBuilder bob;
-    for (const auto& field : bson) {
-        if (field.fieldName() == GenericArguments::kTraceCtxFieldName) {
-            continue;
-        }
-        bob.append(field);
-    }
-    bob.append(GenericArguments::kTraceCtxFieldName,
-               TelemetryContextSerializer::toBSON(telemetryCtxHolder.getTelemetryContext()));
-
-    return bob.obj();
-}
-
 std::shared_ptr<TelemetryContext> TelemetryContextSerializer::fromSection(
     const boost::optional<mongo::TelemetryContextSection>& section) {
     if (!section || section->getOtel().getTraceparent().empty() ||
@@ -124,32 +99,12 @@ std::shared_ptr<TelemetryContext> TelemetryContextSerializer::fromSection(
 }
 
 boost::optional<mongo::TelemetryContextSection> TelemetryContextSerializer::toSection(
-    const std::shared_ptr<TelemetryContext>& context) {
+    const TelemetryContext* context) {
     if (!context) {
         return boost::none;
     }
     auto propagator = getPropagator();
     return traces::toSection(*context, propagator);
-}
-
-boost::optional<TelemetryContextSection> toWireType(const TelemetryContext* ctx) {
-    if (!ctx) {
-        return boost::none;
-    }
-    // Reuse the existing BSON serialization rather than duplicating the propagator/carrier logic,
-    // then pull the traceparent field off the result.
-    // TODO(SERVER-130639): Separate the serialization from the propagator logic.
-    auto propagator = getPropagator();
-    auto bson = traces::toBSON(*ctx, propagator);
-    auto traceparent = bson.getStringField(OtelContextSection::kTraceparentFieldName);
-    if (traceparent.empty()) {
-        return boost::none;
-    }
-    OtelContextSection otelCtx;
-    otelCtx.setTraceparent(std::string{traceparent});
-    TelemetryContextSection wireTc;
-    wireTc.setOtel(std::move(otelCtx));
-    return wireTc;
 }
 
 }  // namespace traces

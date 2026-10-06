@@ -9,11 +9,14 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
 #include "mongo/db/validate/collection_validation.h"
+#include "mongo/db/validate/concurrent_progress_meter.h"
 #include "mongo/db/validate/validate_gen.h"
 #include "mongo/db/validate/validate_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/progress_meter.h"
+
+#include <regex>
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -35,8 +38,22 @@ using KeyStringIndexConsistencyTest = CatalogTestFixture;
 ValidateResults validate(OperationContext* opCtx) {
     ValidateResults validateResults;
     ASSERT_OK(
-        collection_validation::validate(opCtx, kNss, kDefaultValidateOptions, &validateResults));
+        collection_validation::validate(opCtx, kNss, kDefaultValidateOptions, validateResults));
     return validateResults;
+}
+
+// Parses the count out of the "Detected N <kind> index entries." warning, which reports the real
+// number of inconsistencies even when memory limits cut down how many are individually reported.
+int getDetectedEntryCount(const ValidateResults& results, const std::string& kind) {
+    const std::regex re{"Detected ([0-9]+) " + kind + " index entries\\."};
+    for (const std::string& warning : results.getWarnings()) {
+        std::smatch match;
+        if (std::regex_search(warning, match, re)) {
+            return std::stoi(match[1].str());
+        }
+    }
+    FAIL("No 'Detected N " + kind + " index entries.' warning found");
+    MONGO_UNREACHABLE;
 }
 
 // Clears the collection without updating indexes, this creates extra index entries.
@@ -186,10 +203,7 @@ TEST_F(KeyStringIndexConsistencyTest, ExtraEntryPartialFindingsWithNonzeroMemory
     // Due to the very large keystrings, the number of reported entries will be smaller than the
     // real number. But we can still parse the real number out of a particular warning.
     auto getRealExtraEntryCount = [](const ValidateResults& results) {
-        const std::string& firstWarning = *results.getWarnings().begin();
-        // It's "Detected XX extra index entries.", so get the number between the first two spaces.
-        auto firstSpace = firstWarning.find(' ');
-        return std::stoi(firstWarning.substr(firstSpace, firstWarning.find(firstSpace + 1)));
+        return getDetectedEntryCount(results, "extra");
     };
 
     {
@@ -243,11 +257,7 @@ TEST_F(KeyStringIndexConsistencyTest, MissingEntryPartialFindingsWithNonzeroMemo
     // Due to the very large keystrings, the number of reported entries will be smaller than the
     // real number. But we can still parse the real number out of a particular warning.
     auto getRealMissingEntryCount = [](const ValidateResults& results) {
-        const std::string& firstWarning = *results.getWarnings().begin();
-        // It's "Detected XX missing index entries.", so get the number between the first two
-        // spaces.
-        auto firstSpace = firstWarning.find(' ');
-        return std::stoi(firstWarning.substr(firstSpace, firstWarning.find(firstSpace + 1)));
+        return getDetectedEntryCount(results, "missing");
     };
 
     {
@@ -359,7 +369,7 @@ TEST_F(KeyStringIndexConsistencyTest, FailedKeygen) {
 
     ValidateResults results;
     KeyStringIndexConsistency ksic(opCtx, &state);
-    ksic.traverseRecord(opCtx, *coll, xHashedIndex, RecordId(1), unhashableDoc, &results);
+    ksic.traverseRecord(opCtx, *coll, *xHashedIndex, RecordId(1), unhashableDoc, results);
     const auto& errors = results.getErrors();
     namespace m = unittest::match;
     ASSERT_THAT(errors, m::ElementsAre(m::HasSubstr("16766")))
@@ -402,7 +412,7 @@ TEST_F(KeyStringIndexConsistencyTest, GeoKeygenFailureReportsStructuredError) {
 
     ValidateResults results;
     KeyStringIndexConsistency ksic(opCtx, &state);
-    ksic.traverseRecord(opCtx, *coll, geoIndex, RecordId(1), badGeoDoc, &results);
+    ksic.traverseRecord(opCtx, *coll, *geoIndex, RecordId(1), badGeoDoc, results);
 
     using testing::HasSubstr;
     using testing::Not;
@@ -454,7 +464,7 @@ TEST_F(KeyStringIndexConsistencyTest, GeoKeygenFailuresCollapseAcrossDocuments) 
     for (int lng : badLongitudes) {
         const auto doc =
             BSON("loc" << BSON("type" << "Point" << "coordinates" << BSON_ARRAY(lng << 0)));
-        ksic.traverseRecord(opCtx, *coll, geoIndex, RecordId(recordId++), doc, &results);
+        ksic.traverseRecord(opCtx, *coll, *geoIndex, RecordId(recordId++), doc, results);
     }
 
     using testing::HasSubstr;
@@ -462,6 +472,102 @@ TEST_F(KeyStringIndexConsistencyTest, GeoKeygenFailuresCollapseAcrossDocuments) 
     const auto& errors = results.getErrors();
     ASSERT_EQ(errors.size(), 1);
     EXPECT_THAT(*errors.begin(), HasSubstr("at path loc"));
+}
+
+TEST_F(KeyStringIndexConsistencyTest, MultikeyDocErrorsCollapseAcrossDocuments) {
+    // The "not multikey but document has multikey data" error omits per-document content
+    // (RecordId, _id) so that documents failing this check on the same index collapse to a single
+    // error, keeping res.errors bounded by the number of indexes rather than the number of bad
+    // documents (see SERVER-134574).
+    auto opCtx = operationContext();
+    ASSERT_OK(storageInterface()->createCollection(opCtx, kNss, CollectionOptions()));
+
+    static constexpr auto indexName{"a_1"sv};
+
+    AutoGetCollection coll(opCtx, kNss, MODE_X);
+    CollectionWriter writer(opCtx, coll);
+    {
+        WriteUnitOfWork wuow(opCtx);
+        auto collWriter = writer.getWritableCollection(opCtx);
+        ASSERT_OK(collWriter->getIndexCatalog()->createIndexOnEmptyCollection(
+            opCtx,
+            collWriter,
+            BSON("name" << indexName << "v" << int(IndexConfig::kLatestIndexVersion) << "key"
+                        << BSON("a" << 1))));
+        wuow.commit();
+    }
+
+    const auto* index = coll->getIndexCatalog()->findIndexByName(opCtx, indexName);
+    ASSERT_FALSE(index->isMultikey(opCtx, *coll));
+
+    collection_validation::ValidateState state(opCtx, kNss, kDefaultValidateOptions);
+    ASSERT_OK(state.initializeCollection(opCtx));
+    state.initializeCursors(opCtx);
+    ValidateResults results;
+    KeyStringIndexConsistency ksic(opCtx, &state);
+
+    // Two distinct documents whose "a" field is an array, so both individually should mark the
+    // index as multikey even though it is not currently marked as such.
+    ksic.traverseRecord(
+        opCtx, *coll, *index, RecordId(1), BSON("a" << BSON_ARRAY(1 << 2)), results);
+    ksic.traverseRecord(
+        opCtx, *coll, *index, RecordId(2), BSON("a" << BSON_ARRAY(3 << 4)), results);
+
+    using testing::HasSubstr;
+
+    const auto& errors = results.getIndexValidateResult(std::string{indexName}).getErrors();
+    ASSERT_EQ(errors.size(), 1);
+    EXPECT_THAT(*errors.begin(), HasSubstr("is not multikey"));
+    EXPECT_THAT(*errors.begin(), HasSubstr("7556100"));
+}
+
+TEST_F(KeyStringIndexConsistencyTest, MultikeyPathCoverageErrorsCollapseAcrossDocuments) {
+    // The "multikey paths do not cover" error likewise omits per-document content, so documents
+    // whose multikey paths the index's recorded multikey paths do not cover collapse to a single
+    // error per index rather than one per document (see SERVER-134574).
+    auto opCtx = operationContext();
+    ASSERT_OK(storageInterface()->createCollection(opCtx, kNss, CollectionOptions()));
+
+    static constexpr auto indexName{"ab_1"sv};
+
+    AutoGetCollection coll(opCtx, kNss, MODE_X);
+    CollectionWriter writer(opCtx, coll);
+    {
+        WriteUnitOfWork wuow(opCtx);
+        auto collWriter = writer.getWritableCollection(opCtx);
+        ASSERT_OK(collWriter->getIndexCatalog()->createIndexOnEmptyCollection(
+            opCtx,
+            collWriter,
+            BSON("name" << indexName << "v" << int(IndexConfig::kLatestIndexVersion) << "key"
+                        << BSON("a" << 1 << "b" << 1))));
+        // Marks the index multikey with recorded paths covering only "a".
+        ASSERT_OK(Helpers::insert(
+            opCtx, writer.get(), BSON("_id" << 0 << "a" << BSON_ARRAY(1 << 2) << "b" << 1)));
+        wuow.commit();
+    }
+
+    const auto* index = coll->getIndexCatalog()->findIndexByName(opCtx, indexName);
+    ASSERT_TRUE(index->isMultikey(opCtx, *coll));
+
+    collection_validation::ValidateState state(opCtx, kNss, kDefaultValidateOptions);
+    ASSERT_OK(state.initializeCollection(opCtx));
+    state.initializeCursors(opCtx);
+    ValidateResults results;
+    KeyStringIndexConsistency ksic(opCtx, &state);
+
+    // Two distinct documents whose multikey path is "b" rather than "a", which the index's
+    // recorded multikey paths do not cover.
+    ksic.traverseRecord(
+        opCtx, *coll, *index, RecordId(1), BSON("a" << 1 << "b" << BSON_ARRAY(3 << 4)), results);
+    ksic.traverseRecord(
+        opCtx, *coll, *index, RecordId(2), BSON("a" << 1 << "b" << BSON_ARRAY(5 << 6)), results);
+
+    using testing::HasSubstr;
+
+    const auto& errors = results.getIndexValidateResult(std::string{indexName}).getErrors();
+    ASSERT_EQ(errors.size(), 1);
+    EXPECT_THAT(*errors.begin(), HasSubstr("multikey paths do not cover"));
+    EXPECT_THAT(*errors.begin(), HasSubstr("7556100"));
 }
 
 // Splitting the record-store scan into disjoint slices and merging the per-slice
@@ -517,7 +623,7 @@ TEST_F(KeyStringIndexConsistencyTest, MergeIsCommutativeAndMatchesSerialScan) {
             for (const auto& indexIdent : state.getIndexIdents()) {
                 const auto* entry = coll->getIndexCatalog()->findIndexByIdent(opCtx, indexIdent);
                 ksic.traverseRecord(
-                    opCtx, *coll, entry, records[i].first, records[i].second, &results);
+                    opCtx, *coll, *entry, records[i].first, records[i].second, results);
             }
         }
         EXPECT_TRUE(results.isValid()) << "first-phase scan unexpectedly reported errors";
@@ -584,7 +690,7 @@ KeyStringIndexConsistency runTwoPhaseScan(OperationContext* opCtx,
 
     // traverseIndex() only touches the progress meter while iterating real index entries, but a
     // live meter is still required for collections that have extra index entries to report.
-    ProgressMeterHolder progress;
+    ConcurrentProgressMeterHolder progress;
     {
         std::unique_lock<Client> lk(*opCtx->getClient());
         progress.set(lk, CurOp::get(opCtx)->setProgress(lk, "test validate", 1), opCtx);
@@ -600,12 +706,12 @@ KeyStringIndexConsistency runTwoPhaseScan(OperationContext* opCtx,
             for (const auto& indexIdent : state.getIndexIdents()) {
                 const auto* entry = coll->getIndexCatalog()->findIndexByIdent(opCtx, indexIdent);
                 ksic.traverseRecord(
-                    opCtx, coll, entry, rec->id, rec->data.toBson().getOwned(), &results);
+                    opCtx, coll, *entry, rec->id, rec->data.toBson().getOwned(), results);
             }
         }
         for (const auto& indexIdent : state.getIndexIdents()) {
             const auto* entry = coll->getIndexCatalog()->findIndexByIdent(opCtx, indexIdent);
-            ksic.traverseIndex(opCtx, entry, progress, &results);
+            ksic.traverseIndex(opCtx, *entry, progress, results);
         }
     };
 
@@ -614,7 +720,7 @@ KeyStringIndexConsistency runTwoPhaseScan(OperationContext* opCtx,
     scanAll(phaseOneResults);
 
     ksic.setSecondPhase();
-    ksic.limitMemoryUsageForSecondPhase(&phaseOneResults);
+    ksic.limitMemoryUsageForSecondPhase(phaseOneResults);
 
     // The second-phase scan records the specific keys that hashed to inconsistent buckets into the
     // '_missingIndexEntries'/'_extraIndexEntries' maps.
@@ -687,8 +793,8 @@ TEST_F(KeyStringIndexConsistencyTest, CopyConstructorPreservesSecondPhaseInconsi
     // copy this must not crash and must reproduce the original's reported entries exactly.
     ValidateResults originalResults = makeResultsWithIndexMap(opCtx, state, *coll);
     ValidateResults copyResults = makeResultsWithIndexMap(opCtx, state, *coll);
-    original.addIndexEntryErrors(opCtx, &originalResults);
-    copy.addIndexEntryErrors(opCtx, &copyResults);
+    original.addIndexEntryErrors(opCtx, originalResults);
+    copy.addIndexEntryErrors(opCtx, copyResults);
 
     // Sanity check that the scan actually produced inconsistencies, so the comparison is
     // meaningful.
@@ -717,8 +823,8 @@ TEST_F(KeyStringIndexConsistencyTest, CopyAssignmentPreservesSecondPhaseInconsis
 
     ValidateResults originalResults = makeResultsWithIndexMap(opCtx, state, *coll);
     ValidateResults assignedResults = makeResultsWithIndexMap(opCtx, state, *coll);
-    original.addIndexEntryErrors(opCtx, &originalResults);
-    assigned.addIndexEntryErrors(opCtx, &assignedResults);
+    original.addIndexEntryErrors(opCtx, originalResults);
+    assigned.addIndexEntryErrors(opCtx, assignedResults);
 
     // Sanity check that the scan actually produced inconsistencies, so the comparison is
     // meaningful.
@@ -729,6 +835,102 @@ TEST_F(KeyStringIndexConsistencyTest, CopyAssignmentPreservesSecondPhaseInconsis
                        assignedResults.getMissingIndexEntries());
     assertEntriesMatch(originalResults.getExtraIndexEntries(),
                        assignedResults.getExtraIndexEntries());
+}
+
+TEST_F(KeyStringIndexConsistencyTest, TraverseIndexReportsDuplicateKeys) {
+    auto opCtx = operationContext();
+    ASSERT_OK(storageInterface()->createCollection(opCtx, kNss, CollectionOptions()));
+
+    static constexpr auto uniqueIndexName{"x_1"sv};
+
+    AutoGetCollection coll(opCtx, kNss, MODE_X);
+    CollectionWriter writer(opCtx, coll);
+    const auto indexSpec =
+        BSON("v" << IndexDescriptor::IndexVersion::kV2 << "name" << uniqueIndexName << "key"
+                 << BSON("x" << 1) << "unique" << true);
+    {
+        WriteUnitOfWork wuow(opCtx);
+        auto collWriter = writer.getWritableCollection(opCtx);
+        ASSERT_OK(collWriter->getIndexCatalog()->createIndexOnEmptyCollection(
+            opCtx, collWriter, indexSpec));
+        ASSERT_OK(Helpers::insert(opCtx, writer.get(), BSON("_id" << 1 << "x" << 1)));
+        wuow.commit();
+    }
+
+    const auto* entry = coll->getIndexCatalog()->findIndexByName(opCtx, uniqueIndexName);
+    auto* iam = entry->accessMethod()->asSortedData();
+
+    // Plant a second entry for the same key under a different RecordId. The keys stay strictly
+    // increasing because the RecordId is appended, so _validateKeyOrder() reaches the uniqueness
+    // check rather than bailing out on the ordering check first.
+
+    const KeyStringSet keys = std::invoke([&] {
+        WriteUnitOfWork wuow(opCtx);
+        SharedBufferFragmentBuilder pooledBuilder(
+            key_string::HeapBuilder::kHeapAllocatorDefaultBytes);
+        KeyStringSet keys;
+        iam->getKeys(opCtx,
+                     *coll,
+                     entry,
+                     pooledBuilder,
+                     BSON("x" << 1),
+                     InsertDeleteOptions::ConstraintEnforcementMode::kRelaxConstraintsUnfiltered,
+                     SortedDataIndexAccessMethod::GetKeysContext::kAddingKeys,
+                     &keys,
+                     nullptr,
+                     nullptr,
+                     RecordId(2));
+        int64_t numInserted = 0;
+        ASSERT_OK(iam->insertKeys(opCtx,
+                                  *shard_role_details::getRecoveryUnit(opCtx),
+                                  *coll,
+                                  entry,
+                                  keys,
+                                  InsertDeleteOptions{.dupsAllowed = true},
+                                  nullptr,
+                                  &numInserted));
+        ASSERT_EQ(1, numInserted);
+        wuow.commit();
+        return keys;
+    });
+
+    collection_validation::ValidateState state(opCtx, kNss, kDefaultValidateOptions);
+    ASSERT_OK(state.initializeCollection(opCtx));
+    state.initializeCursors(opCtx);
+
+    ValidateResults results;
+    auto& indexResults = results.getIndexValidateResult(std::string{uniqueIndexName});
+
+    KeyStringIndexConsistency ksic(opCtx, &state);
+
+    // TODO SERVER-134900 make ConcurrentProgressMeterHolder a nullable pointer argument
+    ConcurrentProgressMeterHolder progress;
+    {
+        std::unique_lock<Client> lk(*opCtx->getClient());
+        progress.set(lk, CurOp::get(opCtx)->setProgress(lk, "test validate", 1), opCtx);
+    }
+
+    unittest::LogCaptureGuard logs;
+    ASSERT_EQ(2, ksic.traverseIndex(opCtx, *entry, progress, results));
+    logs.stop();
+
+    const auto& errors = indexResults.getErrors();
+    ASSERT_EQ(1, errors.size());
+    const auto& error = *errors.begin();
+    EXPECT_THAT(error, testing::HasSubstr("Unique index 'x_1' has duplicate key"sv));
+    EXPECT_THAT(error, testing::HasSubstr("13457600"));
+
+    // getText() keeps only each line's "msg", so the key has to be matched against the structured
+    // "attr" subtree instead.
+    const auto ord = Ordering::make(entry->descriptor()->keyPattern());
+    for (const auto& key : keys) {
+        EXPECT_EQ(1,
+                  logs.countBSONContainingSubset(
+                      BSON("id" << 13457600 << "attr"
+                                << BSON("indexName" << uniqueIndexName << "bsonKey"
+                                                    << key_string::toBson(key, ord) << "records"
+                                                    << BSON_ARRAY("1" << "2")))));
+    }
 }
 
 }  // namespace mongo

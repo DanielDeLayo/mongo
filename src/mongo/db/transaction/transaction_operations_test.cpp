@@ -10,6 +10,7 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/unittest/death_test.h"
@@ -42,6 +43,23 @@ auto doNothingLogApplyOpsFn = [](repl::MutableOplogEntry* oplogEntry,
                                  WriteUnitOfWork::OplogEntryGroupType oplogGroupingFormat) {
     return repl::OpTime();
 };
+
+// Builds a minimal insert operation for packer tests, optionally tagged with its own record id
+// and/or an atomic-group record id.
+TransactionOperations::TransactionOperation makeInsertOpForTest(
+    int id, boost::optional<RecordId> recordId, boost::optional<RecordId> groupRecordId) {
+    TransactionOperations::TransactionOperation op;
+    op.setOpType(repl::OpTypeEnum::kInsert);
+    op.setNss(NamespaceString::createNamespaceString_forTest("test.t"));
+    op.setObject(BSON("_id" << id));
+    if (recordId) {
+        op.setRecordId(*recordId);
+    }
+    if (groupRecordId) {
+        op.setGroupRecordId(*groupRecordId);
+    }
+    return op;
+}
 
 TEST(TransactionOperationsTest, Basic) {
     TransactionOperations ops;
@@ -315,7 +333,7 @@ DEATH_TEST(TransactionOperationsTestDeathTest,
     ops.logOplogEntries(/*oplogSlots=*/{},
                         applyOpsInfo,
                         kWallClockTime,
-                        WriteUnitOfWork::OplogEntryGroupType::kDontGroup,
+                        WriteUnitOfWork::OplogEntryGroupType::noGroup,
                         doNothingLogApplyOpsFn,
                         &imageToWrite);
 }
@@ -340,7 +358,7 @@ DEATH_TEST(TransactionOperationsTestDeathTest,
     ops.logOplogEntries(oplogSlots,
                         applyOpsInfo,
                         kWallClockTime,
-                        WriteUnitOfWork::OplogEntryGroupType::kDontGroup,
+                        WriteUnitOfWork::OplogEntryGroupType::noGroup,
                         doNothingLogApplyOpsFn,
                         &imageToWrite);
 }
@@ -375,6 +393,146 @@ TEST(TransactionOperationsTest, GetApplyOpsInfoReturnsOneEntryContainingTwoOpera
     ASSERT_EQ(info.applyOpsEntries[0].operations.size(), 2U);
     ASSERT_BSONOBJ_EQ(info.applyOpsEntries[0].operations[0], op1.toBSON());
     ASSERT_BSONOBJ_EQ(info.applyOpsEntries[0].operations[1], op2.toBSON());
+}
+
+TEST(TransactionOperationsTest, GetApplyOpsInfoKeepsARecordsOperationsInOneEntry) {
+    TransactionOperations ops;
+    // Two records, each with a collection op (own record id) and a side op (atomic-group record
+    // id), laid out contiguously as groupByRecordId would produce.
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(1, RecordId(1), boost::none)));
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(2, boost::none, RecordId(1))));
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(3, RecordId(2), boost::none)));
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(4, boost::none, RecordId(2))));
+
+    // At most three operations per entry: without grouping, record 2's group would straddle the
+    // boundary; with respectAtomicGroups it rolls whole into the second entry.
+    auto info = ops.getApplyOpsInfo(/*oplogEntryCountLimit=*/3U,
+                                    kOplogEntrySizeLimitBytes,
+                                    /*prepare=*/false,
+                                    /*respectAtomicGroups=*/true);
+
+    ASSERT_EQ(info.applyOpsEntries.size(), 2U);
+    EXPECT_EQ(info.applyOpsEntries[0].operations.size(), 2U);
+    EXPECT_EQ(info.applyOpsEntries[1].operations.size(), 2U);
+}
+
+TEST(TransactionOperationsTest, GetApplyOpsInfoWithoutAtomicGroupsMaySplitARecord) {
+    TransactionOperations ops;
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(1, RecordId(1), boost::none)));
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(2, boost::none, RecordId(1))));
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(3, RecordId(2), boost::none)));
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(4, boost::none, RecordId(2))));
+
+    // Default respectAtomicGroups=false: entries fill by count, splitting record 2's group.
+    auto info = ops.getApplyOpsInfo(/*oplogEntryCountLimit=*/3U,
+                                    kOplogEntrySizeLimitBytes,
+                                    /*prepare=*/false);
+
+    ASSERT_EQ(info.applyOpsEntries.size(), 2U);
+    EXPECT_EQ(info.applyOpsEntries[0].operations.size(), 3U);
+    EXPECT_EQ(info.applyOpsEntries[1].operations.size(), 1U);
+}
+
+TEST(TransactionOperationsTest, GetApplyOpsInfoThrowsOnOversizedGroup) {
+    TransactionOperations ops;
+    // A single record whose two operations together exceed the size limit.
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(1, RecordId(1), boost::none)));
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(2, boost::none, RecordId(1))));
+
+    const auto oneOpSize = repl::DurableOplogEntry::getDurableReplOperationSize(
+        makeInsertOpForTest(1, RecordId(1), boost::none));
+    ASSERT_THROWS_CODE(ops.getApplyOpsInfo(kOplogEntryCountLimit,
+                                           /*oplogEntrySizeLimitBytes=*/oneOpSize,
+                                           /*prepare=*/false,
+                                           /*respectAtomicGroups=*/true),
+                       DBException,
+                       ErrorCodes::TransactionTooLarge);
+}
+
+TEST(TransactionOperationsTest, GroupByRecordIdMakesGroupsContiguous) {
+    TransactionOperations ops;
+    // Staging order stages all side ops before all collection ops, interleaving the records.
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(1, boost::none, RecordId(1))));
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(2, boost::none, RecordId(2))));
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(3, RecordId(1), boost::none)));
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(4, RecordId(2), boost::none)));
+
+    ops.groupByRecordId();
+
+    auto keyOf = [](const repl::ReplOperation& op) {
+        return op.getGroupRecordId() ? *op.getGroupRecordId() : *op.getRecordId();
+    };
+    const auto& grouped = ops.getOperationsForOpObserver();
+    ASSERT_EQ(grouped.size(), 4U);
+    EXPECT_EQ(keyOf(grouped[0]), RecordId(1));
+    EXPECT_EQ(keyOf(grouped[1]), RecordId(1));
+    EXPECT_EQ(keyOf(grouped[2]), RecordId(2));
+    EXPECT_EQ(keyOf(grouped[3]), RecordId(2));
+}
+
+TEST(TransactionOperationsTest, GroupByRecordIdEmitsGroupsInFirstAppearanceOrder) {
+    TransactionOperations ops;
+    // Record 2's side op appears before record 1's, so record 2's group must be emitted first --
+    // groups follow first-appearance (collection-write) order, not record-id value order.
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(1, boost::none, RecordId(2))));
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(2, boost::none, RecordId(1))));
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(3, RecordId(2), boost::none)));
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(4, RecordId(1), boost::none)));
+
+    ops.groupByRecordId();
+
+    auto keyOf = [](const repl::ReplOperation& op) {
+        return op.getGroupRecordId() ? *op.getGroupRecordId() : *op.getRecordId();
+    };
+    const auto& grouped = ops.getOperationsForOpObserver();
+    ASSERT_EQ(grouped.size(), 4U);
+    EXPECT_EQ(keyOf(grouped[0]), RecordId(2));
+    EXPECT_EQ(keyOf(grouped[1]), RecordId(2));
+    EXPECT_EQ(keyOf(grouped[2]), RecordId(1));
+    EXPECT_EQ(keyOf(grouped[3]), RecordId(1));
+}
+
+TEST(TransactionOperationsTest, GroupByRecordIdMergesMultipleCollectionOpsOnOneRecord) {
+    TransactionOperations ops;
+    // Two collection ops (own record id) touch record 1 in one batch, each with its own side op.
+    // All four operations must collapse into a single contiguous group.
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(1, boost::none, RecordId(1))));  // side, op A
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(2, RecordId(1), boost::none)));  // collection A
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(3, boost::none, RecordId(1))));  // side, op B
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(4, RecordId(1), boost::none)));  // collection B
+
+    ops.groupByRecordId();
+
+    auto keyOf = [](const repl::ReplOperation& op) {
+        return op.getGroupRecordId() ? *op.getGroupRecordId() : *op.getRecordId();
+    };
+    const auto& grouped = ops.getOperationsForOpObserver();
+    ASSERT_EQ(grouped.size(), 4U);
+    for (const auto& op : grouped) {
+        EXPECT_EQ(keyOf(op), RecordId(1));
+    }
+    // Order within the merged group is preserved from staging.
+    EXPECT_EQ(grouped[0].getObject()["_id"].numberInt(), 1);
+    EXPECT_EQ(grouped[1].getObject()["_id"].numberInt(), 2);
+    EXPECT_EQ(grouped[2].getObject()["_id"].numberInt(), 3);
+    EXPECT_EQ(grouped[3].getObject()["_id"].numberInt(), 4);
+}
+
+TEST(TransactionOperationsTest, GroupByRecordIdLeavesOperationsWithoutARecordInPlace) {
+    TransactionOperations ops;
+    // Operations belonging to no record stay put as singletons, only the grouped ops move together.
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(1, boost::none, RecordId(1))));  // record 1 side
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(2, boost::none, boost::none)));  // no record
+    ASSERT_OK(ops.addOperation(makeInsertOpForTest(3, RecordId(1), boost::none)));  // record 1 coll
+
+    ops.groupByRecordId();
+
+    const auto& grouped = ops.getOperationsForOpObserver();
+    ASSERT_EQ(grouped.size(), 3U);
+    // Record 1's two ops are contiguous; the record-less op keeps its relative position after them.
+    EXPECT_EQ(grouped[0].getObject()["_id"].numberInt(), 1);
+    EXPECT_EQ(grouped[1].getObject()["_id"].numberInt(), 3);
+    EXPECT_EQ(grouped[2].getObject()["_id"].numberInt(), 2);
 }
 
 TEST(TransactionOperationsTest, GetApplyOpsInfoRespectsOperationCountLimit) {
@@ -507,7 +665,7 @@ TEST(TransactionOperationsTest, LogOplogEntriesDoesNothingOnEmptyOperations) {
     auto numEntries = ops.logOplogEntries(oplogSlots,
                                           info,
                                           kWallClockTime,
-                                          WriteUnitOfWork::kDontGroup,
+                                          WriteUnitOfWork::noGroup,
                                           brokenLogApplyOpsFn,
                                           &imageToWrite);
     ASSERT_EQ(numEntries, 0);
@@ -572,12 +730,8 @@ TEST(TransactionOperationsTest, LogOplogEntriesSingleOperation) {
         return oplogSlots.back();
     };
     boost::optional<TransactionOperations::TransactionOperation::ImageBundle> imageToWrite;
-    auto numEntries = ops.logOplogEntries(oplogSlots,
-                                          info,
-                                          kWallClockTime,
-                                          WriteUnitOfWork::kDontGroup,
-                                          logApplyOpsFn,
-                                          &imageToWrite);
+    auto numEntries = ops.logOplogEntries(
+        oplogSlots, info, kWallClockTime, WriteUnitOfWork::noGroup, logApplyOpsFn, &imageToWrite);
     ASSERT_EQ(numEntries, 1U);
 }
 
@@ -699,12 +853,8 @@ TEST(TransactionOperationsTest, LogOplogEntriesMultipleOperationsCommitUnprepare
         return expectedOpTime;
     };
     boost::optional<TransactionOperations::TransactionOperation::ImageBundle> imageToWrite;
-    auto numEntries = ops.logOplogEntries(oplogSlots,
-                                          info,
-                                          kWallClockTime,
-                                          WriteUnitOfWork::kDontGroup,
-                                          logApplyOpsFn,
-                                          &imageToWrite);
+    auto numEntries = ops.logOplogEntries(
+        oplogSlots, info, kWallClockTime, WriteUnitOfWork::noGroup, logApplyOpsFn, &imageToWrite);
     ASSERT_EQ(numEntries, 3U);
 }
 
@@ -827,12 +977,8 @@ TEST(TransactionOperationsTest, LogOplogEntriesMultipleOperationsPreparedTransac
         return expectedOpTime;
     };
     boost::optional<TransactionOperations::TransactionOperation::ImageBundle> imageToWrite;
-    auto numEntries = ops.logOplogEntries(oplogSlots,
-                                          info,
-                                          kWallClockTime,
-                                          WriteUnitOfWork::kDontGroup,
-                                          logApplyOpsFn,
-                                          &imageToWrite);
+    auto numEntries = ops.logOplogEntries(
+        oplogSlots, info, kWallClockTime, WriteUnitOfWork::noGroup, logApplyOpsFn, &imageToWrite);
     ASSERT_EQ(numEntries, 3U);
 }
 
@@ -951,7 +1097,7 @@ TEST(TransactionOperationsTest, LogOplogEntriesMultipleOperationsRetryableWrite)
     auto numEntries = ops.logOplogEntries(oplogSlots,
                                           info,
                                           kWallClockTime,
-                                          WriteUnitOfWork::kGroupForPossiblyRetryableOperations,
+                                          WriteUnitOfWork::nonAtomicGroup,
                                           logApplyOpsFn,
                                           &imageToWrite);
     ASSERT_EQ(numEntries, 3U);
@@ -980,7 +1126,7 @@ DEATH_TEST(TransactionOperationsTestDeathTest,
     ops.logOplogEntries(oplogSlots,
                         info,
                         kWallClockTime,
-                        WriteUnitOfWork::kDontGroup,
+                        WriteUnitOfWork::noGroup,
                         doNothingLogApplyOpsFn,
                         &imageToWrite);
 }
@@ -1020,7 +1166,7 @@ TEST(TransactionOperationsTest,
     ASSERT_THROWS(ops.logOplogEntries(oplogSlots,
                                       info,
                                       kWallClockTime,
-                                      WriteUnitOfWork::kDontGroup,
+                                      WriteUnitOfWork::noGroup,
                                       doNothingLogApplyOpsFn,
                                       &imageToWrite),
                   ExceptionFor<ErrorCodes::TransactionTooLarge>);
@@ -1060,13 +1206,10 @@ TEST(TransactionOperationsTest, LogOplogEntriesExtractsPreImage) {
                                      WriteUnitOfWork::OplogEntryGroupType oplogGroupingFormat) {
         return writeOpTime;
     };
-    ASSERT_EQ(ops.logOplogEntries(oplogSlots,
-                                  info,
-                                  kWallClockTime,
-                                  WriteUnitOfWork::kDontGroup,
-                                  logApplyOps,
-                                  &imageToWrite),
-              info.numberOfOplogSlotsRequired);
+    ASSERT_EQ(
+        ops.logOplogEntries(
+            oplogSlots, info, kWallClockTime, WriteUnitOfWork::noGroup, logApplyOps, &imageToWrite),
+        info.numberOfOplogSlotsRequired);
 
     // Check image bundle.
     // Timestamp in image bundle should be based on optime returned by 'logApplyOps'.
@@ -1110,13 +1253,10 @@ TEST(TransactionOperationsTest, LogOplogEntriesExtractsPostImage) {
                                      WriteUnitOfWork::OplogEntryGroupType oplogGroupingFormat) {
         return writeOpTime;
     };
-    ASSERT_EQ(ops.logOplogEntries(oplogSlots,
-                                  info,
-                                  kWallClockTime,
-                                  WriteUnitOfWork::kDontGroup,
-                                  logApplyOps,
-                                  &imageToWrite),
-              info.numberOfOplogSlotsRequired);
+    ASSERT_EQ(
+        ops.logOplogEntries(
+            oplogSlots, info, kWallClockTime, WriteUnitOfWork::noGroup, logApplyOps, &imageToWrite),
+        info.numberOfOplogSlotsRequired);
 
     // Check image bundle.
     // Timestamp in image bundle should be based on optime returned by 'logApplyOps'.
@@ -1124,6 +1264,76 @@ TEST(TransactionOperationsTest, LogOplogEntriesExtractsPostImage) {
     ASSERT(imageToWrite->imageKind == repl::RetryImageEnum::kPostImage);
     ASSERT_BSONOBJ_EQ(imageToWrite->imageDoc, op.getPostImage());
     ASSERT_EQ(imageToWrite->timestamp, writeOpTime.getTimestamp());
+}
+
+// A null 'prePostImageToWriteToImageCollection' makes logOplogEntries() skip retry-image
+// extraction, as on the batched-write path. The operation still carries 'needsRetryImage' but has
+// no inline pre-image, so extracting it would trip an invariant; passing null must skip extraction
+// rather than crash.
+TEST(TransactionOperationsTest, LogOplogEntriesSkipsImageExtractionWithNullImageOutParam) {
+    TransactionOperations ops;
+
+    // The operation needs a retry image but, as on the batched-write path, no pre-image is
+    // recorded.
+    TransactionOperations::TransactionOperation op;
+    op.setOpType(repl::OpTypeEnum::kUpdate);
+    op.setNss(NamespaceString::createNamespaceString_forTest("test.t"));
+    op.setObject(BSON("$set" << BSON("x" << 1)));
+    op.setObject2(BSON("_id" << 1));
+    op.setNeedsRetryImage(repl::RetryImageEnum::kPreImage);
+    ASSERT_OK(ops.addOperation(op));
+
+    auto info = ops.getApplyOpsInfo(kOplogEntryCountLimit,
+                                    kOplogEntrySizeLimitBytes,
+                                    /*prepare=*/false);
+    ASSERT_EQ(info.numOperationsWithNeedsRetryImage, 1U);
+
+    std::vector<OplogSlot> oplogSlots;
+    for (std::size_t i = 0; i < info.numberOfOplogSlotsRequired; ++i) {
+        oplogSlots.push_back(OplogSlot{Timestamp(i + 1, 0), /*term=*/1LL});
+    }
+
+    // Passing null skips extraction and must not crash.
+    ASSERT_EQ(ops.logOplogEntries(oplogSlots,
+                                  info,
+                                  kWallClockTime,
+                                  WriteUnitOfWork::nonAtomicGroup,
+                                  doNothingLogApplyOpsFn,
+                                  /*prePostImageToWriteToImageCollection=*/nullptr),
+              info.numberOfOplogSlotsRequired);
+}
+
+// The counterpart to the test above: with extraction enabled (the default), an operation flagged
+// for a retry image but without an inline pre-image trips the invariant.
+DEATH_TEST(TransactionOperationsTestDeathTest,
+           LogOplogEntriesExtractingMissingPreImageInvariants,
+           "getPreImage") {
+    TransactionOperations ops;
+
+    TransactionOperations::TransactionOperation op;
+    op.setOpType(repl::OpTypeEnum::kUpdate);
+    op.setNss(NamespaceString::createNamespaceString_forTest("test.t"));
+    op.setObject(BSON("$set" << BSON("x" << 1)));
+    op.setObject2(BSON("_id" << 1));
+    op.setNeedsRetryImage(repl::RetryImageEnum::kPreImage);
+    ASSERT_OK(ops.addOperation(op));
+
+    auto info = ops.getApplyOpsInfo(kOplogEntryCountLimit,
+                                    kOplogEntrySizeLimitBytes,
+                                    /*prepare=*/false);
+    std::vector<OplogSlot> oplogSlots;
+    for (std::size_t i = 0; i < info.numberOfOplogSlotsRequired; ++i) {
+        oplogSlots.push_back(OplogSlot{Timestamp(i + 1, 0), /*term=*/1LL});
+    }
+
+    boost::optional<TransactionOperations::TransactionOperation::ImageBundle> imageToWrite;
+    // 'extractPrePostImages' defaults to true, so extraction runs and trips the invariant.
+    ops.logOplogEntries(oplogSlots,
+                        info,
+                        kWallClockTime,
+                        WriteUnitOfWork::nonAtomicGroup,
+                        doNothingLogApplyOpsFn,
+                        &imageToWrite);
 }
 
 // Refer to small transaction test case in retryable_findAndModify_validation.js.
@@ -1164,7 +1374,7 @@ TEST(TransactionOperationsTest, LogOplogEntriesMultiplePrePostImagesInSameEntry)
     ASSERT_THROWS_CODE(ops.logOplogEntries(oplogSlots,
                                            info,
                                            kWallClockTime,
-                                           WriteUnitOfWork::kDontGroup,
+                                           WriteUnitOfWork::noGroup,
                                            doNothingLogApplyOpsFn,
                                            &imageToWrite),
                        AssertionException,
@@ -1214,7 +1424,7 @@ TEST(TransactionOperationsTest, LogOplogEntriesMultiplePrePostImagesInDifferentE
     ASSERT_THROWS_CODE(ops.logOplogEntries(oplogSlots,
                                            info,
                                            kWallClockTime,
-                                           WriteUnitOfWork::kDontGroup,
+                                           WriteUnitOfWork::noGroup,
                                            doNothingLogApplyOpsFn,
                                            &imageToWrite),
                        AssertionException,

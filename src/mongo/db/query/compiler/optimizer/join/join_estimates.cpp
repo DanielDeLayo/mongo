@@ -4,6 +4,7 @@
 #include "mongo/db/query/compiler/optimizer/join/join_estimates.h"
 
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/namespace_string_util.h"
 
 #include <string_view>
 
@@ -23,12 +24,34 @@ std::string_view toStringData(MackertLohmanCase c) {
 
 void JoinExtraEstimateInfo::serialize(BSONObjBuilder& bob) const {
     QSNEstimate::serialize(bob);
+    if (cardinalityRHSBeforeJoinPred) {
+        // Emit a numeric value to match the shape of the 'cardinalityEstimate' field serialized by
+        // QSNEstimate::serialize() (see estimates.h). CardinalityEstimate::toBSON() would instead
+        // produce a nested {Cardinality, Source} object that is incompatible with that shape.
+        bob.append("cardinalityRHSBeforeJoinPred", cardinalityRHSBeforeJoinPred->toDouble());
+    }
+
+    if (!edgeSelectivities.empty()) {
+        BSONArrayBuilder arr(bob.subarrayStart("ndvEstimates"));
+        for (const auto& est : edgeSelectivities) {
+            BSONObjBuilder sub(arr.subobjStart());
+            sub.append("assumedPkSide",
+                       NamespaceStringUtil::serialize(est.assumedPkSide,
+                                                      SerializationContext::stateDefault()));
+            sub.append("ndv", est.ndv.toDouble());
+            sub.append("ndvSource", toStringData(est.source));
+            sub.append("selectivity", est.selectivity.toDouble());
+        }
+    }
+
     BSONObjBuilder subBob(bob.subobjStart("joinCostComponents"));
     subBob.append("docsProcessed", docsProcessed);
     subBob.append("docsOutput", docsOutput);
+    subBob.append("numDocsTransmitted", numDocsTransmitted);
     subBob.append("sequentialIOPages", sequentialIOPages);
     subBob.append("randomIOPages", randomIOPages);
     subBob.append("localOpCost", localOpCost);
+    subBob.append("totalCost", totalCost);
     if (mackertLohmanCase) {
         subBob.append("mackertLohmanCase", toStringData(*mackertLohmanCase));
     }
@@ -80,10 +103,12 @@ JoinCostEstimate::JoinCostEstimate(CardinalityEstimate numDocsProcessed,
                                    CardinalityEstimate numRandIOs,
                                    JoinCostEstimate leftCost,
                                    JoinCostEstimate rightCost,
-                                   MackertLohmanCase mackertLohmanCase)
+                                   MackertLohmanCase mackertLohmanCase,
+                                   CardinalityEstimate cardinalityRHSBeforeJoinPred)
     : JoinCostEstimate(
           numDocsProcessed, numDocsOutput, numSeqIOs, numRandIOs, leftCost, rightCost) {
     _mackertLohmanCase = mackertLohmanCase;
+    _cardinalityRHSBeforeJoinPred = cardinalityRHSBeforeJoinPred;
 }
 
 JoinCostEstimate::JoinCostEstimate(CostEstimate totalCost)
@@ -100,11 +125,19 @@ std::string JoinCostEstimate::toString() const {
 
 BSONObj JoinCostEstimate::toBSON() const {
     BSONObjBuilder bob;
-    bob << "totalCost" << _totalCost.toBSON() << "numDocsProcessed" << _numDocsProcessed.toBSON()
-        << "numDocsOutput" << _numDocsOutput.toBSON() << "ioSeqNumPages" << _ioSeqNumPages.toBSON()
-        << "ioRandNumPages" << _ioRandNumPages.toBSON();
-    if (_mackertLohmanCase) {
-        bob << "mackertLohmanCase" << toStringData(*_mackertLohmanCase);
+    bob << "totalCost" << _totalCost.toDouble();
+    {
+        BSONObjBuilder localBob(bob.subobjStart("localOpCost"));
+        localBob << "Cost" << _localOpCost.toDouble() << "Source" << _localOpCost.source()
+                 << "numDocsProcessed" << _numDocsProcessed.toBSON() << "numDocsOutput"
+                 << _numDocsOutput.toBSON() << "ioSeqNumPages" << _ioSeqNumPages.toBSON()
+                 << "ioRandNumPages" << _ioRandNumPages.toBSON();
+        if (_mackertLohmanCase) {
+            localBob << "mackertLohmanCase" << toStringData(*_mackertLohmanCase);
+        }
+        if (_cardinalityRHSBeforeJoinPred) {
+            localBob << "cardinalityRHSBeforeJoinPred" << _cardinalityRHSBeforeJoinPred->toBSON();
+        }
     }
     return bob.obj();
 }

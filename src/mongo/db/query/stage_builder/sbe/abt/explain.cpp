@@ -3,12 +3,6 @@
 
 #include "mongo/db/query/stage_builder/sbe/abt/explain.h"
 
-#include <cstddef>
-#include <cstdint>
-
-#include <boost/none.hpp>
-#include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/db/exec/sbe/makeobj_spec.h"
 #include "mongo/db/query/algebra/operator.h"
 #include "mongo/db/query/stage_builder/sbe/abt/comparison_op.h"
@@ -18,6 +12,8 @@
 #include "mongo/util/assert_util.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <iterator>
 #include <map>
@@ -25,6 +21,10 @@
 #include <string_view>
 #include <tuple>
 #include <vector>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 
 namespace mongo::abt {
@@ -997,9 +997,9 @@ static void printBSONstr(PrinterType& printer,
 }
 
 std::string ExplainGenerator::explainBSONStr(const ABT::reference_type node) {
-    sbe::value::TagValueOwned vg{explainBSON(node)};
+    sbe::value::TagValueOwned bson = sbe::value::TagValueOwned::fromRaw(explainBSON(node));
     ExplainPrinterImpl<ExplainVersion::V2> printer;
-    printBSONstr(printer, vg.tag(), vg.value());
+    printBSONstr(printer, bson.tag(), bson.value());
     return printer.str();
 }
 }  // namespace mongo::abt

@@ -64,7 +64,6 @@
 #include "mongo/db/sharding_environment/cluster_identity_loader.h"
 #include "mongo/db/sharding_environment/grid.h"
 #include "mongo/db/sharding_environment/shard_id.h"
-#include "mongo/db/sharding_environment/shard_ref.h"
 #include "mongo/db/sharding_environment/sharding_config_server_parameters_gen.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/db/topology/add_shard_gen.h"
@@ -72,7 +71,6 @@
 #include "mongo/db/topology/cluster_parameters/set_cluster_parameter_invocation.h"
 #include "mongo/db/topology/cluster_parameters/sharding_cluster_parameters_gen.h"
 #include "mongo/db/topology/remove_shard_draining_progress_gen.h"
-#include "mongo/db/topology/topology_change_helpers.h"
 #include "mongo/db/topology/user_write_block/set_user_write_block_mode_gen.h"
 #include "mongo/db/topology/user_write_block/user_writes_critical_section_document_gen.h"
 #include "mongo/db/topology/user_write_block/writes_recoverable_critical_section_service.h"
@@ -1745,7 +1743,7 @@ void addShardInTransaction(OperationContext* opCtx,
                            [&](const DatabaseName& dbName) {
                                return DatabaseType(
                                           dbName,
-                                          newShard.getHandle().toShardRef(opCtx),
+                                          newShard.getName(),
                                           DatabaseVersion(UUID::gen(), newShard.getTopologyTime()))
                                    .toBSON();
                            });
@@ -1760,10 +1758,9 @@ void addShardInTransaction(OperationContext* opCtx,
                            databasesInNewShard.end(),
                            std::back_inserter(placementEntries),
                            [&](const DatabaseName& dbName) {
-                               return NamespacePlacementType(
-                                          NamespaceString(dbName),
-                                          newShard.getTopologyTime(),
-                                          {newShard.getHandle().toShardRef(opCtx)})
+                               return NamespacePlacementType(NamespaceString(dbName),
+                                                             newShard.getTopologyTime(),
+                                                             {newShard.getName()})
                                    .toBSON();
                            });
             write_ops::InsertCommandRequest insertPlacementEntries(
@@ -1775,7 +1772,7 @@ void addShardInTransaction(OperationContext* opCtx,
         if (insertPlacementHistoryInitMetadata) {
             auto insertRequest =
                 ShardingCatalogManager::buildInsertReqForPlacementHistoryOperationalBoundaries(
-                    newShard.getTopologyTime(), {newShard.getHandle().toShardRef(opCtx)});
+                    newShard.getTopologyTime(), {newShard.getName()});
             auto insertResponse = txnClient.runCRUDOpSync(insertRequest, {});
             uassertStatusOK(insertResponse.toStatus());
         }

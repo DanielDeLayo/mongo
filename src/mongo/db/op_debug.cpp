@@ -11,6 +11,7 @@
 #include "mongo/db/curop_bson_helpers.h"
 #include "mongo/db/profile_filter.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_ranking/plan_selection_strategy.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_knobs/query_knob_configuration.h"
 #include "mongo/db/query/query_settings/query_settings.h"
@@ -138,19 +139,6 @@ void addSpillingStats(const absl::flat_hash_map<PlanSummaryStats::SpillingStage,
         addSingleSpillingStats(stage, stats, sortTotalDataSizeBytes, appendCallback);
     }
 }
-
-std::string_view getPlanRankerMethodName(PlanRankerMethod method) {
-    switch (method) {
-        case PlanRankerMethod::kMultiPlanner:
-            return "mp"sv;
-        case PlanRankerMethod::kCostBasedRanker:
-            return "cbr"sv;
-        case PlanRankerMethod::kNone:
-            return "none"sv;
-        default:
-            MONGO_UNREACHABLE;
-    }
-}
 }  // namespace
 
 #define OPDEBUG_TOSTRING_HELP(x) \
@@ -208,8 +196,6 @@ void OpDebug::report(OperationContext* opCtx,
     // OpDebug without an indicator from the command layer. Non-read commands handle views
     // differently (i.e. they don't resolve them in the same way), and should be logged
     // unconditionally.
-    // TODO SERVER-122926 Determine whether it is always correct to bypass setting/using
-    // collectionType for non-read commands and document accordingly.
     if (collectionType || curop.getReadWriteType() != Command::ReadWriteType::kRead) {
         pAttrs->addDeepCopy("collectionType", getCollectionTypeFromNamespaceString(curop.getNSS()));
     }
@@ -231,9 +217,7 @@ void OpDebug::report(OperationContext* opCtx,
         if (iscommand) {
             const Command* curCommand = curop.getCommand();
             if (curCommand) {
-                mutablebson::Document cmdToLog(query, mutablebson::Document::kInPlaceDisabled);
-                curCommand->snipForLogging(&cmdToLog);
-                pAttrs->add("command", redact(cmdToLog.getObject()));
+                pAttrs->add("command", redact(snipCommandForLogging(curCommand, query)));
             } else {
                 // Should not happen but we need to handle curCommand == NULL gracefully.
                 // We don't know what the request payload is intended to be, so it might be
@@ -333,6 +317,12 @@ void OpDebug::report(OperationContext* opCtx,
     OPDEBUG_TOATTR_HELP_BOOL_NAMED("usedDisk", additiveMetrics.usedDisk);
     OPDEBUG_TOATTR_HELP_BOOL_NAMED("fromMultiPlanner", additiveMetrics.fromMultiPlanner);
     OPDEBUG_TOATTR_HELP_BOOL_NAMED("fromPlanCache", additiveMetrics.fromPlanCache.value_or(false));
+    OPDEBUG_TOATTR_HELP_BOOL_NAMED("usedJoinOptimization", usedJoinOptimization);
+    if (const auto& joinMetrics = joinOptimizationMetrics) {
+        if (const auto& reason = joinMetrics->fallbackReason) {
+            pAttrs->addDeepCopy("fallbackReason", join_ordering::toReasonName(*reason));
+        }
+    }
     if (replanReason) {
         bool replanned = true;
         OPDEBUG_TOATTR_HELP_BOOL(replanned);
@@ -408,7 +398,7 @@ void OpDebug::report(OperationContext* opCtx,
             break;
     }
 
-    pAttrs->add("planRanker", getPlanRankerMethodName(planRankerMethod));
+    pAttrs->add("planRanker", getPlanSelectionStrategyName(planSelectionStrategy));
 
     if (!errInfo.isOK()) {
         pAttrs->add("ok", 0);
@@ -642,6 +632,12 @@ void OpDebug::append(OperationContext* opCtx,
     OPDEBUG_APPEND_BOOL2(b, "fromMultiPlanner", additiveMetrics.fromMultiPlanner);
     OPDEBUG_APPEND_BOOL2(b, "failedPlanningWithQuerySettings", failedPlanningWithQuerySettings);
     OPDEBUG_APPEND_BOOL2(b, "fromPlanCache", additiveMetrics.fromPlanCache.value_or(false));
+    OPDEBUG_APPEND_BOOL2(b, "usedJoinOptimization", usedJoinOptimization);
+    if (const auto& joinMetrics = joinOptimizationMetrics) {
+        if (const auto& reason = joinMetrics->fallbackReason) {
+            b.append("fallbackReason", join_ordering::toReasonName(*reason));
+        }
+    }
     if (replanReason) {
         bool replanned = true;
         OPDEBUG_APPEND_BOOL(b, replanned);
@@ -710,7 +706,7 @@ void OpDebug::append(OperationContext* opCtx,
             break;
     }
 
-    b.append("planRanker", getPlanRankerMethodName(planRankerMethod));
+    b.append("planRanker", getPlanSelectionStrategyName(planSelectionStrategy));
 
     {
         BSONObjBuilder locks(b.subobjStart("locks"));
@@ -726,7 +722,7 @@ void OpDebug::append(OperationContext* opCtx,
         }
 
         if (userAcquisitionStats->shouldReportLDAPOperationStats()) {
-            BSONObjBuilder ldapOperationStatsBuilder;
+            BSONObjBuilder ldapOperationStatsBuilder(b.subobjStart("LDAPOperations"));
             userAcquisitionStats->reportLdapOperationStats(
                 &ldapOperationStatsBuilder, opCtx->getServiceContext()->getTickSource());
         }
@@ -791,6 +787,9 @@ void OpDebug::append(OperationContext* opCtx,
     if (cpuTime >= Nanoseconds::zero()) {
         b.appendNumber("cpuNanos", durationCount<Nanoseconds>(cpuTime));
     }
+
+    // Extract admission and execution control queueing stats from AdmissionContext stored on opCtx
+    b.append("queues", TicketHolderQueueStats(opCtx).toBson());
 
     // millis/micros should always be present for any operation
     b.appendNumber(
@@ -1011,6 +1010,16 @@ std::function<BSONObj(OpDebug::AppendArgs)> OpDebug::appendStaged(OperationConte
     addIfNeeded("fromPlanCache", [](auto field, auto args, auto& b) {
         OPDEBUG_APPEND_BOOL2(b, field, args.op.getAdditiveMetrics().fromPlanCache.value_or(false));
     });
+    addIfNeeded("usedJoinOptimization", [](auto field, auto args, auto& b) {
+        OPDEBUG_APPEND_BOOL2(b, field, args.op.usedJoinOptimization);
+    });
+    addIfNeeded("fallbackReason", [](auto field, auto args, auto& b) {
+        if (const auto& joinMetrics = args.op.joinOptimizationMetrics) {
+            if (const auto& reason = joinMetrics->fallbackReason) {
+                b.append(field, join_ordering::toReasonName(*reason));
+            }
+        }
+    });
     addIfNeeded("replanned", [](auto field, auto args, auto& b) {
         if (args.op.replanReason) {
             OPDEBUG_APPEND_BOOL2(b, field, true);
@@ -1124,7 +1133,7 @@ std::function<BSONObj(OpDebug::AppendArgs)> OpDebug::appendStaged(OperationConte
     });
 
     addIfNeeded("planRanker", [](auto field, auto args, auto& b) {
-        b.append("planRanker", getPlanRankerMethodName(args.op.planRankerMethod));
+        b.append("planRanker", getPlanSelectionStrategyName(args.op.planSelectionStrategy));
     });
 
     addIfNeeded("locks", [](auto field, auto args, auto& b) {
@@ -1142,7 +1151,10 @@ std::function<BSONObj(OpDebug::AppendArgs)> OpDebug::appendStaged(OperationConte
                 &userCacheAcquisitionStatsBuilder,
                 args.opCtx->getServiceContext()->getTickSource());
         }
+    });
 
+    addIfNeeded("LDAPOperations", [](auto field, auto args, auto& b) {
+        auto userAcquisitionStats = args.curop.getUserAcquisitionStats();
         if (userAcquisitionStats->shouldReportLDAPOperationStats()) {
             BSONObjBuilder ldapOperationStatsBuilder(b.subobjStart(field));
             userAcquisitionStats->reportLdapOperationStats(
@@ -1216,6 +1228,10 @@ std::function<BSONObj(OpDebug::AppendArgs)> OpDebug::appendStaged(OperationConte
         if (args.op.cpuTime >= Nanoseconds::zero()) {
             b.appendNumber(field, durationCount<Nanoseconds>(args.op.cpuTime));
         }
+    });
+
+    addIfNeeded("queues", [](auto field, auto args, auto& b) {
+        b.append(field, TicketHolderQueueStats(args.opCtx).toBson());
     });
 
     // millis and durationMillis are the same thing. This is one of the few inconsistencies between
@@ -1327,6 +1343,12 @@ void OpDebug::setPlanSummaryMetrics(PlanSummaryStats&& planSummaryStats) {
 
     replanReason = std::move(planSummaryStats.replanReason);
     indexesUsed = std::move(planSummaryStats.indexesUsed);
+
+    if (planSummaryStats.planSelectionStrategy) {
+        planSelectionStrategy = planSummaryStats.planSelectionStrategy;
+    }
+
+    usedJoinOptimization = usedJoinOptimization || planSummaryStats.usedJoinOptimization;
 }
 
 BSONObj OpDebug::makeFlowControlObject(FlowControlTicketholder::CurOp stats) {

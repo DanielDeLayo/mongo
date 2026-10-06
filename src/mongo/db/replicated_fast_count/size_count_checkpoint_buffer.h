@@ -54,9 +54,9 @@ public:
     void scanToNoHolesEOF(SeekableRecordCursor& cursor);
 
     /**
-     * Acknowledges that the _inFlight result has been persisted and is safe to clear.
+     * Acknowledges that the _inFlight result is safe to clear.
      */
-    void acknowledgeFlushSuccess();
+    void acknowledgeFlush();
 
 private:
     // The options used to build every pending accumulator.
@@ -67,6 +67,11 @@ private:
     // The record ID of the last record consumed into _pending. The boost::none state means we have
     // not buffered any oplog entries yet.
     boost::optional<RecordId> _lastBufferedRid = boost::none;
+
+    // Set while the last buffered record ID has been observed to be lost and the anomaly reported,
+    // so the same loss is not re-reported on every scan. Cleared once scanning has recovered,
+    // re-arming the report for the next loss.
+    bool _reportedLostLastBufferedRid = false;
 
     mutable std::mutex _mutex;
     // Accumulated size/count deltas buffered but not checked out. See checkoutForFlush().

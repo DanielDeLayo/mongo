@@ -168,6 +168,7 @@ mongo_cc_library(
         "//src/mongo/db/stats:counters",
         "//src/mongo/executor:egress_connection_closer_manager",
         "//src/mongo/otel/traces:telemetry_context_serialization",
+        "//src/mongo/otel/traces/span",
         "//src/mongo/rpc",
         "//src/mongo/rpc:command_status",
         "//src/mongo/transport:message_compressor",
@@ -233,6 +234,7 @@ mongo_cc_library(
         "//src/mongo/otel:otel_base",
         "//src/mongo/otel/traces:telemetry_context_serialization",
         "//src/mongo/otel/traces:tracing_enablement",
+        "//src/mongo/otel/traces/span",
         "//src/mongo/rpc",
         "//src/mongo/rpc:command_status",
         "//src/mongo/util/net:ssl_manager",
@@ -741,5 +743,17 @@ mongo_cc_unit_test(
     deps = [
         ":native_sasl_client",
         "//src/mongo/db:server_base",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "rpc_local_timing_test",
+    srcs = [
+        "rpc_local_timing_test.cpp",
+    ],
+    tags = ["mongo_unittest_fourth_group"],
+    deps = [
+        ":async_client",
+        "//src/mongo/unittest",
     ],
 )

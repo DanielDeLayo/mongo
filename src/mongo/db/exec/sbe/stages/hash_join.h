@@ -54,6 +54,7 @@ public:
                   value::SlotVector innerCond,
                   value::SlotVector innerProjects,
                   boost::optional<value::SlotId> collatorSlot,
+                  bool allowDiskUse,
                   PlanYieldPolicySBE* yieldPolicy,
                   PlanNodeId planNodeId,
                   boost::optional<size_t> estimatedBuildCardinality,
@@ -75,9 +76,10 @@ public:
 
 protected:
     void doSaveState() final;
-    void doRestoreState() final;
 
 private:
+    bool probeRowsLiveAcrossYield() const;
+
     using HashElementAccessor = value::SingleRowPointerAccessor<const value::MaterializedRow*>;
 
     const value::SlotVector _outerKey;
@@ -85,6 +87,7 @@ private:
     const value::SlotVector _innerKey;
     const value::SlotVector _innerProjects;
     const boost::optional<value::SlotId> _collatorSlot;
+    const bool _allowDiskUse;
     boost::optional<size_t> _estimatedBuildCardinality;
 
     // All defined values from the inner/outer sides.

@@ -3,19 +3,22 @@
 
 #include "mongo/db/replicated_fast_count/replicated_fast_count_init.h"
 
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/op_observer/operation_logger_impl.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/replicated_fast_count/replicated_fast_count_manager.h"
 #include "mongo/db/rss/replicated_storage_service.h"
 #include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
-#include "mongo/db/shard_role/shard_role.h"
 #include "mongo/db/shard_role/transaction_resources.h"
 #include "mongo/db/storage/ident.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/record_store_write_conflict_fail_points.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/write_unit_of_work.h"
-#include "mongo/unittest/server_parameter_guard.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo::replicated_fast_count {
@@ -40,57 +43,7 @@ protected:
     ReplicatedFastCountManager* _fastCountManager;
 };
 
-const NamespaceString replicatedFastCountStoreNss =
-    NamespaceString::makeGlobalConfigCollection(NamespaceString::kReplicatedFastCountStore);
-
-const NamespaceString replicatedFastCountStoreTimestampsNss =
-    NamespaceString::makeGlobalConfigCollection(
-        NamespaceString::kReplicatedFastCountStoreTimestamps);
-
-TEST_F(ReplicatedFastCountInitTest,
-       setUpReplicatedFastCountCreatesInternalCollectionsAndStartsUpThread) {
-    {
-        auto coll = acquireCollection(
-            _opCtx,
-            CollectionAcquisitionRequest::fromOpCtx(
-                _opCtx, replicatedFastCountStoreNss, AcquisitionPrerequisites::kRead),
-            LockMode::MODE_IS);
-        ASSERT(!coll.exists());
-
-        auto collTimestamps = acquireCollection(
-            _opCtx,
-            CollectionAcquisitionRequest::fromOpCtx(
-                _opCtx, replicatedFastCountStoreTimestampsNss, AcquisitionPrerequisites::kRead),
-            LockMode::MODE_IS);
-        ASSERT(!collTimestamps.exists());
-    }
-
-    EXPECT_EQ(_fastCountManager->isRunning_ForTest(), false);
-
-    setUpReplicatedFastCount(_opCtx);
-
-    {
-        auto coll = acquireCollection(
-            _opCtx,
-            CollectionAcquisitionRequest::fromOpCtx(
-                _opCtx, replicatedFastCountStoreNss, AcquisitionPrerequisites::kRead),
-            LockMode::MODE_IS);
-        ASSERT(coll.exists());
-
-        auto collTimestamps = acquireCollection(
-            _opCtx,
-            CollectionAcquisitionRequest::fromOpCtx(
-                _opCtx, replicatedFastCountStoreTimestampsNss, AcquisitionPrerequisites::kRead),
-            LockMode::MODE_IS);
-        ASSERT(collTimestamps.exists());
-    }
-
-    EXPECT_EQ(_fastCountManager->isRunning_ForTest(), true);
-}
-
 TEST_F(ReplicatedFastCountInitTest, setUpReplicatedFastCountCreatesRecordStoreIdents) {
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", true);
-
     auto* storageEngine = _opCtx->getServiceContext()->getStorageEngine();
     auto* ru = shard_role_details::getRecoveryUnit(_opCtx);
 
@@ -112,8 +65,6 @@ TEST_F(ReplicatedFastCountInitTest, setUpReplicatedFastCountCreatesRecordStoreId
 }
 
 TEST_F(ReplicatedFastCountInitTest, setUpReplicatedFastCountIdempotentIdents) {
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", true);
-
     auto* storageEngine = _opCtx->getServiceContext()->getStorageEngine();
     auto* engine = storageEngine->getEngine();
     auto* ru = shard_role_details::getRecoveryUnit(_opCtx);
@@ -137,9 +88,7 @@ TEST_F(ReplicatedFastCountInitTest, setUpReplicatedFastCountIdempotentIdents) {
     // Write a record to the metadata store so we can verify it is preserved on re-setup.
     {
         auto [metadataSCS, _] = _fastCountManager->getSizeCountStores_ForTest();
-        auto metadataContainerSCS = dynamic_cast<ContainerSizeCountStore*>(metadataSCS);
-        ASSERT(metadataContainerSCS);
-        auto metadataRS = metadataContainerSCS->rs_ForTest();
+        auto metadataRS = metadataSCS->rs_ForTest();
 
         WriteUnitOfWork wuow(_opCtx);
         std::string key = "test_key";
@@ -160,36 +109,14 @@ TEST_F(ReplicatedFastCountInitTest, setUpReplicatedFastCountIdempotentIdents) {
     // Verify the previously written record is still present.
     {
         auto [metadataSCS, _] = _fastCountManager->getSizeCountStores_ForTest();
-        auto metadataContainerSCS = dynamic_cast<ContainerSizeCountStore*>(metadataSCS);
-        ASSERT(metadataContainerSCS);
-        auto metadataRS = metadataContainerSCS->rs_ForTest();
+        auto metadataRS = metadataSCS->rs_ForTest();
 
         auto cursor = metadataRS->getCursor(_opCtx, *ru);
         EXPECT_TRUE(cursor->next());
     }
 }
 
-TEST_F(ReplicatedFastCountInitTest, setUpReplicatedFastCountSkipsContainersWhenFlagDisabled) {
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", false);
-
-    auto* storageEngine = _opCtx->getServiceContext()->getStorageEngine();
-    auto* ru = shard_role_details::getRecoveryUnit(_opCtx);
-
-    setUpReplicatedFastCount(_opCtx);
-
-    // Containers should not be created when the flag is disabled.
-    EXPECT_FALSE(
-        storageEngine->getEngine()->hasIdent(*ru, std::string(ident::kFastCountMetadataStore)));
-    EXPECT_FALSE(storageEngine->getEngine()->hasIdent(
-        *ru, std::string(ident::kFastCountMetadataStoreTimestamps)));
-
-    // Collections and manager should still be set up.
-    EXPECT_EQ(_fastCountManager->isRunning_ForTest(), true);
-}
-
 TEST_F(ReplicatedFastCountInitTest, StartingUpThenShuttingDownDoesNotHang) {
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", true);
-
     const int numIterations = 100;
     for (int i = 0; i < numIterations; ++i) {
         setUpReplicatedFastCount(_opCtx);
@@ -198,8 +125,6 @@ TEST_F(ReplicatedFastCountInitTest, StartingUpThenShuttingDownDoesNotHang) {
 }
 
 TEST_F(ReplicatedFastCountInitTest, setUpReplicatedFastCountCreatesBothWhenOnlyMetadataExists) {
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", true);
-
     auto* storageEngine = _opCtx->getServiceContext()->getStorageEngine();
     auto* engine = storageEngine->getEngine();
     auto* ru = shard_role_details::getRecoveryUnit(_opCtx);
@@ -227,8 +152,6 @@ TEST_F(ReplicatedFastCountInitTest, setUpReplicatedFastCountCreatesBothWhenOnlyM
 }
 
 TEST_F(ReplicatedFastCountInitTest, setUpReplicatedFastCountFailsWhenOnlyNonEmptyMetadataExists) {
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", true);
-
     auto* storageEngine = _opCtx->getServiceContext()->getStorageEngine();
     auto* engine = storageEngine->getEngine();
     auto* ru = shard_role_details::getRecoveryUnit(_opCtx);
@@ -267,8 +190,6 @@ TEST_F(ReplicatedFastCountInitTest, setUpReplicatedFastCountFailsWhenOnlyNonEmpt
 }
 
 TEST_F(ReplicatedFastCountInitTest, setUpReplicatedFastCountCreatesBothWhenOnlyTimestampsExists) {
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", true);
-
     auto* storageEngine = _opCtx->getServiceContext()->getStorageEngine();
     auto* engine = storageEngine->getEngine();
     auto* ru = shard_role_details::getRecoveryUnit(_opCtx);
@@ -296,8 +217,6 @@ TEST_F(ReplicatedFastCountInitTest, setUpReplicatedFastCountCreatesBothWhenOnlyT
 }
 
 TEST_F(ReplicatedFastCountInitTest, setUpReplicatedFastCountFailsWhenOnlyNonEmptyTimestampsExists) {
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", true);
-
     auto* storageEngine = _opCtx->getServiceContext()->getStorageEngine();
     auto* engine = storageEngine->getEngine();
     auto* ru = shard_role_details::getRecoveryUnit(_opCtx);
@@ -424,6 +343,260 @@ TEST_F(ReplicatedFastCountInitTest, handleExistingFastCountIdentReusesEmptyLongI
     ASSERT_OK(status);
     EXPECT_FALSE(msg.empty());
     EXPECT_NE(msg.find(std::string(ident::kFastCountMetadataStoreTimestamps)), std::string::npos);
+}
+
+TEST_F(ReplicatedFastCountInitTest, dropInternalFastCountContainersRemovesExistingIdents) {
+    auto* engine = _opCtx->getServiceContext()->getStorageEngine()->getEngine();
+    auto* ru = shard_role_details::getRecoveryUnit(_opCtx);
+    auto& provider = rss::ReplicatedStorageService::get(_opCtx).getPersistenceProvider();
+
+    // Create both container idents directly, as they would exist on disk when a previously
+    // running node begins a resync. This deliberately does not bind the manager to them, matching
+    // the state during initial sync's drop phase.
+    {
+        WriteUnitOfWork wuow(_opCtx);
+        ASSERT_OK(engine->createRecordStore(provider,
+                                            *ru,
+                                            NamespaceString::kAdminCommandNamespace,
+                                            ident::kFastCountMetadataStore,
+                                            RecordStore::Options{.keyFormat = KeyFormat::String}));
+        ASSERT_OK(engine->createRecordStore(provider,
+                                            *ru,
+                                            NamespaceString::kAdminCommandNamespace,
+                                            ident::kFastCountMetadataStoreTimestamps,
+                                            RecordStore::Options{.keyFormat = KeyFormat::Long}));
+        wuow.commit();
+    }
+
+    // Write a stale record into the metadata container to represent leftover per-collection state.
+    {
+        auto rs = engine->getRecordStore(_opCtx,
+                                         NamespaceString::kAdminCommandNamespace,
+                                         ident::kFastCountMetadataStore,
+                                         RecordStore::Options{.keyFormat = KeyFormat::String},
+                                         boost::none);
+        WriteUnitOfWork wuow(_opCtx);
+        std::string key = "stale_key";
+        RecordId rid(std::span<const char>(key.data(), key.size()));
+        const char data[] = "value";
+        ASSERT_OK(rs->insertRecord(_opCtx, *ru, rid, data, sizeof(data), Timestamp{}));
+        wuow.commit();
+    }
+
+    EXPECT_TRUE(engine->hasIdent(*ru, ident::kFastCountMetadataStore));
+    EXPECT_TRUE(engine->hasIdent(*ru, ident::kFastCountMetadataStoreTimestamps));
+
+    dropInternalFastCountContainers(_opCtx);
+
+    // The drop is scheduled as an immediate drop-pending ident. Complete the pending drops to
+    // observe that the tables -- and therefore the stale record -- are gone.
+    auto* storageEngine = _opCtx->getServiceContext()->getStorageEngine();
+    ASSERT_OK(
+        storageEngine->immediatelyCompletePendingDrop(_opCtx, ident::kFastCountMetadataStore));
+    ASSERT_OK(storageEngine->immediatelyCompletePendingDrop(
+        _opCtx, ident::kFastCountMetadataStoreTimestamps));
+
+    EXPECT_FALSE(engine->hasIdent(*ru, ident::kFastCountMetadataStore));
+    EXPECT_FALSE(engine->hasIdent(*ru, ident::kFastCountMetadataStoreTimestamps));
+}
+
+TEST_F(ReplicatedFastCountInitTest, dropInternalFastCountContainersIsNoOpWhenAbsent) {
+    auto* engine = _opCtx->getServiceContext()->getStorageEngine()->getEngine();
+    auto* ru = shard_role_details::getRecoveryUnit(_opCtx);
+
+    EXPECT_FALSE(engine->hasIdent(*ru, ident::kFastCountMetadataStore));
+    EXPECT_FALSE(engine->hasIdent(*ru, ident::kFastCountMetadataStoreTimestamps));
+
+    // Dropping when the containers do not exist must not throw or create anything.
+    dropInternalFastCountContainers(_opCtx);
+
+    EXPECT_FALSE(engine->hasIdent(*ru, ident::kFastCountMetadataStore));
+    EXPECT_FALSE(engine->hasIdent(*ru, ident::kFastCountMetadataStoreTimestamps));
+}
+
+TEST_F(ReplicatedFastCountInitTest, dropInternalFastCountContainersHandlesPartialState) {
+    auto* engine = _opCtx->getServiceContext()->getStorageEngine()->getEngine();
+    auto* ru = shard_role_details::getRecoveryUnit(_opCtx);
+    auto& provider = rss::ReplicatedStorageService::get(_opCtx).getPersistenceProvider();
+
+    // Only the metadata ident exists (e.g. a partial prior state). The drop must remove it and
+    // leave the (absent) timestamps ident handling as a no-op.
+    {
+        WriteUnitOfWork wuow(_opCtx);
+        ASSERT_OK(engine->createRecordStore(provider,
+                                            *ru,
+                                            NamespaceString::kAdminCommandNamespace,
+                                            ident::kFastCountMetadataStore,
+                                            RecordStore::Options{.keyFormat = KeyFormat::String}));
+        wuow.commit();
+    }
+
+    EXPECT_TRUE(engine->hasIdent(*ru, ident::kFastCountMetadataStore));
+    EXPECT_FALSE(engine->hasIdent(*ru, ident::kFastCountMetadataStoreTimestamps));
+
+    dropInternalFastCountContainers(_opCtx);
+
+    // Complete the scheduled drop-pending drop; the absent timestamps ident is a no-op.
+    auto* storageEngine = _opCtx->getServiceContext()->getStorageEngine();
+    ASSERT_OK(
+        storageEngine->immediatelyCompletePendingDrop(_opCtx, ident::kFastCountMetadataStore));
+
+    EXPECT_FALSE(engine->hasIdent(*ru, ident::kFastCountMetadataStore));
+    EXPECT_FALSE(engine->hasIdent(*ru, ident::kFastCountMetadataStoreTimestamps));
+}
+
+TEST_F(ReplicatedFastCountInitTest, dropInternalFastCountContainersAllowsCleanRecreate) {
+    auto* engine = _opCtx->getServiceContext()->getStorageEngine()->getEngine();
+    auto* ru = shard_role_details::getRecoveryUnit(_opCtx);
+    auto& provider = rss::ReplicatedStorageService::get(_opCtx).getPersistenceProvider();
+
+    // Simulate a stale metadata container carrying a leftover record.
+    {
+        WriteUnitOfWork wuow(_opCtx);
+        ASSERT_OK(engine->createRecordStore(provider,
+                                            *ru,
+                                            NamespaceString::kAdminCommandNamespace,
+                                            ident::kFastCountMetadataStore,
+                                            RecordStore::Options{.keyFormat = KeyFormat::String}));
+        ASSERT_OK(engine->createRecordStore(provider,
+                                            *ru,
+                                            NamespaceString::kAdminCommandNamespace,
+                                            ident::kFastCountMetadataStoreTimestamps,
+                                            RecordStore::Options{.keyFormat = KeyFormat::Long}));
+        wuow.commit();
+    }
+    {
+        auto rs = engine->getRecordStore(_opCtx,
+                                         NamespaceString::kAdminCommandNamespace,
+                                         ident::kFastCountMetadataStore,
+                                         RecordStore::Options{.keyFormat = KeyFormat::String},
+                                         boost::none);
+        WriteUnitOfWork wuow(_opCtx);
+        std::string key = "stale_key";
+        RecordId rid(std::span<const char>(key.data(), key.size()));
+        const char data[] = "value";
+        ASSERT_OK(rs->insertRecord(_opCtx, *ru, rid, data, sizeof(data), Timestamp{}));
+        wuow.commit();
+    }
+
+    dropInternalFastCountContainers(_opCtx);
+
+    // After the drop, re-creating the containers succeeds and yields an empty metadata store, i.e.
+    // a clean slate with no stale record carried over.
+    ASSERT_OK(createInternalFastCountContainers(_opCtx,
+                                                NamespaceString::kAdminCommandNamespace,
+                                                ident::kFastCountMetadataStore,
+                                                KeyFormat::String,
+                                                ident::kFastCountMetadataStoreTimestamps,
+                                                KeyFormat::Long,
+                                                /*writeToOplog=*/false));
+
+    EXPECT_TRUE(engine->hasIdent(*ru, ident::kFastCountMetadataStore));
+    EXPECT_TRUE(engine->hasIdent(*ru, ident::kFastCountMetadataStoreTimestamps));
+
+    auto rs = engine->getRecordStore(_opCtx,
+                                     NamespaceString::kAdminCommandNamespace,
+                                     ident::kFastCountMetadataStore,
+                                     RecordStore::Options{.keyFormat = KeyFormat::String},
+                                     boost::none);
+    auto cursor = rs->getCursor(_opCtx, *ru);
+    EXPECT_FALSE(cursor->next());
+}
+
+/**
+ * Fixture to inject a WriteConflictException when creating internal fast count containers.
+ * Specifically, this injects a WCE into the call to write an oplog entry for container creation,
+ * not into the write to create the containers, since there isn't currently machinery to inject a
+ * WCE there; however, a WCE from either of these writes would be handled in the same write conflict
+ * retry loop, which gets exercised in these tests.
+ */
+class ReplicatedFastCountInitOplogTest : public ReplicatedFastCountInitTest {
+protected:
+    void setUp() override {
+        ReplicatedFastCountInitTest::setUp();
+
+        auto* registry = dynamic_cast<OpObserverRegistry*>(getServiceContext()->getOpObserver());
+        ASSERT(registry);
+        registry->addObserver(
+            std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerImpl>()));
+    }
+
+    Status createContainers() {
+        return createInternalFastCountContainers(_opCtx,
+                                                 NamespaceString::kAdminCommandNamespace,
+                                                 ident::kFastCountMetadataStore,
+                                                 KeyFormat::String,
+                                                 ident::kFastCountMetadataStoreTimestamps,
+                                                 KeyFormat::Long,
+                                                 /*writeToOplog=*/true);
+    }
+
+    // Asserts both containers exist and do not contain any records.
+    void assertContainersExistAndAreEmpty() {
+        auto* engine = _opCtx->getServiceContext()->getStorageEngine()->getEngine();
+        auto* ru = shard_role_details::getRecoveryUnit(_opCtx);
+
+        ASSERT_TRUE(engine->hasIdent(*ru, ident::kFastCountMetadataStore));
+        ASSERT_TRUE(engine->hasIdent(*ru, ident::kFastCountMetadataStoreTimestamps));
+
+        for (auto [identName, keyFormat] :
+             {std::pair{ident::kFastCountMetadataStore, KeyFormat::String},
+              std::pair{ident::kFastCountMetadataStoreTimestamps, KeyFormat::Long}}) {
+            auto rs = engine->getRecordStore(_opCtx,
+                                             NamespaceString::kAdminCommandNamespace,
+                                             identName,
+                                             RecordStore::Options{.keyFormat = keyFormat},
+                                             /*uuid=*/boost::none);
+            ASSERT(rs);
+            ASSERT_EQ(rs->keyFormat(), keyFormat);
+            EXPECT_FALSE(rs->getCursor(_opCtx, *ru)->next()) << identName << " is not empty";
+        }
+    }
+
+    // Returns the detected number of 'initReplicatedFastCount' oplog entries.
+    int64_t countInitOplogEntries() {
+        DBDirectClient client(_opCtx);
+        return client.count(NamespaceString::kRsOplogNamespace,
+                            BSON("o.initReplicatedFastCount" << 1));
+    }
+};
+
+TEST_F(ReplicatedFastCountInitOplogTest, CreateContainersRetriesOnWriteConflict) {
+    auto failPoint = enableWriteConflictForWrites(
+        FailPoint::ModeOptions{.mode = FailPoint::Mode::nTimes, .val = 1});
+    const auto initialTimesEntered = failPoint->initialTimesEntered();
+
+    ASSERT_OK(createContainers());
+
+    ASSERT_EQ(initialTimesEntered + 1, (*failPoint)->waitForTimesEntered(initialTimesEntered + 1));
+
+    assertContainersExistAndAreEmpty();
+    ASSERT_EQ(countInitOplogEntries(), 1);
+}
+
+TEST_F(ReplicatedFastCountInitOplogTest, CreateContainersRetriesRepeatedlyOnWriteConflict) {
+    auto failPoint = enableWriteConflictForWrites(
+        FailPoint::ModeOptions{.mode = FailPoint::Mode::nTimes, .val = 3});
+    const auto initialTimesEntered = failPoint->initialTimesEntered();
+
+    ASSERT_OK(createContainers());
+
+    ASSERT_EQ(initialTimesEntered + 3, (*failPoint)->waitForTimesEntered(initialTimesEntered + 3));
+
+    assertContainersExistAndAreEmpty();
+    ASSERT_EQ(countInitOplogEntries(), 1);
+}
+
+TEST_F(ReplicatedFastCountInitOplogTest, SetUpReplicatedFastCountDoesNotCrashOnWriteConflict) {
+    auto failPoint = enableWriteConflictForWrites(
+        FailPoint::ModeOptions{.mode = FailPoint::Mode::nTimes, .val = 1});
+    const auto initialTimesEntered = failPoint->initialTimesEntered();
+
+    setUpReplicatedFastCount(_opCtx);
+
+    ASSERT_EQ(initialTimesEntered + 1, (*failPoint)->waitForTimesEntered(initialTimesEntered + 1));
+
+    assertContainersExistAndAreEmpty();
 }
 
 }  // namespace

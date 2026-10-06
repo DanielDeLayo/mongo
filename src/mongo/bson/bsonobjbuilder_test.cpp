@@ -1,6 +1,22 @@
 // Copyright (c) MongoDB, Inc.
 // SPDX-License-Identifier: SSPL-1.0
 
+#include "mongo/bson/bsonobjbuilder.h"
+
+#include "mongo/base/data_range.h"
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/static_assert.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/shared_buffer.h"
+
 #include <initializer_list>
 #include <limits>
 #include <list>
@@ -13,23 +29,8 @@
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/vector.hpp>
-// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
-#include "mongo/base/data_range.h"
-#include "mongo/base/data_type_endian.h"
-#include "mongo/base/error_codes.h"
-#include "mongo/base/static_assert.h"
-#include "mongo/bson/bsonelement.h"
-#include "mongo/bson/bsonmisc.h"
-#include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/bsontypes.h"
-#include "mongo/bson/timestamp.h"
-#include "mongo/bson/util/builder.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/assert_util.h"
-#include "mongo/util/shared_buffer.h"
-
 #include <boost/move/utility_core.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
 
 namespace mongo {
 namespace {
@@ -198,6 +199,21 @@ TEST(BSONObjBuilderTest, ResetToEmptyResultsInEmptyObj) {
     BSONObjBuilder bob;
     bob.append("a", 3);
     bob.resetToEmpty();
+    ASSERT_BSONOBJ_EQ(BSONObj(), bob.obj());
+}
+
+TEST(BSONObjBuilderTest, CapacityGrowsWithContentAndSurvivesResetToEmpty) {
+    BSONObjBuilder bob;
+    ASSERT_GTE(bob.capacity(), bob.len());
+
+    bob.append("a", std::string(4096, 'x'));
+    ASSERT_GTE(bob.capacity(), bob.len());
+    ASSERT_GT(bob.capacity(), 4096);
+
+    const int grownCapacity = bob.capacity();
+    bob.resetToEmpty();
+    ASSERT_EQ(bob.capacity(), grownCapacity);
+    ASSERT_LT(bob.len(), grownCapacity);
     ASSERT_BSONOBJ_EQ(BSONObj(), bob.obj());
 }
 
@@ -576,6 +592,95 @@ TEST(BSONObjBuilderTest, QueryConstraintLabelSingle) {
 TEST(BSONObjBuilderTest, QueryConstraintLabelCompound) {
     ASSERT_BSONOBJ_EQ(BSON("ts" << GTE << 123 << LTE << 456),
                       BSON("ts" << BSON("$gte" << 123 << "$lte" << 456)));
+}
+
+TEST(BSONObjBuilderTest, AppendElementsUniqueEmptyInputs) {
+    auto assertIsEqualAfterAppendingToEmpty = [](const BSONObj& obj) {
+        ASSERT_BSONOBJ_EQ(BSONObjBuilder().appendElementsUnique(obj).obj(), obj);
+    };
+
+    assertIsEqualAfterAppendingToEmpty(BSONObj());
+    assertIsEqualAfterAppendingToEmpty(BSON("a" << 1));
+    assertIsEqualAfterAppendingToEmpty(BSON("a" << 1 << "b" << 2));
+}
+
+TEST(BSONObjBuilderTest, AppendElementsUniqueSkipsDuplicates) {
+    // All field names are already present, so nothing is appended.
+    ASSERT_BSONOBJ_EQ(BSONObjBuilder(BSON("a" << 1 << "b" << 2))
+                          .appendElementsUnique(BSON("b" << 20 << "a" << 10))
+                          .obj(),
+                      BSON("a" << 1 << "b" << 2));
+
+    // Only the field names not present yet are appended, in the order of the input object.
+    ASSERT_BSONOBJ_EQ(BSONObjBuilder(BSON("a" << 1 << "b" << 2))
+                          .appendElementsUnique(BSON("d" << 40 << "b" << 20 << "c" << 30))
+                          .obj(),
+                      BSON("a" << 1 << "b" << 2 << "d" << 40 << "c" << 30));
+}
+
+TEST(BSONObjBuilderTest, AppendElementsUniqueComparesFullFieldNames) {
+    // Field names which are prefixes of each other must not be confused, and neither must the
+    // empty field name.
+    ASSERT_BSONOBJ_EQ(
+        BSONObjBuilder(BSON("a" << 1 << "" << 0))
+            .appendElementsUnique(BSON("ab" << 2 << "a" << 10 << "abc" << 3 << "" << 9).getOwned())
+            .obj(),
+        BSON("a" << 1 << "" << 0 << "ab" << 2 << "abc" << 3));
+}
+
+TEST(BSONObjBuilderTest, AppendElementsUniqueSurvivesBufferReallocation) {
+    // Appending grows the builder's buffer and reallocates it, which invalidates any pointer
+    // into the previously observed field names. The offsets recorded for the existing field
+    // names must remain usable across those reallocations.
+    const std::string big(4096, 'x');
+
+    BSONObjBuilder bob;
+    bob.append("a", 1);
+    bob.append("b", 2);
+
+    auto obj = BSONObjBuilder{}
+                   .append("c", big)
+                   .append("a", big)
+                   .append("d", big)
+                   .append("b", big)
+                   .append("e", big)
+                   .obj();
+
+    const int capacityBefore = bob.capacity();
+    const char* bufBefore = bob.bb().buf();
+
+    bob.appendElementsUnique(obj);
+
+    // Verify that the buffer really was reallocated, otherwise the test would not exercise
+    // anything.
+    ASSERT_GT(bob.capacity(), capacityBefore);
+    ASSERT_NE(static_cast<const void*>(bob.bb().buf()), static_cast<const void*>(bufBefore));
+
+    ASSERT_BSONOBJ_EQ(bob.obj(),
+                      BSON("a" << 1 << "b" << 2 << "c" << big << "d" << big << "e" << big));
+}
+
+TEST(BSONObjBuilderTest, AppendElementsUniqueOnNestedBuilder) {
+    // A nested builder starts at a non-zero offset into the shared buffer.
+    const std::string big(4096, 'y');
+
+    BSONObjBuilder outer;
+    outer.append("x", big);
+    {
+        BSONObjBuilder inner(outer.subobjStart("nested"));
+        inner.append("a", 1);
+        inner.appendElementsUnique(BSON("a" << 10 << "b" << 2));
+    }
+    ASSERT_BSONOBJ_EQ(outer.obj(), BSON("x" << big << "nested" << BSON("a" << 1 << "b" << 2)));
+}
+
+TEST(BSONObjBuilderTest, AppendElementsUniqueDoesNotDeduplicateWithinInput) {
+    // Duplicates within the input object itself are not filtered; only field names already
+    // present in the builder are skipped.
+    ASSERT_BSONOBJ_EQ(BSONObjBuilder(BSON("a" << 1))
+                          .appendElementsUnique(BSON("a" << 10 << "b" << 2 << "b" << 3))
+                          .obj(),
+                      BSON("a" << 1 << "b" << 2 << "b" << 3));
 }
 
 TEST(BSONObjBuilderTest, AppendRenamed) {

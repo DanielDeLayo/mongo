@@ -13,6 +13,7 @@
 #include "mongo/db/keypattern.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/namespace_string_util.h"
 #include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/db/query/compiler/logical_model/projection/projection_ast_util.h"
 #include "mongo/db/query/compiler/optimizer/index_bounds_builder/index_bounds_builder.h"
@@ -90,7 +91,84 @@ bool rangeCanContainString(const BSONElement& startKey,
     return !stringBoundsOil.intervals.empty();
 }
 
-// Helper for 'getAllSecondaryNamespaces' that deduplicates namespaces.
+// Helper to extract a keypattern from a QSN node that has one.
+boost::optional<KeyPattern> getKeyPattern(const QuerySolutionNode* node) {
+    switch (node->getType()) {
+        case STAGE_COUNT_SCAN: {
+            return KeyPattern{static_cast<const CountScanNode*>(node)->index.keyPattern};
+        }
+        case STAGE_DISTINCT_SCAN: {
+            return KeyPattern{static_cast<const DistinctNode*>(node)->index.keyPattern};
+        }
+        case STAGE_GEO_NEAR_2D: {
+            return KeyPattern{static_cast<const GeoNear2DNode*>(node)->index.keyPattern};
+        }
+        case STAGE_GEO_NEAR_2DSPHERE: {
+            return KeyPattern{static_cast<const GeoNear2DSphereNode*>(node)->index.keyPattern};
+        }
+        case STAGE_INDEX_PROBE_NODE: {
+            return KeyPattern{static_cast<const IndexProbeNode*>(node)->index.keyPattern};
+        }
+        case STAGE_IXSCAN: {
+            return KeyPattern{static_cast<const IndexScanNode*>(node)->index.keyPattern};
+        }
+        case STAGE_TEXT_MATCH: {
+            return KeyPattern{static_cast<const TextMatchNode*>(node)->indexPrefix};
+        }
+        default:
+            return boost::none;
+    }
+}
+
+// Helper to extract a namespace from a QSN node that has one.
+boost::optional<NamespaceString> getNamespace(const QuerySolutionNode* qsn) {
+    if (auto node = dynamic_cast<const EqLookupNode*>(qsn)) {
+        return node->foreignCollection;
+    }
+
+    if (auto node = dynamic_cast<const IndexScanNode*>(qsn)) {
+        return node->nss;
+    }
+
+    if (auto node = dynamic_cast<const FetchNode*>(qsn)) {
+        return node->nss;
+    }
+
+    if (auto node = dynamic_cast<const CollectionScanNode*>(qsn)) {
+        return node->nss;
+    }
+
+    if (auto node = dynamic_cast<const CountScanNode*>(qsn)) {
+        return node->nss;
+    }
+
+    if (auto node = dynamic_cast<const DistinctNode*>(qsn)) {
+        return node->nss;
+    }
+
+    if (auto node = dynamic_cast<const TextMatchNode*>(qsn)) {
+        return node->nss;
+    }
+
+    if (auto node = dynamic_cast<const SearchNode*>(qsn)) {
+        return node->nss;
+    }
+
+    if (auto node = dynamic_cast<const GeoNear2DNode*>(qsn)) {
+        return node->nss;
+    }
+
+    if (auto node = dynamic_cast<const GeoNear2DSphereNode*>(qsn)) {
+        return node->nss;
+    }
+
+    if (auto node = dynamic_cast<const IndexProbeNode*>(qsn)) {
+        return node->nss;
+    }
+
+    return boost::none;
+}
+
 void getAllSecondaryNamespacesHelper(const QuerySolutionNode* qsn,
                                      const NamespaceString& mainNss,
                                      std::set<NamespaceString>& secondaryNssSet) {
@@ -98,49 +176,65 @@ void getAllSecondaryNamespacesHelper(const QuerySolutionNode* qsn,
         return;
     }
 
-    if (auto node = dynamic_cast<const EqLookupNode*>(qsn);
-        node && node->foreignCollection != mainNss) {
-        secondaryNssSet.emplace(node->foreignCollection);
-    }
-
-    if (auto node = dynamic_cast<const IndexScanNode*>(qsn); node && node->nss != mainNss) {
-        secondaryNssSet.emplace(node->nss);
-    }
-
-    if (auto node = dynamic_cast<const FetchNode*>(qsn); node && node->nss != mainNss) {
-        secondaryNssSet.emplace(node->nss);
-    }
-
-    if (auto node = dynamic_cast<const CollectionScanNode*>(qsn); node && node->nss != mainNss) {
-        secondaryNssSet.emplace(node->nss);
-    }
-
-    if (auto node = dynamic_cast<const CountScanNode*>(qsn); node && node->nss != mainNss) {
-        secondaryNssSet.emplace(node->nss);
-    }
-
-    if (auto node = dynamic_cast<const DistinctNode*>(qsn); node && node->nss != mainNss) {
-        secondaryNssSet.emplace(node->nss);
-    }
-
-    if (auto node = dynamic_cast<const TextMatchNode*>(qsn); node && node->nss != mainNss) {
-        secondaryNssSet.emplace(node->nss);
-    }
-
-    if (auto node = dynamic_cast<const SearchNode*>(qsn); node && node->nss != mainNss) {
-        secondaryNssSet.emplace(node->nss);
-    }
-
-    if (auto node = dynamic_cast<const GeoNear2DNode*>(qsn); node && node->nss != mainNss) {
-        secondaryNssSet.emplace(node->nss);
-    }
-
-    if (auto node = dynamic_cast<const GeoNear2DSphereNode*>(qsn); node && node->nss != mainNss) {
-        secondaryNssSet.emplace(node->nss);
+    if (auto nss = getNamespace(qsn); nss && *nss != mainNss) {
+        secondaryNssSet.emplace(*nss);
     }
 
     for (auto&& child : qsn->children) {
         getAllSecondaryNamespacesHelper(child.get(), mainNss, secondaryNssSet);
+    }
+}
+
+// Appends a compact, functional summary of the plan rooted at 'node' to 'sb'.
+// A join node renders as:
+//    <JOIN>( <leftField> = ( <left operand> ), <rightField> = ( <right operand> ) )
+// with each operand's collections named, and each operand wrapped in parentheses so that it reads
+// as a single argument of the join. Non-join interior nodes contribute nothing to the summary
+// themselves and simply render their children in order.
+void summaryStringRecursive(const QuerySolutionNode* node,
+                            StringBuilder& sb,
+                            bool includeNss = false) {
+    if (auto joinNode = dynamic_cast<const BinaryJoinEmbeddingNode*>(node)) {
+        // Join node!
+        sb << nodeStageTypeToString(node, true /* brief */);
+        sb << "( ";
+        sb << (joinNode->leftEmbeddingField ? joinNode->leftEmbeddingField->fullPath()
+                                            : std::string{"_"})
+           << " = ( ";
+        summaryStringRecursive(joinNode->children[0].get(), sb, true /* includeNss */);
+        sb << " ), "
+           << (joinNode->rightEmbeddingField ? joinNode->rightEmbeddingField->fullPath()
+                                             : std::string{"_"})
+           << " = ( ";
+        summaryStringRecursive(joinNode->children[1].get(), sb, true /* includeNss */);
+        sb << " ) )";
+        return;
+    }
+
+    if (node->children.empty()) {
+        // Leaf node!
+        sb << nodeStageTypeToString(node, true /* brief */);
+        if (includeNss) {
+            if (auto nss = getNamespace(node); nss) {
+                sb << " ["
+                   << NamespaceStringUtil::serialize(*nss, SerializationContext::stateDefault())
+                   << "]";
+            }
+        }
+        if (auto kp = getKeyPattern(node); kp) {
+            sb << " " << *kp;
+        }
+        return;
+    }
+
+    // "Interior" node, e.g. OR.
+    bool comma = false;
+    for (auto&& child : node->children) {
+        if (comma) {
+            sb << ", ";
+        }
+        summaryStringRecursive(child.get(), sb, includeNss);
+        comma = true;
     }
 }
 }  // namespace
@@ -236,72 +330,8 @@ std::pair<const QuerySolutionNode*, size_t> QuerySolutionNode::getFirstNodeByTyp
 
 std::string QuerySolution::summaryString() const {
     tassert(5968205, "QuerySolutionNode cannot be null in this QuerySolution", _root);
-
     StringBuilder sb;
-    bool seenLeaf = false;
-    std::queue<const QuerySolutionNode*> queue;
-    queue.push(_root.get());
-
-    while (!queue.empty()) {
-        auto node = queue.front();
-        queue.pop();
-
-        if (node->children.empty()) {
-            if (seenLeaf) {
-                sb << ", ";
-            } else {
-                seenLeaf = true;
-            }
-
-            sb << nodeStageTypeToString(node);
-
-            switch (node->getType()) {
-                case STAGE_COUNT_SCAN: {
-                    auto csn = static_cast<const CountScanNode*>(node);
-                    const KeyPattern keyPattern{csn->index.keyPattern};
-                    sb << " " << keyPattern;
-                    break;
-                }
-                case STAGE_DISTINCT_SCAN: {
-                    auto dn = static_cast<const DistinctNode*>(node);
-                    const KeyPattern keyPattern{dn->index.keyPattern};
-                    sb << " " << keyPattern;
-                    break;
-                }
-                case STAGE_GEO_NEAR_2D: {
-                    auto geo2d = static_cast<const GeoNear2DNode*>(node);
-                    const KeyPattern keyPattern{geo2d->index.keyPattern};
-                    sb << " " << keyPattern;
-                    break;
-                }
-                case STAGE_GEO_NEAR_2DSPHERE: {
-                    auto geo2dsphere = static_cast<const GeoNear2DSphereNode*>(node);
-                    const KeyPattern keyPattern{geo2dsphere->index.keyPattern};
-                    sb << " " << keyPattern;
-                    break;
-                }
-                case STAGE_IXSCAN: {
-                    auto ixn = static_cast<const IndexScanNode*>(node);
-                    const KeyPattern keyPattern{ixn->index.keyPattern};
-                    sb << " " << keyPattern;
-                    break;
-                }
-                case STAGE_TEXT_MATCH: {
-                    auto tn = static_cast<const TextMatchNode*>(node);
-                    const KeyPattern keyPattern{tn->indexPrefix};
-                    sb << " " << keyPattern;
-                    break;
-                }
-                default:
-                    break;
-            }
-        }
-
-        for (auto&& child : node->children) {
-            queue.push(child.get());
-        }
-    }
-
+    summaryStringRecursive(_root.get(), sb);
     return sb.str();
 }
 
@@ -431,8 +461,7 @@ std::unique_ptr<QuerySolutionNode> CollectionScanNode::clone() const {
     cloneBaseData(copy.get());
 
     copy->nss = this->nss;
-    copy->minRecord = this->minRecord;
-    copy->maxRecord = this->maxRecord;
+    copy->rangeList = this->rangeList;
     copy->clusteredIndex = this->clusteredIndex;
     copy->hasCompatibleCollation = this->hasCompatibleCollation;
     copy->requestResumeToken = this->requestResumeToken;
@@ -443,7 +472,6 @@ std::unique_ptr<QuerySolutionNode> CollectionScanNode::clone() const {
     copy->direction = this->direction;
     copy->isClustered = this->isClustered;
     copy->isOplog = this->isOplog;
-    copy->boundInclusion = this->boundInclusion;
     copy->shouldWaitForOplogVisibility = this->shouldWaitForOplogVisibility;
     copy->stopApplyingFilterAfterFirstMatch = this->stopApplyingFilterAfterFirstMatch;
     return copy;
@@ -1570,6 +1598,17 @@ std::unique_ptr<QuerySolutionNode> SkipNode::clone() const {
     return std::make_unique<SkipNode>(*this);
 }
 
+std::unique_ptr<MatchExpression>* getGeoNearDocFilter(QuerySolutionNode& node) {
+    switch (node.getType()) {
+        case STAGE_GEO_NEAR_2D:
+            return &static_cast<GeoNear2DNode&>(node).residualFilter;
+        case STAGE_GEO_NEAR_2DSPHERE:
+            return &static_cast<GeoNear2DSphereNode&>(node).residualFilter;
+        default:
+            return nullptr;
+    }
+}
+
 //
 // GeoNear2DNode
 //
@@ -1587,6 +1626,10 @@ void GeoNear2DNode::appendToString(str::stream* ss, int indent) const {
         addIndent(ss, indent + 1);
         *ss << " filter = " << filter->debugString();
     }
+    if (nullptr != residualFilter) {
+        addIndent(ss, indent + 1);
+        *ss << " residualFilter = " << residualFilter->debugString();
+    }
 }
 
 std::unique_ptr<QuerySolutionNode> GeoNear2DNode::clone() const {
@@ -1597,6 +1640,9 @@ std::unique_ptr<QuerySolutionNode> GeoNear2DNode::clone() const {
     copy->baseBounds = this->baseBounds;
     copy->addPointMeta = this->addPointMeta;
     copy->addDistMeta = this->addDistMeta;
+    if (this->residualFilter) {
+        copy->residualFilter = this->residualFilter->clone();
+    }
 
     return copy;
 }
@@ -1620,6 +1666,10 @@ void GeoNear2DSphereNode::appendToString(str::stream* ss, int indent) const {
         addIndent(ss, indent + 1);
         *ss << " filter = " << filter->debugString();
     }
+    if (nullptr != residualFilter) {
+        addIndent(ss, indent + 1);
+        *ss << " residualFilter = " << residualFilter->debugString();
+    }
 }
 
 std::unique_ptr<QuerySolutionNode> GeoNear2DSphereNode::clone() const {
@@ -1630,6 +1680,9 @@ std::unique_ptr<QuerySolutionNode> GeoNear2DSphereNode::clone() const {
     copy->baseBounds = this->baseBounds;
     copy->addPointMeta = this->addPointMeta;
     copy->addDistMeta = this->addDistMeta;
+    if (this->residualFilter) {
+        copy->residualFilter = this->residualFilter->clone();
+    }
 
     return copy;
 }
@@ -1688,6 +1741,7 @@ std::unique_ptr<QuerySolutionNode> DistinctNode::clone() const {
     copy->direction = this->direction;
     copy->isShardFiltering = this->isShardFiltering;
     copy->isFetching = this->isFetching;
+    copy->unwindsArrays = this->unwindsArrays;
 
     return copy;
 }
@@ -1965,47 +2019,6 @@ void SearchNode::appendToString(str::stream* ss, int indent) const {
         addIndent(ss, indent + 1);
         *ss << "limit = " << limit << '\n';
     }
-}
-
-/**
- * WindowNode.
- */
-std::unique_ptr<QuerySolutionNode> WindowNode::clone() const {
-    return std::make_unique<WindowNode>(children[0]->clone(), partitionBy, sortBy, outputFields);
-}
-
-void WindowNode::appendToString(str::stream* ss, int indent) const {
-    addIndent(ss, indent);
-    *ss << "WINDOW\n";
-    if (partitionBy) {
-        addIndent(ss, indent + 1);
-        *ss << "partitionBy = " << (*partitionBy)->serialize().toString() << '\n';
-    }
-    if (sortBy) {
-        addIndent(ss, indent + 1);
-        *ss << "sortBy = "
-            << sortBy->serialize(SortPattern::SortKeySerialization::kForExplain).toBson().toString()
-            << '\n';
-    }
-    addIndent(ss, indent + 1);
-    *ss << "outputFields = [";
-    for (size_t idx = 0; idx < outputFields.size(); ++idx) {
-        if (idx > 0) {
-            *ss << ", ";
-        }
-        auto& outputField = outputFields[idx];
-        MutableDocument boundsDoc;
-        outputField.expr->bounds().serialize(boundsDoc, query_shape::SerializationOptions{});
-        auto boundsBson = boundsDoc.freeze().toBson();
-        *ss << "{" << outputField.fieldName << ": {" << outputField.expr->getOpName() << ": "
-            << outputField.expr->input()->serialize().toString()
-            << "window: " << boundsBson.toString() << "}}";
-    }
-    *ss << "]" << '\n';
-    addCommon(ss, indent);
-    addIndent(ss, indent + 1);
-    *ss << "Child:" << '\n';
-    children[0]->appendToString(ss, indent + 2);
 }
 
 HashJoinEmbeddingNode::HashJoinEmbeddingNode(std::unique_ptr<QuerySolutionNode> leftChildArg,

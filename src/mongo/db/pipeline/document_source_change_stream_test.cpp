@@ -14,6 +14,7 @@
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/matcher/matcher.h"
 #include "mongo/db/index/index_constants.h"
 #include "mongo/db/pipeline/change_stream_filter_helpers.h"
 #include "mongo/db/pipeline/change_stream_read_mode.h"
@@ -38,6 +39,7 @@
 #include "mongo/db/pipeline/document_source_project.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/resume_token.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/query_shape/serialization_options.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
@@ -305,6 +307,34 @@ TEST_F(ChangeStreamStageTest, ShouldRejectResumeAfterWithResumeTokenMissingUUID)
         ErrorCodes::InvalidResumeToken);
 }
 
+TEST_F(ChangeStreamStageTest, ShouldRejectResumeFromNamespacePlacementChangedEvent) {
+    auto expCtx = getExpCtx();
+    auto opCtx = expCtx->getOperationContext();
+
+    // Need to put the collection in the collection catalog so the resume token is valid.
+    {
+        Lock::GlobalWrite lk(opCtx);
+        std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
+        CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+            catalog.registerCollection(opCtx, std::move(collection), /*ts=*/boost::none);
+        });
+    }
+
+    // An event resume token from a 'namespacePlacementChanged' control event is not a valid point
+    // to resume a change stream from.
+    ASSERT_THROWS_CODE(DSChangeStream::createFromBson(
+                           BSON(DSChangeStream::kStageName
+                                << BSON("resumeAfter" << makeResumeToken(
+                                            kDefaultTs,
+                                            testUuid(),
+                                            Value(),
+                                            DSChangeStream::kNamespacePlacementChangedOpType)))
+                               .firstElement(),
+                           expCtx),
+                       AssertionException,
+                       ErrorCodes::InvalidResumeToken);
+}
+
 TEST_F(ChangeStreamStageTestNoSetup, FailsWithNoReplicationCoordinator) {
     const auto spec = fromjson("{$changeStream: {}}");
 
@@ -349,13 +379,12 @@ TEST_F(ChangeStreamStageTest, CanCreateStageForNonSystemCollection) {
     DocumentSourceChangeStream::createFromBson(spec.firstElement(), getExpCtx());
 }
 
-TEST_F(ChangeStreamStageTest, ShowMigrationsFailsOnMongos) {
+TEST_F(ChangeStreamStageTest, ShowMigrationsSucceedsOnMongos) {
     auto expCtx = getExpCtx();
     expCtx->setInRouter(true);
     auto spec = fromjson("{$changeStream: {showMigrationEvents: true}}");
 
-    ASSERT_THROWS_CODE(
-        DSChangeStream::createFromBson(spec.firstElement(), expCtx), AssertionException, 31123);
+    ASSERT_DOES_NOT_THROW(DSChangeStream::createFromBson(spec.firstElement(), expCtx));
 }
 
 TEST_F(ChangeStreamStageTest, ChangeStreamBuiltInRegexesSingleCollection) {
@@ -366,17 +395,122 @@ TEST_F(ChangeStreamStageTest, ChangeStreamBuiltInRegexesSingleCollection) {
 
     ASSERT_EQ("^unittest\\.someCollection$",
               DocumentSourceChangeStream::getNsRegexForChangeStream(expCtx));
-    ASSERT_BSONOBJ_EQ(BSON("" << BSONRegEx("^unittest\\.someCollection$")),
+    ASSERT_BSONOBJ_EQ(BSON("" << "unittest.someCollection"),
                       DocumentSourceChangeStream::getNsMatchObjForChangeStream(expCtx));
 
     ASSERT_EQ("^someCollection$", DocumentSourceChangeStream::getCollRegexForChangeStream(expCtx));
-    ASSERT_BSONOBJ_EQ(BSON("" << BSONRegEx("^someCollection$")),
+    ASSERT_BSONOBJ_EQ(BSON("" << "someCollection"),
                       DocumentSourceChangeStream::getCollMatchObjForChangeStream(expCtx));
 
     ASSERT_EQ("^unittest\\.\\$cmd$",
               DocumentSourceChangeStream::getCmdNsRegexForChangeStream(expCtx));
-    ASSERT_BSONOBJ_EQ(BSON("" << BSONRegEx("^unittest\\.\\$cmd$")),
+    ASSERT_BSONOBJ_EQ(BSON("" << "unittest.$cmd"),
                       DocumentSourceChangeStream::getCmdNsMatchObjForChangeStream(expCtx));
+}
+
+// Builds an insert oplog entry BSON for the given namespace so that we can exercise the oplog match
+// expression's namespace matching directly.
+namespace {
+BSONObj makeInsertOplogEntryBSON(std::string_view ns) {
+    return makeOplogEntry(OpTypeEnum::kInsert,
+                          NamespaceString::createNamespaceString_forTest(boost::none, ns),
+                          BSON("_id" << 0))
+        .getEntry()
+        .toBSON();
+}
+}  // namespace
+
+// The oplog match stage of a single-collection change stream must match the watched collection's
+// namespace exactly (case-sensitively), and must not match a namespace that differs only in case.
+// This must hold regardless of the pipeline's collation.
+TEST_F(ChangeStreamStageTest, OplogMatchNamespaceIsCaseSensitiveWithoutCollation) {
+    const std::vector<BSONObj> rawPipeline = {BSON("$changeStream" << BSONObj())};
+
+    auto pipeline =
+        buildTestPipelineForCollection(rawPipeline, "unittests.change_stream_case_sensitive");
+
+    auto oplogMatchStage =
+        getStageFromPipeline<DocumentSourceChangeStreamOplogMatch>(pipeline.get());
+    ASSERT_NE(nullptr, oplogMatchStage);
+
+    const auto* matchExpr = oplogMatchStage->getMatchExpression();
+
+    // An insert into the exact namespace is matched.
+    ASSERT_TRUE(exec::matcher::matchesBSON(
+        matchExpr, makeInsertOplogEntryBSON("unittests.change_stream_case_sensitive")));
+
+    // An insert into a namespace that only differs in case is not matched.
+    ASSERT_FALSE(exec::matcher::matchesBSON(
+        matchExpr, makeInsertOplogEntryBSON("unittests.cHaNgE_sTrEaM_cAsE_sEnSiTiVe")));
+}
+
+// Same as above, but the change stream pipeline runs with a custom, case-insensitive collation
+// (modeled by the "to lower string" mock collator). The oplog namespace matching must remain
+// case-sensitive, because the collation must only apply to the generated change events and not to
+// the scan over the oplog. This is the scenario exercised by jstests/change_streams/collation.js.
+TEST_F(ChangeStreamStageTest, OplogMatchNamespaceIsCaseSensitiveWithCustomCollation) {
+    getExpCtx()->setCollator(
+        std::make_shared<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kToLowerString));
+
+    const std::vector<BSONObj> rawPipeline = {BSON("$changeStream" << BSONObj())};
+
+    auto pipeline =
+        buildTestPipelineForCollection(rawPipeline, "unittests.change_stream_case_insensitive");
+
+    auto oplogMatchStage =
+        getStageFromPipeline<DocumentSourceChangeStreamOplogMatch>(pipeline.get());
+    ASSERT_NE(nullptr, oplogMatchStage);
+
+    const auto* matchExpr = oplogMatchStage->getMatchExpression();
+
+    // An insert into the exact namespace is matched.
+    ASSERT_TRUE(exec::matcher::matchesBSON(
+        matchExpr, makeInsertOplogEntryBSON("unittests.change_stream_case_insensitive")));
+
+    // An insert into a namespace that only differs in case must not be matched, even though the
+    // case-insensitive collation would otherwise consider the two namespaces equal.
+    ASSERT_FALSE(exec::matcher::matchesBSON(
+        matchExpr, makeInsertOplogEntryBSON("unittests.cHaNgE_sTrEaM_cAsE_iNsEnSiTiVe")));
+
+    // An insert into an entirely different namespace is not matched either.
+    ASSERT_FALSE(exec::matcher::matchesBSON(
+        matchExpr, makeInsertOplogEntryBSON("unittests.some_other_collection")));
+}
+
+// The transaction unwind stage applies a filter to the individual operations extracted from
+// transaction oplog entries. Just like the oplog $match, this filter must match the watched
+// collection's namespace case-sensitively, even when the change stream pipeline runs with a custom,
+// case-insensitive collation. In a sharded cluster the shard parses this filter using the
+// collection's collation, so without stripping the collator the namespace comparison would
+// incorrectly match a namespace that only differs in case. This is the scenario exercised by
+// jstests/change_streams/collation.js in the multi-statement transaction passthrough suites.
+TEST_F(ChangeStreamStageTest, UnwindTransactionNamespaceIsCaseSensitiveWithCustomCollation) {
+    getExpCtx()->setCollator(
+        std::make_shared<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kToLowerString));
+
+    const std::vector<BSONObj> rawPipeline = {BSON("$changeStream" << BSONObj())};
+
+    auto pipeline =
+        buildTestPipelineForCollection(rawPipeline, "unittests.change_stream_case_insensitive");
+
+    auto unwindTransactionStage =
+        getStageFromPipeline<DocumentSourceChangeStreamUnwindTransaction>(pipeline.get());
+    ASSERT_NE(nullptr, unwindTransactionStage);
+
+    const auto* matchExpr = unwindTransactionStage->getMatchExpression();
+
+    // An insert into the exact namespace is matched.
+    ASSERT_TRUE(exec::matcher::matchesBSON(
+        matchExpr, makeInsertOplogEntryBSON("unittests.change_stream_case_insensitive")));
+
+    // An insert into a namespace that only differs in case must not be matched, even though the
+    // custom collation would otherwise consider the two namespaces equal.
+    ASSERT_FALSE(exec::matcher::matchesBSON(
+        matchExpr, makeInsertOplogEntryBSON("unittests.cHaNgE_sTrEaM_cAsE_iNsEnSiTiVe")));
+
+    // An insert into an entirely different namespace is not matched either.
+    ASSERT_FALSE(exec::matcher::matchesBSON(
+        matchExpr, makeInsertOplogEntryBSON("unittests.some_other_collection")));
 }
 
 TEST_F(ChangeStreamStageTest, ChangeStreamBuiltInRegexesSingleDatabase) {
@@ -395,7 +529,7 @@ TEST_F(ChangeStreamStageTest, ChangeStreamBuiltInRegexesSingleDatabase) {
 
     ASSERT_EQ("^unittest\\.system\\.views$",
               DocumentSourceChangeStream::getViewNsRegexForChangeStream(expCtx));
-    ASSERT_BSONOBJ_EQ(BSON("" << BSONRegEx("^unittest\\.system\\.views$")),
+    ASSERT_BSONOBJ_EQ(BSON("" << "unittest.system.views"),
                       DocumentSourceChangeStream::getViewNsMatchObjForChangeStream(expCtx));
 
     ASSERT_EQ(fmt::format("^{}", DocumentSourceChangeStream::kRegexAllCollections),
@@ -406,7 +540,7 @@ TEST_F(ChangeStreamStageTest, ChangeStreamBuiltInRegexesSingleDatabase) {
 
     ASSERT_EQ("^unittest\\.\\$cmd$",
               DocumentSourceChangeStream::getCmdNsRegexForChangeStream(expCtx));
-    ASSERT_BSONOBJ_EQ(BSON("" << BSONRegEx("^unittest\\.\\$cmd$")),
+    ASSERT_BSONOBJ_EQ(BSON("" << "unittest.$cmd"),
                       DocumentSourceChangeStream::getCmdNsMatchObjForChangeStream(expCtx));
 }
 
@@ -455,6 +589,8 @@ TEST_F(ChangeStreamStageTest, CreatingChangeStreamSucceedsWithValidVersions) {
 
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
 
     ScopedChangeStreamReaderBuilderMock readerBuilder(
         std::make_unique<ChangeStreamReaderBuilderMock>());
@@ -577,6 +713,8 @@ TEST_F(ChangeStreamStageTest, SelectsChangeStreamReaderVersionV2ForAllDatabasesC
 
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock;
     ScopedChangeStreamReaderBuilderMock readerBuilder(
         std::make_unique<ChangeStreamReaderBuilderMock>());
@@ -599,6 +737,8 @@ TEST_F(ChangeStreamStageTest, SelectsChangeStreamReaderVersionV2ForDatabaseLevel
 
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock;
     ScopedChangeStreamReaderBuilderMock readerBuilder(
         std::make_unique<ChangeStreamReaderBuilderMock>());
@@ -619,6 +759,8 @@ DEATH_TEST_REGEX_F(ChangeStreamStageTestDeathTest,
 
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock;
 
     // Intentionally set the global 'ChangeStreamReaderBuilder' instance to a nullptr.
@@ -641,6 +783,8 @@ DEATH_TEST_REGEX_F(
 
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
 
     // Intentionally set the global 'DataToShardsAllocationQueryService' instance to a nullptr.
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock(nullptr);
@@ -660,6 +804,8 @@ DEATH_TEST_REGEX_F(
 TEST_F(ChangeStreamStageTest, CreatingV2ChangeStreamRegistersSupportedEvents) {
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
 
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock;
 
@@ -707,6 +853,8 @@ TEST_F(ChangeStreamStageTest, CreatingV2ChangeStreamRegistersSupportedEvents) {
 TEST_F(ChangeStreamStageTest, CreatingV2ChangeStreamRegistersOplogMatchFilterForSupportedEvents) {
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
 
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock;
 
@@ -756,6 +904,8 @@ TEST_F(ChangeStreamStageTest, CreatingV2ChangeStreamRegistersOplogMatchFilterFor
 TEST_F(ChangeStreamStageTest, CreatingV2ChangeStreamRegistersUnwindFilterForDataShard) {
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
 
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock;
 
@@ -876,19 +1026,19 @@ TEST_F(ChangeStreamStageTest, BuildTransactionFilterForV1ChangeStream) {
                                             "$or": [
                                                 {
                                                     "o.create": {
-                                                        "$regex": "^change_stream$"
+                                                        "$eq": "change_stream"
                                                     }
                                                 },
                                                 {
                                                     "o.createIndexes": {
-                                                        "$regex": "^change_stream$"
+                                                        "$eq": "change_stream"
                                                     }
                                                 }
                                             ]
                                         },
                                         {
                                             "ns": {
-                                                "$regex": "^unittests\\.\\$cmd$"
+                                                "$eq": "unittests.$cmd"
                                             }
                                         }
                                     ]
@@ -897,7 +1047,7 @@ TEST_F(ChangeStreamStageTest, BuildTransactionFilterForV1ChangeStream) {
                         },
                         {
                             "o.applyOps.ns": {
-                                "$regex": "^unittests\\.change_stream$"
+                                "$eq": "unittests.change_stream"
                             }
                         },
                         {
@@ -957,13 +1107,13 @@ TEST_F(ChangeStreamStageTest, BuildTransactionFilterForV1ChangeStream) {
         {
             "$and": [
                 {
-                    "op": {
-                        "$eq": "n"
+                    "o2.endOfTransaction": {
+                        "$eq": "unittests.change_stream"
                     }
                 },
                 {
-                    "o2.endOfTransaction": {
-                        "$regex": "^unittests\\.change_stream$"
+                    "op": {
+                        "$eq": "n"
                     }
                 }
             ]
@@ -1019,19 +1169,19 @@ TEST_F(ChangeStreamStageTest, BuildTransactionFilterForV2ChangeStream) {
                                                     "$or": [
                                                         {
                                                             "o.create": {
-                                                                "$regex": "^change_stream$"
+                                                                "$eq": "change_stream"
                                                             }
                                                         },
                                                         {
                                                             "o.createIndexes": {
-                                                                "$regex": "^change_stream$"
+                                                                "$eq": "change_stream"
                                                             }
                                                         }
                                                     ]
                                                 },
                                                 {
                                                     "ns": {
-                                                        "$regex": "^unittests\\.\\$cmd$"
+                                                        "$eq": "unittests.$cmd"
                                                     }
                                                 }
                                             ]
@@ -1040,7 +1190,7 @@ TEST_F(ChangeStreamStageTest, BuildTransactionFilterForV2ChangeStream) {
                                 },
                                 {
                                     "o.applyOps.ns": {
-                                        "$regex": "^unittests\\.change_stream$"
+                                        "$eq": "unittests.change_stream"
                                     }
                                 },
                                 {
@@ -1100,13 +1250,13 @@ TEST_F(ChangeStreamStageTest, BuildTransactionFilterForV2ChangeStream) {
                 {
                     "$and": [
                         {
-                            "op": {
-                                "$eq": "n"
+                            "o2.endOfTransaction": {
+                                "$eq": "unittests.change_stream"
                             }
                         },
                         {
-                            "o2.endOfTransaction": {
-                                "$regex": "^unittests\\.change_stream$"
+                            "op": {
+                                "$eq": "n"
                             }
                         }
                     ]
@@ -2656,6 +2806,107 @@ TEST_F(ChangeStreamStageTest, TransactionWithMultipleOplogEntries) {
                                        2));
 }
 
+// Builds one entry of a kApplyOpsAppliedAtomically batch: an applyOps wrapping a single insert of
+// 'insertId', tagged with the atomic multiOpType. 'partialTxn' and 'count' are set when provided,
+// which is how a multi-entry batch's non-terminal and terminal entries are distinguished.
+repl::OplogEntry makeAtomicBatchEntry(const OperationSessionInfo& sessionInfo,
+                                      repl::OpTime opTime,
+                                      repl::OpTime prevOpTime,
+                                      int insertId,
+                                      bool partialTxn = false,
+                                      boost::optional<int> count = boost::none) {
+    BSONObjBuilder oField;
+    oField.append(
+        "applyOps",
+        BSON_ARRAY(BSON("op" << "i"
+                             << "ns" << nss.ns_forTest() << "ui" << testUuid() << "o"
+                             << BSON("_id" << insertId) << "o2" << BSON("_id" << insertId))));
+    if (partialTxn) {
+        oField.append("partialTxn", true);
+    }
+    if (count) {
+        oField.append("count", *count);
+    }
+    auto entry = makeOplogEntry(OpTypeEnum::kCommand,
+                                nss.getCommandNS(),
+                                oField.obj(),
+                                testUuid(),
+                                boost::none,  // fromMigrate
+                                boost::none,  // o2 field
+                                opTime,
+                                sessionInfo,
+                                prevOpTime);
+    return unittest::assertGet(repl::OplogEntry::parse(entry.getEntry().toBSON().addField(
+        BSON(repl::OplogEntry::kMultiOpTypeFieldName
+             << repl::MultiOplogEntryType::kApplyOpsAppliedAtomically)
+            .firstElement())));
+}
+
+// The previous statement has fallen off the oplog. Bounding the unwind by 'count' means the batch's
+// own entries suffice, so a truncated predecessor is not a spurious ChangeStreamHistoryLost.
+TEST_F(ChangeStreamStageTest, RetryableAtomicBatchUnwindToleratesTruncatedPreviousStatement) {
+    OperationSessionInfo sessionInfo;
+    sessionInfo.setTxnNumber(1);
+    sessionInfo.setSessionId(makeLogicalSessionIdForTest());
+
+    // Statement 0 is not built at all: it stands in for a statement truncated from the oplog.
+    // Statement 1's first entry links to where it used to be.
+    repl::OpTime truncatedStmt0OpTime(Timestamp(100, 1), 1);
+    repl::OpTime stmt1FirstOpTime(Timestamp(100, 2), 1);
+    repl::OpTime stmt1TerminalOpTime(Timestamp(100, 3), 1);
+    auto stmt1First = makeAtomicBatchEntry(
+        sessionInfo, stmt1FirstOpTime, truncatedStmt0OpTime, 456, true /* partialTxn */);
+    auto stmt1Terminal = makeAtomicBatchEntry(sessionInfo,
+                                              stmt1TerminalOpTime,
+                                              stmt1FirstOpTime,
+                                              789,
+                                              false /* partialTxn */,
+                                              2 /* count */);
+
+    auto execPipeline = makeExecPipeline(stmt1Terminal, kDefaultSpec);
+    auto transform = execPipeline->getStages()[3].get();
+    invariant(dynamic_cast<exec::agg::ChangeStreamTransformStage*>(transform) != nullptr);
+
+    // The mock has only statement 1's entries. Reaching for statement 0 would raise
+    // IncompleteTransactionHistory, which the stage surfaces as ChangeStreamHistoryLost.
+    getExpCtx()->setMongoProcessInterface(std::make_unique<ChangeStreamMockMongoInterface>(
+        std::vector<repl::OplogEntry>{stmt1Terminal, stmt1First}));
+
+    for (int expectedId : {456, 789}) {
+        auto next = transform->getNext();
+        ASSERT(next.isAdvanced());
+        auto nextDoc = next.releaseDocument();
+        ASSERT_EQ(nextDoc[DSChangeStream::kFullDocumentField]["_id"].getInt(), expectedId);
+    }
+    ASSERT(transform->getNext().isEOF());
+}
+
+// A single-entry atomic batch's prevOpTime is purely a session-history link, so the unwind must
+// not walk it at all. The link points at an entry the mock cannot supply, so any walk fails.
+TEST_F(ChangeStreamStageTest, RetryableAtomicBatchSingleEntryUnwindSkipsChainWalk) {
+    OperationSessionInfo sessionInfo;
+    sessionInfo.setTxnNumber(1);
+    sessionInfo.setSessionId(makeLogicalSessionIdForTest());
+
+    // A single-entry batch: no 'count', and prevOpTime links to a statement the mock cannot supply.
+    repl::OpTime unreachablePrevOpTime(Timestamp(100, 1), 1);
+    auto entry = makeAtomicBatchEntry(
+        sessionInfo, repl::OpTime(Timestamp(100, 2), 1), unreachablePrevOpTime, 123);
+
+    auto execPipeline = makeExecPipeline(entry, kDefaultSpec);
+    auto transform = execPipeline->getStages()[3].get();
+    invariant(dynamic_cast<exec::agg::ChangeStreamTransformStage*>(transform) != nullptr);
+
+    // Only the entry itself is available; there is nothing behind it to walk to.
+    getExpCtx()->setMongoProcessInterface(
+        std::make_unique<ChangeStreamMockMongoInterface>(std::vector<repl::OplogEntry>{entry}));
+
+    auto next = transform->getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQ(next.releaseDocument()[DSChangeStream::kFullDocumentField]["_id"].getInt(), 123);
+    ASSERT(transform->getNext().isEOF());
+}
+
 TEST_F(ChangeStreamStageTest, TransactionWithEmptyOplogEntries) {
     OperationSessionInfo sessionInfo;
     sessionInfo.setTxnNumber(1);
@@ -4183,6 +4434,8 @@ TEST_F(ChangeStreamStageTest, ControlEventsAreReturnedByProjectStageUnmodified) 
 TEST_F(ChangeStreamStageTest, InjectControlEventsBuildForDataShard) {
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
 
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock;
     ScopedChangeStreamReaderBuilderMock readerBuilder(
@@ -4218,6 +4471,8 @@ TEST_F(ChangeStreamStageTest, InjectControlEventsBuildForDataShard) {
 TEST_F(ChangeStreamStageTest, InjectControlEventsBuildForDataShardShowSystemEvents) {
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
 
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock;
     ScopedChangeStreamReaderBuilderMock readerBuilder(
@@ -5428,6 +5683,8 @@ TEST_F(ChangeStreamStageTest, BasicAllClusterChangeStreamStagesOrder) {
 TEST_F(ChangeStreamStageTest, BasicCollectionChangeStreamV2StagesOrder) {
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
 
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock;
     ScopedChangeStreamReaderBuilderMock readerBuilder(
@@ -5458,6 +5715,8 @@ TEST_F(ChangeStreamStageTest, BasicCollectionChangeStreamV2StagesOrder) {
 TEST_F(ChangeStreamStageTest, BasicDatabaseChangeStreamV2StagesOrder) {
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
 
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock;
     ScopedChangeStreamReaderBuilderMock readerBuilder(
@@ -5487,6 +5746,8 @@ TEST_F(ChangeStreamStageTest, BasicDatabaseChangeStreamV2StagesOrder) {
 TEST_F(ChangeStreamStageTest, BasicAllClusterChangeStreamV2StagesOrder) {
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
 
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock;
     ScopedChangeStreamReaderBuilderMock readerBuilder(
@@ -5541,6 +5802,8 @@ TEST_F(ChangeStreamStageTest, ChangeStreamWithSingleMatch) {
 TEST_F(ChangeStreamStageTest, ChangeStreamV2WithSingleMatch) {
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
 
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock;
     ScopedChangeStreamReaderBuilderMock readerBuilder(
@@ -5596,6 +5859,8 @@ TEST_F(ChangeStreamStageTest, ChangeStreamWithMultipleMatch) {
 TEST_F(ChangeStreamStageTest, ChangeStreamV2WithMultipleMatch) {
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
 
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock;
     ScopedChangeStreamReaderBuilderMock readerBuilder(
@@ -5657,6 +5922,8 @@ TEST_F(ChangeStreamStageTest, ChangeStreamWithMultipleMatchAndResumeToken) {
 TEST_F(ChangeStreamStageTest, ChangeStreamV2WithMultipleMatchAndResumeToken) {
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
 
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock;
     ScopedChangeStreamReaderBuilderMock readerBuilder(
@@ -5717,6 +5984,8 @@ TEST_F(ChangeStreamStageTest, ChangeStreamWithSingleProject) {
 TEST_F(ChangeStreamStageTest, ChangeStreamV2WithSingleProject) {
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
 
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock;
     ScopedChangeStreamReaderBuilderMock readerBuilder(
@@ -5772,6 +6041,8 @@ TEST_F(ChangeStreamStageTest, ChangeStreamWithMultipleProject) {
 TEST_F(ChangeStreamStageTest, ChangeStreamV2WithMultipleProject) {
     unittest::ServerParameterGuard preciseShardTargetingEnabler(
         "featureFlagChangeStreamPreciseShardTargeting", true);
+    unittest::ServerParameterGuard changeStreamReaderV2Enabler("featureFlagChangeStreamReaderV2",
+                                                               true);
 
     ScopedDataToShardsAllocationQueryServiceMock queryServiceMock;
     ScopedChangeStreamReaderBuilderMock readerBuilder(
@@ -6943,8 +7214,7 @@ TEST_F(ChangeStreamMetricsTest, BooleanOptionCountersIncrementOnTrue) {
         }
 
         // mongos
-        // 'showMigrationEvents' is not supported on mongos.
-        if (c.optionKey != "showMigrationEvents") {
+        {
             const long long before = readCsMetric(c.metricRelPath);
             openOnMongos(
                 BSON("$changeStream" << BSON(c.optionKey << true).addFields(c.extraOptions)));
@@ -6978,8 +7248,7 @@ TEST_F(ChangeStreamMetricsTest, BooleanOptionCountersDoNotIncrementWhenExplicitl
         }
 
         // mongos
-        // 'showMigrationEvents' is not supported on mongos.
-        if (c.optionKey != "showMigrationEvents") {
+        {
             const long long before = readCsMetric(c.metricRelPath);
             openOnMongos(BSON("$changeStream" << BSON(c.optionKey << false)));
             ASSERT_EQ(before, readCsMetric(c.metricRelPath)) << "option: " << c.optionKey;

@@ -49,9 +49,9 @@ public:
                  boost::optional<SbSlot> rootSlot,
                  Value expected,
                  std::string_view test) {
-        auto [expectedTag, expectedVal] = sbe::value::makeValue(expected);
-        sbe::value::ValueGuard expectedGuard{expectedTag, expectedVal};
-        runTest(expr, rootSlot, expectedTag, expectedVal, test);
+        sbe::value::TagValueOwned expectedTv =
+            sbe::value::TagValueOwned::fromRaw(sbe::value::makeValue(expected));
+        runTest(expr, rootSlot, expectedTv.tag(), expectedTv.value(), test);
     }
 };
 
@@ -103,6 +103,17 @@ TEST_F(GoldenGenExpressionTest, TestSimpleExpr) {
         auto constArr = ExpressionConstant::create(_expCtx.get(), arrVal);
         ExpressionArrayToObject arr2ObjExpr(_expCtx.get(), {constArr});
         runTest(&arr2ObjExpr, rootSlot, Value(root), "ExpressionArrayToObject"sv);
+    }
+    {
+        // Wrap in $objectToArray (rather than using a constant array) so the argument isn't
+        // constant-folded away before it reaches the SBE stage builder.
+        auto varExpr = ExpressionFieldPath::createVarFromString(
+            _expCtx.get(), "ROOT", _expCtx->variablesParseState);
+        boost::intrusive_ptr<ExpressionObjectToArray> obj2arrExpr{
+            new ExpressionObjectToArray(_expCtx.get())};
+        obj2arrExpr->addOperand(varExpr);
+        ExpressionSize sizeExpr(_expCtx.get(), {obj2arrExpr});
+        runTest(&sizeExpr, rootSlot, Value(4), "ExpressionSize"sv);
     }
     {
         auto varExpr = ExpressionFieldPath::createVarFromString(
@@ -762,11 +773,17 @@ TEST_F(GoldenGenExpressionTest, TestExprArraySet) {
     }
     {
         ExpressionSetDifference setDiffExpr(_expCtx.get(), {fieldArr2Expr, fieldArr3Expr});
-        auto [tag, val] = sbe::value::makeNewArraySet();
-        sbe::value::ValueGuard valGuard{tag, val};
-        sbe::value::getArraySetView(val)->push_back_raw(sbe::value::makeValue(Value(2.5)));
-        sbe::value::getArraySetView(val)->push_back_raw(sbe::value::makeValue(Value("str"sv)));
-        runTest(&setDiffExpr, rootSlot, tag, val, "ExpressionSetDifference"sv);
+        sbe::value::TagValueOwned setDiffResult =
+            sbe::value::TagValueOwned::fromRaw(sbe::value::makeNewArraySet());
+        sbe::value::getArraySetView(setDiffResult.value())
+            ->push_back_raw(sbe::value::makeValue(Value(2.5)));
+        sbe::value::getArraySetView(setDiffResult.value())
+            ->push_back_raw(sbe::value::makeValue(Value("str"sv)));
+        runTest(&setDiffExpr,
+                rootSlot,
+                setDiffResult.tag(),
+                setDiffResult.value(),
+                "ExpressionSetDifference"sv);
     }
     {
         ExpressionSetEquals setEqExpr(_expCtx.get(), {fieldArr2Expr, fieldArr3Expr});
@@ -783,14 +800,23 @@ TEST_F(GoldenGenExpressionTest, TestExprArraySet) {
     }
     {
         ExpressionSetUnion setUnionExpr(_expCtx.get(), {fieldArr2Expr, fieldArr3Expr});
-        auto [tag, val] = sbe::value::makeNewArraySet();
-        sbe::value::ValueGuard valGuard{tag, val};
-        sbe::value::getArraySetView(val)->push_back_raw(sbe::value::makeValue(Value(1)));
-        sbe::value::getArraySetView(val)->push_back_raw(sbe::value::makeValue(Value(2.5)));
-        sbe::value::getArraySetView(val)->push_back_raw(sbe::value::makeValue(Value("str"sv)));
-        sbe::value::getArraySetView(val)->push_back_raw(sbe::value::makeValue(Value(5)));
-        sbe::value::getArraySetView(val)->push_back_raw(sbe::value::makeValue(Value("str2"sv)));
-        runTest(&setUnionExpr, rootSlot, tag, val, "ExpressionSetUnion"sv);
+        sbe::value::TagValueOwned setUnionResult =
+            sbe::value::TagValueOwned::fromRaw(sbe::value::makeNewArraySet());
+        sbe::value::getArraySetView(setUnionResult.value())
+            ->push_back_raw(sbe::value::makeValue(Value(1)));
+        sbe::value::getArraySetView(setUnionResult.value())
+            ->push_back_raw(sbe::value::makeValue(Value(2.5)));
+        sbe::value::getArraySetView(setUnionResult.value())
+            ->push_back_raw(sbe::value::makeValue(Value("str"sv)));
+        sbe::value::getArraySetView(setUnionResult.value())
+            ->push_back_raw(sbe::value::makeValue(Value(5)));
+        sbe::value::getArraySetView(setUnionResult.value())
+            ->push_back_raw(sbe::value::makeValue(Value("str2"sv)));
+        runTest(&setUnionExpr,
+                rootSlot,
+                setUnionResult.tag(),
+                setUnionResult.value(),
+                "ExpressionSetUnion"sv);
     }
     {
         ExpressionReverseArray arrReverseExpr(_expCtx.get());

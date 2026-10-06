@@ -24,7 +24,6 @@
  * @tags: [
  *   assumes_balancer_off,
  *   featureFlagAllowUserFacingQuerySettings,
- *   featureFlagPqsQueryKnobs,
  *   requires_fcv_90,
  *   requires_sharding,
  *   uses_change_streams,
@@ -92,12 +91,14 @@ describe("sharded change stream operationResponseMaxMS via query settings", () =
 
     // Runs the core assertion: opens a change stream at startTime with batchSize 0 and the
     // operationResponseMaxMS query knob set via query settings, then issues getMores until the
-    // matching document (_id: kNumDocs - 1) is returned. Asserts that at least 'minDifferentPBRTs'
-    // distinct PBRTs were observed before the document arrived, confirming that the knob was honored
-    // on the shard. For an unsharded collection the oplog contains createCollection + (kNumDocs - 1)
-    // non-matching inserts before the match, so 5 is a safe lower bound. For a sharded collection
-    // the two shards scan in lockstep and the effective number of client-visible empty batches is
-    // lower (~half of kNumDocs), so a smaller minimum is used.
+    // matching document (_id: kNumDocs - 1) is returned. Asserts that at least one empty batch
+    // with a distinct PBRT was observed before the document arrived, confirming that the knob was
+    // honored on the shard.
+    // The number of PBRT advances depends on how many oplog entries (including periodic noops) the
+    // laggard shard must traverse, which varies with platform speed and setup timing. A fixed
+    // higher threshold was found to be unreliable on Windows CI (BF-46072) where fewer noops
+    // interleave during a faster setup phase. The primary verification that the knob was forwarded
+    // and honored is the log message 10290000 check below, which is stable across platforms.
     // extraAggregateOptions merges into the aggregate command (e.g. {$_passthroughToShard: ...}).
     // shardsToVerify is an array of shard primary connections whose logs are checked for log ID
     // kResponseDeadlineLogId, confirming the knob reached the shard executor.
@@ -106,7 +107,6 @@ describe("sharded change stream operationResponseMaxMS via query settings", () =
         collName,
         startTime,
         shardsToVerify,
-        minDifferentPBRTs,
         extraAggregateOptions = {},
         changeStreamOptions = {},
     ) => {
@@ -157,6 +157,9 @@ describe("sharded change stream operationResponseMaxMS via query settings", () =
                         "Cursor must stay open after an empty batch",
                         {cursor},
                     );
+                    if (pbrtCompareResult < 0) {
+                        differentPBRTsReturned++;
+                    }
                 } else {
                     assert.eq(
                         1,
@@ -166,10 +169,8 @@ describe("sharded change stream operationResponseMaxMS via query settings", () =
                     );
                     foundDoc = batch[0];
                 }
-                if (pbrtCompareResult < 0) {
-                    lastPBRT = pbrt;
-                    differentPBRTsReturned++;
-                }
+
+                lastPBRT = pbrt;
             }
 
             assert(foundDoc !== null, "Did not receive the matching document within the limit");
@@ -181,10 +182,10 @@ describe("sharded change stream operationResponseMaxMS via query settings", () =
             );
             assert.gte(
                 differentPBRTsReturned,
-                minDifferentPBRTs,
-                "Expected multiple empty batches with distinct PBRTs before the matching document," +
-                    " indicating that operationResponseMaxMS was forwarded to the shard",
-                {differentPBRTsReturned, minDifferentPBRTs},
+                1,
+                "Expected at least one empty batch with a distinct PBRT before the matching" +
+                    " document, indicating that operationResponseMaxMS was forwarded to the shard",
+                {differentPBRTsReturned},
             );
         });
 
@@ -287,7 +288,7 @@ describe("sharded change stream operationResponseMaxMS via query settings", () =
 
         for (const [version, options] of Object.entries(changeStreamOptions)) {
             it(`forwards operationResponseMaxMS to the primary shard and returns multiple empty batches - ${version} change stream`, () => {
-                runTest(cst, collName, startTime, [st.rs0.getPrimary()], 4, {}, options);
+                runTest(cst, collName, startTime, [st.rs0.getPrimary()], {}, options);
             });
         }
     });
@@ -328,16 +329,11 @@ describe("sharded change stream operationResponseMaxMS via query settings", () =
 
         for (const [version, options] of Object.entries(changeStreamOptions)) {
             it(`forwards operationResponseMaxMS to all shards and returns multiple empty batches - ${version} change stream`, () => {
-                // With kNumDocs split evenly across 2 shards and the matching doc on shard1, the two
-                // shards scan in lockstep. Each client getMore yields one PBRT advance per shard pair,
-                // giving (kNumDocs / 2 - 1) advances before the match. Use 3 as the lower bound to
-                // allow some variability while still distinguishing from the "not forwarded" case (0).
                 runTest(
                     cst,
                     collName,
                     startTime,
                     [st.rs0.getPrimary(), st.rs1.getPrimary()],
-                    3,
                     {},
                     options,
                 );
@@ -377,7 +373,6 @@ describe("sharded change stream operationResponseMaxMS via query settings", () =
                     collName,
                     startTime,
                     [st.rs0.getPrimary()],
-                    4,
                     {
                         $_passthroughToShard: {shard: st.shard0.shardName},
                     },

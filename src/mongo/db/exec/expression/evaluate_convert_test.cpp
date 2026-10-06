@@ -68,7 +68,6 @@ Value makeVectorBinData() {
 }
 
 TEST_F(EvaluateConvertTest, TracksOutputMemoryAndReleasesAfterEvaluation) {
-    unittest::ServerParameterGuard convertFlag{"featureFlagConvertBinDataVectors", true};
     auto expCtx = getExpCtx();
     auto spec = BSON("$convert" << BSON("input" << makeVectorBinData() << "to"
                                                 << "array"));
@@ -86,7 +85,6 @@ TEST_F(EvaluateConvertTest, TracksOutputMemoryAndReleasesAfterEvaluation) {
 }
 
 TEST_F(EvaluateConvertTest, ThrowsExceededMemoryLimitWhenQueryLimitExceeded) {
-    unittest::ServerParameterGuard convertFlag{"featureFlagConvertBinDataVectors", true};
     auto expCtx = getExpCtx();
     auto spec = BSON("$convert" << BSON("input" << makeVectorBinData() << "to"
                                                 << "array"));
@@ -112,7 +110,6 @@ TEST_F(EvaluateConvertTest, ThrowsExceededMemoryLimitWhenQueryLimitExceeded) {
 }
 
 TEST_F(EvaluateConvertTest, FallbackTrackerWithinLimitDoesNotThrow) {
-    unittest::ServerParameterGuard convertFlag{"featureFlagConvertBinDataVectors", true};
     auto expCtx = getExpCtx();
     auto spec = BSON("$convert" << BSON("input" << makeVectorBinData() << "to"
                                                 << "array"));
@@ -135,7 +132,6 @@ TEST_F(EvaluateConvertTest, FallbackTrackerWithinLimitDoesNotThrow) {
 }
 
 TEST_F(EvaluateConvertTest, FallbackTrackerEnforcesLimit) {
-    unittest::ServerParameterGuard convertFlag{"featureFlagConvertBinDataVectors", true};
     auto expCtx = getExpCtx();
     auto spec = BSON("$convert" << BSON("input" << makeVectorBinData() << "to"
                                                 << "array"));
@@ -1139,6 +1135,19 @@ TEST_F(EvaluateConvertTest, ConvertObjectToBinDataWithCustomSubtype) {
                     Value(BSONBinData(expectedBson.objdata(),
                                       expectedBson.objsize(),
                                       static_cast<BinDataType>(128))));
+}
+
+TEST_F(EvaluateConvertTest, ConvertObjectToFixedSizeBinDataSubtypeValidatesSize) {
+    auto expCtx = getExpCtx();
+
+    // MD5 (subtype 5) requires exactly 16 bytes; a small object's BSON is not 16 bytes, so the
+    // conversion must be rejected rather than producing an invalid fixed-size BinData.
+    auto spec = fromjson("{$convert: {input: '$path1', to: {type: 'binData', subtype: 5}}}");
+    auto convertExp = Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState);
+
+    Document input{{"path1", Document{{"a", "a"sv}}}};
+    ASSERT_THROWS_CODE(
+        convertExp->evaluate(input, &expCtx->variables), AssertionException, 13016802);
 }
 
 TEST_F(EvaluateConvertTest, ConvertObjectToBinDataNullInputReturnsNull) {
@@ -4458,6 +4467,200 @@ TEST_F(EvaluateConvertTest, ConvertDoubleToBinDataQuietNan) {
                         {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF});
 }
 
+TEST_F(EvaluateConvertTest, ConvertToBinDataByteArrayDeprecatedSubtypeBanned) {
+    auto expCtx = getExpCtx();
+    auto convertExp = Expression::parseExpression(
+        expCtx.get(),
+        BSON("$convert" << BSON("input" << "$path1"
+                                        << "to" << BSON("type" << "binData" << "subtype" << 2)
+                                        << "format" << toStringData(BinDataFormat::kBase64))),
+        expCtx->variablesParseState);
+    Document input{{"path1", "AAAAAAAAAAAAAAAAAAAAAA=="sv}};
+    ASSERT_THROWS_CODE(
+        convertExp->evaluate(input, &expCtx->variables), AssertionException, 13016800);
+}
+
+TEST_F(EvaluateConvertTest, ConvertToBinDataEncryptSubtypeBanned) {
+    auto expCtx = getExpCtx();
+    auto convertExp = Expression::parseExpression(
+        expCtx.get(),
+        BSON("$convert" << BSON("input" << "$path1"
+                                        << "to" << BSON("type" << "binData" << "subtype" << 6)
+                                        << "format" << toStringData(BinDataFormat::kBase64))),
+        expCtx->variablesParseState);
+    Document input{{"path1", "AAAAAAAAAAAAAAAAAAAAAA=="sv}};
+    ASSERT_THROWS_CODE(
+        convertExp->evaluate(input, &expCtx->variables), AssertionException, 13016801);
+}
+
+TEST_F(EvaluateConvertTest, ConvertToBinDataBdtUUIDWrongSizeFails) {
+    auto expCtx = getExpCtx();
+    auto convertExp = Expression::parseExpression(
+        expCtx.get(),
+        BSON("$convert" << BSON("input" << "$path1"
+                                        << "to" << BSON("type" << "binData" << "subtype" << 3)
+                                        << "format" << toStringData(BinDataFormat::kBase64))),
+        expCtx->variablesParseState);
+    // "AAAAAA==" base64-decodes to 4 bytes, not the required 16.
+    Document input{{"path1", "AAAAAA=="sv}};
+    ASSERT_THROWS_CODE(
+        convertExp->evaluate(input, &expCtx->variables), AssertionException, 13016802);
+}
+
+TEST_F(EvaluateConvertTest, ConvertToBinDataMD5TypeWrongSizeFails) {
+    auto expCtx = getExpCtx();
+    auto convertExp = Expression::parseExpression(
+        expCtx.get(),
+        BSON("$convert" << BSON("input" << "$path1"
+                                        << "to" << BSON("type" << "binData" << "subtype" << 5)
+                                        << "format" << toStringData(BinDataFormat::kBase64))),
+        expCtx->variablesParseState);
+    // "AAAAAA==" base64-decodes to 4 bytes, not the required 16.
+    Document input{{"path1", "AAAAAA=="sv}};
+    ASSERT_THROWS_CODE(
+        convertExp->evaluate(input, &expCtx->variables), AssertionException, 13016802);
+}
+
+TEST_F(EvaluateConvertTest, ConvertIntToBinDataBdtUUIDFailsSizeCheck) {
+    auto expCtx = getExpCtx();
+    auto convertExp =
+        Expression::parseExpression(expCtx.get(),
+                                    fromjson("{$convert: {input: '$path1', to: {type: 'binData', "
+                                             "subtype: 3}, byteOrder: 'little'}}"),
+                                    expCtx->variablesParseState);
+    // int32 is 4 bytes; bdtUUID requires exactly 16.
+    ASSERT_THROWS_CODE(convertExp->evaluate({{"path1", Value(42)}}, &expCtx->variables),
+                       AssertionException,
+                       13016802);
+}
+
+TEST_F(EvaluateConvertTest, ConvertLongToBinDataMD5TypeFailsSizeCheck) {
+    auto expCtx = getExpCtx();
+    auto convertExp =
+        Expression::parseExpression(expCtx.get(),
+                                    fromjson("{$convert: {input: '$path1', to: {type: 'binData', "
+                                             "subtype: 5}, byteOrder: 'little'}}"),
+                                    expCtx->variablesParseState);
+    // int64 is 8 bytes; MD5Type requires exactly 16.
+    ASSERT_THROWS_CODE(convertExp->evaluate({{"path1", Value(42LL)}}, &expCtx->variables),
+                       AssertionException,
+                       13016802);
+}
+
+TEST_F(EvaluateConvertTest, ConvertDoubleToBinDataBdtUUIDFailsSizeCheck) {
+    auto expCtx = getExpCtx();
+    auto convertExp =
+        Expression::parseExpression(expCtx.get(),
+                                    fromjson("{$convert: {input: '$path1', to: {type: 'binData', "
+                                             "subtype: 3}, byteOrder: 'little'}}"),
+                                    expCtx->variablesParseState);
+    // double is 8 bytes; bdtUUID requires exactly 16.
+    ASSERT_THROWS_CODE(convertExp->evaluate({{"path1", Value(1.5)}}, &expCtx->variables),
+                       AssertionException,
+                       13016802);
+}
+
+TEST_F(EvaluateConvertTest, ConvertLongToBinDataNewUUIDFailsSizeCheck) {
+    auto expCtx = getExpCtx();
+    auto convertExp =
+        Expression::parseExpression(expCtx.get(),
+                                    fromjson("{$convert: {input: '$path1', to: {type: 'binData', "
+                                             "subtype: 4}, byteOrder: 'little'}}"),
+                                    expCtx->variablesParseState);
+    ASSERT_THROWS_CODE(convertExp->evaluate({{"path1", Value(42LL)}}, &expCtx->variables),
+                       AssertionException,
+                       13016802);
+}
+
+TEST_F(EvaluateConvertTest, ConvertBinDataToBinDataWrongSizeUUIDIdentityRejected) {
+    auto expCtx = getExpCtx();
+    auto convertExp = Expression::parseExpression(
+        expCtx.get(),
+        BSON("$convert" << BSON("input" << "$path1"
+                                        << "to" << BSON("type" << "binData" << "subtype" << 4))),
+        expCtx->variablesParseState);
+    auto shortUuid = BSONBinData("AAAAAAAA", 8, BinDataType::newUUID);
+    Document input{{"path1", shortUuid}};
+    ASSERT_THROWS_CODE(
+        convertExp->evaluate(input, &expCtx->variables), AssertionException, 13016802);
+}
+
+TEST_F(EvaluateConvertTest, ConvertToBinDataSensitiveSubtypeAllowed) {
+    auto expCtx = getExpCtx();
+    auto convertExp = Expression::parseExpression(
+        expCtx.get(),
+        BSON("$convert" << BSON("input" << "$path1"
+                                        << "to" << BSON("type" << "binData" << "subtype" << 8)
+                                        << "format" << toStringData(BinDataFormat::kBase64))),
+        expCtx->variablesParseState);
+    Document input{{"path1", "AAAAAAAAAAAAAAAAAAAAAA=="sv}};
+    auto result = convertExp->evaluate(input, &expCtx->variables);
+    ASSERT_EQ(result.getType(), BSONType::binData);
+    ASSERT_EQ(result.getBinData().type, BinDataType::Sensitive);
+}
+
+TEST_F(EvaluateConvertTest, ConvertBinDataToBinDataSensitiveIdentityAllowed) {
+    auto expCtx = getExpCtx();
+    auto convertExp = Expression::parseExpression(
+        expCtx.get(),
+        BSON("$convert" << BSON("input" << "$path1"
+                                        << "to" << BSON("type" << "binData" << "subtype" << 8))),
+        expCtx->variablesParseState);
+    auto sensitive = BSONBinData("gf1UcxdHTJ2HQ/EGQrO7mQ==", 16, BinDataType::Sensitive);
+    Document input{{"path1", sensitive}};
+    ASSERT_VALUE_EQ(convertExp->evaluate(input, &expCtx->variables), Value(sensitive));
+}
+
+TEST_F(EvaluateConvertTest, ConvertBinDataToBinDataFunctionIdentityAllowed) {
+    auto expCtx = getExpCtx();
+    auto convertExp = Expression::parseExpression(
+        expCtx.get(),
+        BSON("$convert" << BSON("input" << "$path1"
+                                        << "to" << BSON("type" << "binData" << "subtype" << 1))),
+        expCtx->variablesParseState);
+    auto function = BSONBinData("abc", 3, BinDataType::Function);
+    Document input{{"path1", function}};
+    ASSERT_VALUE_EQ(convertExp->evaluate(input, &expCtx->variables), Value(function));
+}
+
+TEST_F(EvaluateConvertTest, ConvertArrayToBinDataBannedSubtypeRejected) {
+    auto expCtx = getExpCtx();
+    auto convertExp = Expression::parseExpression(
+        expCtx.get(),
+        BSON("$convert" << BSON("input" << BSON_ARRAY(1 << 5 << 10) << "to"
+                                        << BSON("type" << "binData" << "subtype" << 7) << "format"
+                                        << toStringData(BinDataFormat::kBase64))),
+        expCtx->variablesParseState);
+    ASSERT_THROWS_CODE(convertExp->evaluate({}, &expCtx->variables), AssertionException, 12910300);
+}
+
+TEST_F(EvaluateConvertTest, ConvertArrayToBinDataAllowedNonVectorSubtypeProducesVector) {
+    auto expCtx = getExpCtx();
+    // Array conversion always yields a Vector. An allowed non-vector subtype is accepted and
+    // ignored.
+    auto convertExp = Expression::parseExpression(
+        expCtx.get(),
+        BSON("$convert" << BSON("input" << BSON_ARRAY(1 << 5 << 10) << "to"
+                                        << BSON("type" << "binData" << "subtype" << 8) << "format"
+                                        << toStringData(BinDataFormat::kBase64))),
+        expCtx->variablesParseState);
+    auto result = convertExp->evaluate({}, &expCtx->variables);
+    ASSERT_EQ(result.getType(), BSONType::binData);
+    ASSERT_EQ(result.getBinData().type, BinDataType::Vector);
+}
+
+TEST_F(EvaluateConvertTest, ConvertObjectToBinDataFunctionSubtypeAllowed) {
+    auto expCtx = getExpCtx();
+
+    auto spec = fromjson("{$convert: {input: '$path1', to: {type: 'binData', subtype: 1}}}");
+    auto convertExp = Expression::parseExpression(expCtx.get(), spec, expCtx->variablesParseState);
+
+    Document input{{"path1", Document{{"a", "a"sv}}}};
+    auto expectedBson = BSON("a" << "a");
+    ASSERT_VALUE_EQ(
+        convertExp->evaluate(input, &expCtx->variables),
+        Value(BSONBinData(expectedBson.objdata(), expectedBson.objsize(), BinDataType::Function)));
+}
 
 }  // namespace evaluate_convert_test
 
@@ -4708,7 +4911,6 @@ TEST(ExpressionConvert, StringToDouble) {
  */
 
 TEST(ExpressionConvertTest, CanRoundTripBitArrays) {
-    unittest::ServerParameterGuard convertFlag{"featureFlagConvertBinDataVectors", true};
 
     auto expCtx = ExpressionContextForTest{};
 
@@ -4754,7 +4956,6 @@ TEST(ExpressionConvertTest, CanRoundTripBitArrays) {
 }
 
 TEST(ExpressionConvertTest, CanRoundTripIntArray) {
-    unittest::ServerParameterGuard convertFlag{"featureFlagConvertBinDataVectors", true};
 
     auto expCtx = ExpressionContextForTest{};
     auto originalArray = Value(BSON_ARRAY(1 << 5 << 10 << 24 << -30 << 79 << 83));
@@ -4778,7 +4979,6 @@ TEST(ExpressionConvertTest, CanRoundTripIntArray) {
 }
 
 TEST(ExpressionConvertTest, CanRoundTripIntArrayHexFormat) {
-    unittest::ServerParameterGuard convertFlag{"featureFlagConvertBinDataVectors", true};
 
     auto expCtx = ExpressionContextForTest{};
     auto originalArray = Value(BSON_ARRAY(1 << 5 << 10 << 24 << -30 << 79 << 83));
@@ -4821,7 +5021,6 @@ BSONArray createBsonArrayFromFloats(std::vector<double> arr) {
 }
 
 TEST(ExpressionConvertTest, CanRoundTripFloatArray) {
-    unittest::ServerParameterGuard convertFlag{"featureFlagConvertBinDataVectors", true};
 
     auto expCtx = ExpressionContextForTest{};
     auto bsonArray = createBsonArrayFromFloats({10.3, 5.87, 10.10294, 24.1, -30.2, 79, 83});
@@ -4846,7 +5045,6 @@ TEST(ExpressionConvertTest, CanRoundTripFloatArray) {
 }
 
 TEST(ExpressionConvertTest, CanRoundTripFloatArrayBigEndian) {
-    unittest::ServerParameterGuard convertFlag{"featureFlagConvertBinDataVectors", true};
     auto expCtx = ExpressionContextForTest{};
 
     auto bsonArray = createBsonArrayFromFloats({10.3, 5.87, 10.10294, 24.1, -30.2, 79, 83});

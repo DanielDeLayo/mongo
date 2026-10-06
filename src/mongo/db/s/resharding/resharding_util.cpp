@@ -85,14 +85,20 @@ boost::optional<long long> estimateCollectionSizeBytes(OperationContext* opCtx,
                                     << BSON("$sum" << "$storageStats.size")))};
     AggregateCommandRequest aggRequest(nss, pipeline);
 
+    // The caller holds the FCV region while this runs, so the aggregation must be bounded. See
+    // SERVER-133988.
+    const auto deadline = opCtx->fastClockSource().now() +
+        Milliseconds{gReshardingCollectionSizeEstimationTimeoutMS.load()};
     BSONObjBuilder resultBuilder;
     try {
-        uassertStatusOK(ClusterAggregate::runAggregate(opCtx,
-                                                       ClusterAggregate::Namespaces{nss, nss},
-                                                       aggRequest,
-                                                       PrivilegeVector(),
-                                                       boost::none,
-                                                       &resultBuilder));
+        opCtx->runWithDeadline(deadline, ErrorCodes::MaxTimeMSExpired, [&] {
+            uassertStatusOK(ClusterAggregate::runAggregate(opCtx,
+                                                           ClusterAggregate::Namespaces{nss, nss},
+                                                           aggRequest,
+                                                           PrivilegeVector(),
+                                                           boost::none,
+                                                           &resultBuilder));
+        });
         BSONObj result = resultBuilder.obj();
         auto resultArr = result["cursor"]["firstBatch"].Array();
         if (resultArr.empty()) {
@@ -266,6 +272,38 @@ std::vector<ReshardingZoneType> getZonesFromExistingCollection(OperationContext*
     for (const auto& zone : collectionZones) {
         ReshardingZoneType newZone(zone.getTag(), zone.getMinKey(), zone.getMaxKey());
         zones.push_back(newZone);
+    }
+    return zones;
+}
+
+std::vector<ReshardingZoneType> selectZonesForParticipantShardsAndChunks(
+    OperationContext* opCtx,
+    const boost::optional<ReshardingProvenanceEnum>& provenance,
+    const boost::optional<std::vector<ReshardingZoneType>>& requestedZones,
+    bool forceRedistribution,
+    const NamespaceString& sourceNss) {
+    std::vector<ReshardingZoneType> zones;
+    if (isUnshardCollection(provenance)) {
+        // Since the resulting collection of an unshardCollection operation cannot have zones, we
+        // do not need to account for existing zones in the original collection. Existing zones
+        // from the original collection will be deleted after the unsharding operation commits.
+        uassert(ErrorCodes::InvalidOptions,
+                "Cannot specify zones when unsharding a collection.",
+                !requestedZones);
+    } else if (requestedZones) {
+        zones = *requestedZones;
+
+        ShardingCatalogManager& shardingCatalogManager = *ShardingCatalogManager::get(opCtx);
+
+        // This is a best effort check that all of the zones exist. It does not provide any
+        // guarantee that the zones will remain stable during the resharding operation.
+        for (const auto& zone : zones) {
+            shardingCatalogManager.checkZoneExists(opCtx, std::string(zone.getZone()));
+        }
+    } else if (forceRedistribution) {
+        // If zones are not provided by the user for same-key resharding, we should use the
+        // existing zones for this resharding operation.
+        zones = getZonesFromExistingCollection(opCtx, sourceNss);
     }
     return zones;
 }
@@ -684,6 +722,16 @@ ReshardingCoordinatorDocument createReshardingCoordinatorDoc(
     // entire operation lifetime, even across FCV transitions. If the opCtx already carries an OFCV,
     // capture that; otherwise fall back to the global snapshot.
     const auto fcv = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
+
+    // (Generic FCV reference): upgrading/downgrading FCV is represented as multi field object,
+    // trying to store this will cause an invariant later, so don't try to store it here.
+    // Don't throw here as well as it won't allow new reshardCollection command requests from
+    // joining active resharding. Instead, defer the assertion to
+    // ReshardingCoordinatorService::checkIfConflictsWithOtherInstances.
+    if (!fcv.isUpgradingOrDowngrading()) {
+        commonMetadata.setStartingFCV(fcv.getVersion());
+    }
+
     {
         ForwardableOperationMetadata fom(opCtx);
         if (!fom.getVersionContext() &&
@@ -754,26 +802,13 @@ ReshardingCoordinatorDocument createReshardingCoordinatorDoc(
     coordinatorDoc.setDemoMode(request.getDemoMode());
     auto telemetryContext =
         otel::TelemetryContextHolder::getDecoration(opCtx).getTelemetryContext();
-    // TODO(SERVER-107128): The telemetry context should not be on the sharding document.
+    // TODO(SERVER-133103): The telemetry context should not be on the sharding document.
     if (telemetryContext && telemetryContext->hasActiveTrace()) {
         auto telemetryCtxBSON = otel::traces::TelemetryContextSerializer::toBSON(telemetryContext);
         coordinatorDoc.setTelemetryContext(telemetryCtxBSON);
     }
 
     if (isEnabledWithPinnedVersion(forwardableMetadata, feature_flags::gAuthoritativeShardsDDL)) {
-        uassert(ErrorCodes::ReshardCollectionInterruptedDueToFCVChange,
-                "Resharding with authoritative shards requires shard refreshes to be disabled; "
-                "this can occur during FCV transitions. Retry after the FCV transition completes.",
-                isEnabledWithPinnedVersion(forwardableMetadata,
-                                           resharding::gFeatureFlagReshardingCloneNoRefresh) &&
-                    isEnabledWithPinnedVersion(forwardableMetadata,
-                                               resharding::gFeatureFlagReshardingInitNoRefresh) &&
-                    isEnabledWithPinnedVersion(
-                        forwardableMetadata,
-                        resharding::gFeatureFlagReshardingNoRefreshApplyingAndBlockingWrites) &&
-                    isEnabledWithPinnedVersion(
-                        forwardableMetadata,
-                        resharding::gFeatureFlagReshardingSkipCloningAndApplyingIfApplicable));
         auto authoritativeLevel =
             isEnabledWithPinnedVersion(forwardableMetadata, feature_flags::gAuthoritativeShardsCRUD)
             ? ReshardingAuthoritativeMetadataAccessLevelEnum::kWritesAndReadsAllowed
@@ -998,6 +1033,33 @@ bool isEnabledWithPinnedVersion(const boost::optional<ForwardableOperationMetada
                                 const FCVGatedFeatureFlag& flag) {
     return flag.isEnabled(getVersionContextOrDefault(fom),
                           serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
+}
+
+bool isFCVTheSame(const CommonReshardingMetadata& metadata,
+                  const multiversion::FeatureCompatibilityVersion& fcv) {
+    // (Generic FCV reference): the coordinator doc predates the startingFCV field, so it can only
+    // have been created on an older binary, which implies the FCV was not kLatest.
+    using GenericFCV = multiversion::GenericFCV;
+
+    // TODO SERVER-132341: startingFCV should always be present in post v9.0.
+    auto startingFCV = metadata.getStartingFCV();
+    if (!startingFCV) {
+        return fcv == GenericFCV::kLastLTS || fcv == GenericFCV::kLastContinuous;
+    }
+
+    // Note: startingFCV cannot be upgrading/downgrading versions because we disallow them during
+    // the creation of the coordinator document.
+    return *startingFCV == fcv;
+}
+
+std::string getStartingFCVString(const CommonReshardingMetadata& metadata) {
+    auto startingFCV = metadata.getStartingFCV();
+    // TODO SERVER-132341: startingFCV should always be present in post v9.0.
+    if (!startingFCV) {
+        return "uninitialized";
+    }
+
+    return std::string{multiversion::toString(*startingFCV)};
 }
 
 boost::optional<BSONObj> determineCloneCountHint(OperationContext* opCtx,

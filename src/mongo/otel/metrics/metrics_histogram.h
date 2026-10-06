@@ -12,6 +12,7 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/histogram.h"
 #include "mongo/util/moving_average.h"
+#include "mongo/util/static_immortal.h"
 
 #include <algorithm>
 #include <atomic>
@@ -88,6 +89,37 @@ public:
     void record(T value) {
         record(value, {});
     }
+};
+
+/**
+ * A no-op, attribute-free Histogram that silently discards all recorded values. The single shared
+ * instance is obtained via instance(); it is stateless and therefore safe to share across threads
+ * and recorders.
+ */
+template <HistogramValueType T>
+class [[MONGO_MOD_PUBLIC]] NoopHistogram final : public Histogram<T> {
+public:
+    using Histogram<T>::record;
+
+    static NoopHistogram* instance() {
+        static StaticImmortal<NoopHistogram> histogram;
+        return &*histogram;
+    }
+
+    void record(T, const std::tuple<>&) override {}
+
+    BSONObj serializeToBson(const std::string&) const override {
+        return BSONObj{};
+    }
+
+#ifdef MONGO_CONFIG_OTEL
+    void reset(opentelemetry::metrics::Meter*) override {}
+#endif  // MONGO_CONFIG_OTEL
+
+private:
+    friend class StaticImmortal<NoopHistogram>;
+
+    NoopHistogram() = default;
 };
 
 // OTel's default explicit bucket boundaries, matching those used internally by the OTel SDK when
@@ -179,6 +211,11 @@ private:
     // kDefaultBucketBoundaries.
     boost::optional<mongo::Histogram<double>> _bucketCounts;
 
+    // BSON field names for each bucket of `_bucketCounts`, built once at construction. Empty when
+    // `_bucketCounts` is disengaged. Bucket boundaries never change after construction, so these
+    // stay valid across `reset()`.
+    std::vector<std::string> _bucketKeys;
+
     std::array<std::string, sizeof...(AttributeTs)> _attributeNames;
 
     OwnedAttributeValueLists<AttributeTs...> _ownedValueLists;
@@ -240,6 +277,8 @@ HistogramImpl<T, AttributeTs...>::HistogramImpl(
                         ? boost::optional<mongo::Histogram<double>>(
                               makeBucketCountsHistogram(this->explicitBucketBoundaries))
                         : boost::none),
+      _bucketKeys(_bucketCounts ? mongo::makeHistogramBucketKeys(*_bucketCounts)
+                                : std::vector<std::string>{}),
       _attributeNames{defs.name...},
       _ownedValueLists(makeOwnedAttributeValueLists(defs...)),
       _validCombinations([this] {
@@ -270,6 +309,8 @@ HistogramImpl<T, AttributeTs...>::HistogramImpl(
                         ? boost::optional<mongo::Histogram<double>>(
                               makeBucketCountsHistogram(this->explicitBucketBoundaries))
                         : boost::none),
+      _bucketKeys(_bucketCounts ? mongo::makeHistogramBucketKeys(*_bucketCounts)
+                                : std::vector<std::string>{}),
       _attributeNames{defs.name...},
       _ownedValueLists(makeOwnedAttributeValueLists(defs...)),
       _validCombinations([this] {
@@ -339,7 +380,7 @@ BSONObj HistogramImpl<T, AttributeTs...>::serializeToBson(const std::string& key
 #ifdef MONGO_CONFIG_OTEL
         auto readLock = _rwMutex.readLock();
 #endif
-        mongo::appendHistogram(builder, *_bucketCounts, key);
+        mongo::appendHistogram(builder, *_bucketCounts, key, _bucketKeys);
     }
     return builder.obj();
 }

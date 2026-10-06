@@ -103,14 +103,18 @@ struct __wt_bm;
 typedef struct __wt_bm WT_BM;
 struct __wt_btree;
 typedef struct __wt_btree WT_BTREE;
-struct __wt_bucket_storage;
-typedef struct __wt_bucket_storage WT_BUCKET_STORAGE;
 struct __wt_cache;
 typedef struct __wt_cache WT_CACHE;
 struct __wt_cache_eviction_controls;
 typedef struct __wt_cache_eviction_controls WT_CACHE_EVICTION_CONTROLS;
 struct __wt_cache_pool;
 typedef struct __wt_cache_pool WT_CACHE_POOL;
+struct __wt_cache_top;
+typedef struct __wt_cache_top WT_CACHE_TOP;
+struct __wt_cache_top_array;
+typedef struct __wt_cache_top_array WT_CACHE_TOP_ARRAY;
+struct __wt_cache_top_entry;
+typedef struct __wt_cache_top_entry WT_CACHE_TOP_ENTRY;
 struct __wt_cell;
 typedef struct __wt_cell WT_CELL;
 struct __wt_cell_kv;
@@ -137,6 +141,8 @@ struct __wt_ckpt_block_mods;
 typedef struct __wt_ckpt_block_mods WT_CKPT_BLOCK_MODS;
 struct __wt_ckpt_connection;
 typedef struct __wt_ckpt_connection WT_CKPT_CONNECTION;
+struct __wt_ckpt_eviction_snap;
+typedef struct __wt_ckpt_eviction_snap WT_CKPT_EVICTION_SNAP;
 struct __wt_ckpt_session;
 typedef struct __wt_ckpt_session WT_CKPT_SESSION;
 struct __wt_ckpt_snapshot;
@@ -187,8 +193,6 @@ struct __wt_conn_stat_log;
 typedef struct __wt_conn_stat_log WT_CONN_STAT_LOG;
 struct __wt_conn_sweep;
 typedef struct __wt_conn_sweep WT_CONN_SWEEP;
-struct __wt_conn_tiered;
-typedef struct __wt_conn_tiered WT_CONN_TIERED;
 struct __wt_connection_impl;
 typedef struct __wt_connection_impl WT_CONNECTION_IMPL;
 struct __wt_connection_load_control;
@@ -233,6 +237,8 @@ struct __wt_dhandle_clear_event;
 typedef struct __wt_dhandle_clear_event WT_DHANDLE_CLEAR_EVENT;
 struct __wt_dhandle_clear_log;
 typedef struct __wt_dhandle_clear_log WT_DHANDLE_CLEAR_LOG;
+struct __wt_disagg_deferred_ckpt;
+typedef struct __wt_disagg_deferred_ckpt WT_DISAGG_DEFERRED_CKPT;
 struct __wt_disagg_metadata_op;
 typedef struct __wt_disagg_metadata_op WT_DISAGG_METADATA_OP;
 struct __wt_disagg_pending_crypt_key;
@@ -331,8 +337,6 @@ struct __wt_named_encryptor;
 typedef struct __wt_named_encryptor WT_NAMED_ENCRYPTOR;
 struct __wt_named_page_log;
 typedef struct __wt_named_page_log WT_NAMED_PAGE_LOG;
-struct __wt_named_storage_source;
-typedef struct __wt_named_storage_source WT_NAMED_STORAGE_SOURCE;
 struct __wt_optrack_header;
 typedef struct __wt_optrack_header WT_OPTRACK_HEADER;
 struct __wt_optrack_record;
@@ -373,10 +377,10 @@ struct __wt_prefetch;
 typedef struct __wt_prefetch WT_PREFETCH;
 struct __wt_prefetch_queue_entry;
 typedef struct __wt_prefetch_queue_entry WT_PREFETCH_QUEUE_ENTRY;
+struct __wt_prefetch_scan;
+typedef struct __wt_prefetch_scan WT_PREFETCH_SCAN;
 struct __wt_process;
 typedef struct __wt_process WT_PROCESS;
-struct __wt_reconcile_stats;
-typedef struct __wt_reconcile_stats WT_RECONCILE_STATS;
 struct __wt_reconcile_timeline;
 typedef struct __wt_reconcile_timeline WT_RECONCILE_TIMELINE;
 struct __wt_recovery_timeline;
@@ -437,16 +441,6 @@ struct __wt_thread_group;
 typedef struct __wt_thread_group WT_THREAD_GROUP;
 struct __wt_throttle;
 typedef struct __wt_throttle WT_THROTTLE;
-struct __wt_tiered;
-typedef struct __wt_tiered WT_TIERED;
-struct __wt_tiered_object;
-typedef struct __wt_tiered_object WT_TIERED_OBJECT;
-struct __wt_tiered_tiers;
-typedef struct __wt_tiered_tiers WT_TIERED_TIERS;
-struct __wt_tiered_tree;
-typedef struct __wt_tiered_tree WT_TIERED_TREE;
-struct __wt_tiered_work_unit;
-typedef struct __wt_tiered_work_unit WT_TIERED_WORK_UNIT;
 struct __wt_time_aggregate;
 typedef struct __wt_time_aggregate WT_TIME_AGGREGATE;
 struct __wt_time_window;
@@ -625,8 +619,10 @@ typedef uint64_t wt_timestamp_t;
 #include "block.h"
 #include "block_cache.h"
 #include "btmem.h"
+#include "cache_top.h" /* required by btree.h */
 #include "btree.h"
 #include "cache.h"
+#include "../reconcile/reconcile.h"
 #include "../evict/evict.h"
 #include "capacity.h"
 #include "cell.h"
@@ -647,10 +643,8 @@ typedef uint64_t wt_timestamp_t;
 #include "meta.h" /* required by block.h */
 #include "optrack.h"
 #include "os.h"
-#include "../reconcile/reconcile.h"
 #include "rollback_to_stable.h"
 #include "schema.h"
-#include "tiered.h"
 #include "truncate.h"
 #include "txn.h" /* required by checkpoint.h */
 #include "../checkpoint/checkpoint.h"

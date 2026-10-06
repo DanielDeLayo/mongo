@@ -1,10 +1,8 @@
 // Copyright (c) MongoDB, Inc.
 // SPDX-License-Identifier: SSPL-1.0
 
-#include <boost/move/utility_core.hpp>
-#include <boost/numeric/conversion/converter_policies.hpp>
-#include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "ext/alloc_traits.h"
+#include "mongo/db/matcher/expression_leaf.h"
+
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonelement_comparator.h"
 #include "mongo/bson/bsonmisc.h"
@@ -14,12 +12,12 @@
 #include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
-#include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/path.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/query_execution_knobs_gen.h"
 #include "mongo/db/query/query_integration_knobs_gen.h"
 #include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/errno_util.h"
 #include "mongo/util/pcre.h"
 #include "mongo/util/pcre_util.h"
@@ -29,6 +27,13 @@
 #include <cmath>
 #include <memory>
 #include <string_view>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/numeric/conversion/converter_policies.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 namespace mongo {
 using namespace std::literals::string_view_literals;
@@ -447,6 +452,8 @@ BitTestMatchExpression::BitTestMatchExpression(MatchType type,
                                                uint32_t bitMaskLen,
                                                clonable_ptr<ErrorAnnotation> annotation)
     : LeafMatchExpression(type, path, std::move(annotation)) {
+    const auto maxPositions = internalQueryMaxBitTestIntermediatePositions.load();
+    const auto logThreshold = static_cast<size_t>(internalQueryBitTestPositionsLogThreshold.load());
     for (uint32_t byte = 0; byte < bitMaskLen; byte++) {
         char byteAt = bitMaskBinary[byte];
         if (!byteAt) {
@@ -465,7 +472,18 @@ BitTestMatchExpression::BitTestMatchExpression(MatchType type,
 
         for (int bit = 0; bit < 8; bit++) {
             if (byteAt & (1 << bit)) {
+                uassert(12244901,
+                        str::stream() << "BinData bitmask for " << name()
+                                      << " has too many set bits; maximum is " << maxPositions
+                                      << " (controlled by "
+                                         "internalQueryMaxBitTestIntermediatePositions)",
+                        _bitPositions.size() < static_cast<size_t>(maxPositions));
                 _bitPositions.push_back(8 * byte + bit);
+                if (_bitPositions.size() == logThreshold) {
+                    LOGV2_WARNING(12244900,
+                                  "Creating large bitPosition vector",
+                                  "size"_attr = _bitPositions.size());
+                }
             }
         }
     }

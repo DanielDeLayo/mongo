@@ -48,7 +48,6 @@
 #include "mongo/db/shard_role/shard_role.h"
 #include "mongo/db/shard_role/transaction_resources.h"
 #include "mongo/db/sharding_environment/shard_id.h"
-#include "mongo/db/sharding_environment/shard_ref.h"
 #include "mongo/db/sharding_environment/shard_server_test_fixture.h"
 #include "mongo/db/sharding_environment/sharding_mongod_test_fixture.h"
 #include "mongo/db/storage/write_unit_of_work.h"
@@ -216,16 +215,12 @@ protected:
                                         const Timestamp& timestamp,
                                         const std::string& shardKey) {
         auto range1 = ChunkRange(BSON(shardKey << MINKEY), BSON(shardKey << 5));
-        ChunkType chunk1(uuid,
-                         range1,
-                         ChunkVersion({epoch, timestamp}, {1, 0}),
-                         ShardRef(kShardList[0].getName()));
+        ChunkType chunk1(
+            uuid, range1, ChunkVersion({epoch, timestamp}, {1, 0}), kShardList[0].getName());
 
         auto range2 = ChunkRange(BSON(shardKey << 5), BSON(shardKey << MAXKEY));
-        ChunkType chunk2(uuid,
-                         range2,
-                         ChunkVersion({epoch, timestamp}, {1, 0}),
-                         ShardRef(kShardList[1].getName()));
+        ChunkType chunk2(
+            uuid, range2, ChunkVersion({epoch, timestamp}, {1, 0}), kShardList[1].getName());
 
         return {chunk1, chunk2};
     }
@@ -297,15 +292,15 @@ protected:
                                                       env.version.placementVersion().getTimestamp(),
                                                       "y");
 
-        getShardServerCatalogCacheLoaderMock()->setDatabaseRefreshReturnValue(DatabaseType(
-            kNss.dbName(), ShardRef{std::string{kShardList[0].getName()}}, env.dbVersion));
+        getShardServerCatalogCacheLoaderMock()->setDatabaseRefreshReturnValue(
+            DatabaseType(kNss.dbName(), kShardList[0].getName(), env.dbVersion));
         getShardServerCatalogCacheLoaderMock()->setCollectionRefreshValues(
             kNss, coll, chunksWithXShardKey, reshardingFields);
         getShardServerCatalogCacheLoaderMock()->setCollectionRefreshValues(
             env.tempNss, coll, chunksWithYShardKey, boost::none);
 
-        getConfigServerCatalogCacheLoaderMock()->setDatabaseRefreshReturnValue(DatabaseType(
-            kNss.dbName(), ShardRef{std::string{kShardList[0].getName()}}, env.dbVersion));
+        getConfigServerCatalogCacheLoaderMock()->setDatabaseRefreshReturnValue(
+            DatabaseType(kNss.dbName(), kShardList[0].getName(), env.dbVersion));
         getConfigServerCatalogCacheLoaderMock()->setCollectionRefreshValues(
             kNss, coll, chunksWithXShardKey, reshardingFields);
         getConfigServerCatalogCacheLoaderMock()->setCollectionRefreshValues(

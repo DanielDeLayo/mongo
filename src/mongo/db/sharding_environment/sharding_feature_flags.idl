@@ -98,6 +98,11 @@ feature_flags:
         version: 9.0
         fcv_gated: true
         enable_on_transitional_fcv_UNSAFE: true
+    featureFlagShardCatalogExpiredHistoryFiltering:
+        description: "Feature flag to enable filtering out expired unreachable chunk ownership metadata during shard catalog metadata recovery."
+        cpp_varname: feature_flags::gShardCatalogExpiredHistoryFiltering
+        default: false
+        fcv_gated: false
     featureFlagTerminateSecondaryReadsUponRangeDeletion:
         description: "Feature flag to enable the termination of secondary reads due to range deletions."
         cpp_varname: feature_flags::gTerminateSecondaryReadsUponRangeDeletion
@@ -222,16 +227,6 @@ feature_flags:
         version: 9.0
         fcv_gated: true
     # TODO (SERVER-126212): remove feature flag once 9.0 becomes last LTS.
-    # TODO (SERVER-127411): keep default: false until all types and APIs have been migrated to ShardRef.
-    # Enabling earlier would allow UUID primaries to be written
-    # into config.databases while not-yet-migrated types still expect ShardIds.
-    featureFlagUniqueShardIdentifiers:
-        description:
-            "Feature flag to refer to shards by their UUID, to uniquely identify each shard across
-            additions and removals."
-        cpp_varname: feature_flags::gFeatureFlagUniqueShardIdentifiers
-        default: false
-        fcv_gated: true
     featureFlagAssignUUIDToShard:
         description: >
             When enabled, each shard receives a uuid value when added to a cluster
@@ -250,4 +245,26 @@ feature_flags:
         cpp_varname: feature_flags::gStrictExpireAfterSecondsTypeChecking
         default: true
         version: 9.0
+        fcv_gated: true
+    featureFlagServerInitiatedTransactionClassification:
+        description: >-
+            When enabled, the router attaches the 'isServerInitiatedTransaction' generic argument to
+            the first command sent to each participant of a server-initiated (internal) transaction,
+            so that the participant can attribute its transaction lifecycle metrics as internal
+            rather than external. Gated on FCV to ensure all nodes in the cluster understand the field 
+            before it is sent.
+        cpp_varname: feature_flags::gServerInitiatedTransactionClassification
+        default: false
+        fcv_gated: true
+    # TODO (SERVER-133881): Remove this flag once 10.0 becomes last LTS.
+    featureFlagCreateRenameNewSetAllowChunkOperationsBehavior:
+        description: >-
+            When enabled, the create and rename collection DDL coordinators commit the new
+            (splittable) collection with 'allowChunkOperations: false' and only re-enable chunk
+            operations after the critical section has been released. This prevents a chunk
+            operation from acquiring the critical section of a collection while the DDL
+            coordinator is still holding it.
+        cpp_varname: feature_flags::gCreateRenameNewSetAllowChunkOperationsBehavior
+        default: true
+        version: 9.1
         fcv_gated: true

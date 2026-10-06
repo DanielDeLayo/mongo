@@ -100,6 +100,22 @@ server_parameters:
         default: false
         redact: false
 
+    migrationRecipientPITHistoryToPreserveInSecs:
+        description: >-
+            TEST-ONLY. Overrides the point-in-time snapshot history, in seconds, preserved by the
+            chunk migration recipient during testing. Ignored outside of test environments,
+            where minSnapshotHistoryWindowInSeconds is used instead. Has no effect unless testing is
+            enabled. When its value is -1, it's disabled, meaning that minSnapshotHistoryWindowInSeconds
+            prevails.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: gMigrationRecipientPITHistoryToPreserveInSecs
+        default: -1
+        validator:
+            gte: -1
+        redact: false
+        test_only: true
+
     migrateCloneInsertionBatchSize:
         description: >-
             The maximum number of documents to insert in a single batch during the cloning step of
@@ -125,6 +141,20 @@ server_parameters:
         validator:
             gte: 0
         default: 0
+        redact: false
+
+    migrationRecipientAbortTimeoutMS:
+        description: >-
+            How long the donor waits for the recipient to acknowledge the _recvChunkAbort command
+            sent when a migration is cancelled. This command is sent asynchronously on a
+            best-effort basis, so the timeout only bounds how long the network operation may remain
+            outstanding.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<int>
+        cpp_varname: gMigrationRecipientAbortTimeoutMS
+        validator:
+            gte: 1
+        default: 30000
         redact: false
 
     migrationLockAcquisitionMaxWaitMS:
@@ -298,3 +328,25 @@ server_parameters:
         cpp_varname: skipRangeDeletionForMaxKeyChunks
         default: true
         redact: false
+
+    clearCollectionShardingRuntimesOnRecovery:
+        description: >-
+            When enabled, rollback recovery clears the in-memory CollectionShardingRuntime filtering
+            metadata. When disabled, the filtering metadata is left untouched during rollback recovery.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<bool>
+        cpp_varname: gClearCollectionShardingRuntimesOnRecovery
+        default: true
+        redact: false
+
+    allowDeferredInternalCatalogIndexBuildOnNonEmptyCollectionDuringStepUp:
+        description: >-
+            TEST-ONLY. When enabled, suppresses the tassert in createIndexesOnCollectionAtStepUp for
+            missing indexes on non-empty collections during step-up. This allows step up to succeed
+            without building those indexes.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: gAllowDeferredInternalCatalogIndexBuildOnNonEmptyCollectionDuringStepUp
+        default: false
+        redact: false
+        test_only: true

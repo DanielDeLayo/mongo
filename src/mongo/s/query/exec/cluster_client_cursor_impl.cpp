@@ -8,6 +8,7 @@
 #include "mongo/db/change_stream_metrics_util.h"
 #include "mongo/db/commands/server_status/server_status_metric.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/query/client_cursor/generic_cursor_utils.h"
 #include "mongo/db/query/query_stats/query_stats.h"
 #include "mongo/db/query/tailable_mode_gen.h"
 #include "mongo/db/service_context.h"
@@ -80,6 +81,7 @@ ClusterClientCursorImpl::ClusterClientCursorImpl(OperationContext* opCtx,
       _lsid(lsid),
       _opCtx(opCtx),
       _rawData(isRawDataOperation(opCtx)),
+      _ifrContext(IncrementalFeatureRolloutContext::get(opCtx)),
       _createdDate(opCtx->getServiceContext()->getPreciseClockSource()->now()),
       _lastUseDate(_createdDate),
       _planCacheShapeHash(CurOp::get(opCtx)->debug().planCacheShapeHash),
@@ -94,6 +96,9 @@ ClusterClientCursorImpl::ClusterClientCursorImpl(OperationContext* opCtx,
             SimpleBSONObjComparator::kInstance.evaluate(
                 _params.sortToApplyOnRouter == AsyncResultsMerger::kWholeSortKeySortPattern));
     mongosCursorStatsTotalOpened.increment();
+
+    _params.originatingCommandObj = generic_cursor::maybeRedactOriginatingCommand(
+        _params.originatingCommandObj, _shouldOmitDiagnosticInformation);
 
     if (_isChangeStreamQuery) {
         change_stream_metrics::gCursorsTotalOpened.add(1);
@@ -110,6 +115,7 @@ ClusterClientCursorImpl::ClusterClientCursorImpl(OperationContext* opCtx,
       _lsid(lsid),
       _opCtx(opCtx),
       _rawData(isRawDataOperation(opCtx)),
+      _ifrContext(IncrementalFeatureRolloutContext::get(opCtx)),
       _createdDate(opCtx->getServiceContext()->getPreciseClockSource()->now()),
       _lastUseDate(_createdDate),
       _planCacheShapeHash(CurOp::get(opCtx)->debug().planCacheShapeHash),
@@ -124,6 +130,9 @@ ClusterClientCursorImpl::ClusterClientCursorImpl(OperationContext* opCtx,
             SimpleBSONObjComparator::kInstance.evaluate(
                 _params.sortToApplyOnRouter == AsyncResultsMerger::kWholeSortKeySortPattern));
     mongosCursorStatsTotalOpened.increment();
+
+    _params.originatingCommandObj = generic_cursor::maybeRedactOriginatingCommand(
+        _params.originatingCommandObj, _shouldOmitDiagnosticInformation);
 
     if (_isChangeStreamQuery) {
         change_stream_metrics::gCursorsTotalOpened.add(1);
@@ -388,6 +397,10 @@ boost::optional<std::size_t> ClusterClientCursorImpl::getQueryStatsKeyHash() con
 
 APIParameters ClusterClientCursorImpl::getAPIParameters() const {
     return _params.apiParameters;
+}
+
+std::shared_ptr<IncrementalFeatureRolloutContext> ClusterClientCursorImpl::cloneIfrContext() const {
+    return _ifrContext->clone();
 }
 
 boost::optional<ReadPreferenceSetting> ClusterClientCursorImpl::getReadPreference() const {

@@ -67,8 +67,7 @@ struct RepresentativeQueryInfo {
  * Creates a RepresentativeQueryInfo for the given query.
  */
 RepresentativeQueryInfo createRepresentativeInfo(OperationContext* opCtx,
-                                                 const QueryInstance& queryInstance,
-                                                 const boost::optional<TenantId>& tenantId);
+                                                 const QueryInstance& queryInstance);
 
 class [[MONGO_MOD_PUBLIC]] QuerySettingsService {
 public:
@@ -92,8 +91,8 @@ public:
      * namespace 'nss'. Query settings are not eligible for IDHACK/Express queries, encrypted
      * queries and queries run on internal or system collections.
      */
-    static bool isEligbleForQuerySettings(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                          const NamespaceString& nss);
+    static bool isEligibleForQuerySettings(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                           const NamespaceString& nss);
 
     /**
      * Applies 'settings.maxTimeMS' (if set) to the current operation's deadline. A no-op during
@@ -103,16 +102,6 @@ public:
      */
     static void applyMaxTimeMSFromSettings(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                            const QuerySettings& settings);
-
-    /**
-     * Returns a set of system and administrative aggregation pipeline stages that, if used as the
-     * initial stage, prevent the query from being rejected via query settings.
-     *
-     * Query settings module is responsible for maintaining the information about what aggregation
-     * stages can be rejected.
-     */
-    static const stdx::unordered_set<std::string_view, StringMapHasher>&
-    getRejectionIncompatibleStages();
 
     /**
      * Creates the QuerySettingsService that is attached to the 'serviceContext' with the logic
@@ -150,7 +139,6 @@ public:
     virtual QuerySettings lookupQuerySettingsWithRejectionCheck(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const query_shape::QueryShapeHash& queryShapeHash,
-        const NamespaceString& nss,
         const boost::optional<QuerySettings>& querySettingsFromOriginalCommand) const = 0;
 
     /**
@@ -165,7 +153,7 @@ public:
         const boost::optional<QuerySettings>& querySettingsFromOriginalCommand) const {
         // Ineligible queries (IDHACK/Express, FLE, internal/system namespaces) never receive query
         // settings, whether from persisted settings or supplied directly by the user.
-        if (!isEligbleForQuerySettings(expCtx, nss)) {
+        if (!isEligibleForQuerySettings(expCtx, nss)) {
             return QuerySettings();
         }
 
@@ -183,7 +171,7 @@ public:
         }
 
         return lookupQuerySettingsWithRejectionCheck(
-            expCtx, *queryShapeHash, nss, querySettingsFromOriginalCommand);
+            expCtx, *queryShapeHash, querySettingsFromOriginalCommand);
     }
 
     /**
@@ -206,26 +194,23 @@ public:
     /**
      * Returns all the query shape configurations and the timestamp of the last modification.
      */
-    virtual QueryShapeConfigurationsWithTimestamp getAllQueryShapeConfigurations(
-        const boost::optional<TenantId>& tenantId) const = 0;
+    virtual QueryShapeConfigurationsWithTimestamp getAllQueryShapeConfigurations() const = 0;
 
     /**
      * Sets all the query shape configurations with the given timestamp.
      */
     virtual void setAllQueryShapeConfigurations(
-        QueryShapeConfigurationsWithTimestamp&& queryShapeConfigurations,
-        const boost::optional<TenantId>& tenantId) = 0;
+        QueryShapeConfigurationsWithTimestamp&& queryShapeConfigurations) = 0;
 
     /**
      * Removes all query shape configurations.
      */
-    virtual void removeAllQueryShapeConfigurations(const boost::optional<TenantId>& tenantId) = 0;
+    virtual void removeAllQueryShapeConfigurations() = 0;
 
     /**
      * Returns the LogicalTime of the 'querySettings' cluster parameter.
      */
-    virtual LogicalTime getClusterParameterTime(
-        const boost::optional<TenantId>& tenantId) const = 0;
+    virtual LogicalTime getClusterParameterTime() const = 0;
 
     /**
      * Creates the corresponding 'querySettings' cluster parameter value out of the 'config' and
@@ -243,19 +228,6 @@ public:
      * collection creation failure, unless the collection already exists.
      */
     virtual void createQueryShapeRepresentativeQueriesCollection(OperationContext* opCtx) const = 0;
-
-    /**
-     * Drops 'queryShapeRepresentativeQueries' collection locally. Throws an exception in case of
-     * collection drop failure, unless the collection doesn't exist.
-     */
-    virtual void dropQueryShapeRepresentativeQueriesCollection(OperationContext* opCtx) const = 0;
-
-    /**
-     * Performs any query settings data migrations needed when upgrading to 'targetFCV'. The
-     * required actions are derived from which feature flags are enabled on 'targetFCV'.
-     */
-    virtual void upgradeQuerySettings(
-        OperationContext* opCtx, multiversion::FeatureCompatibilityVersion targetFCV) const = 0;
 
     /**
      * Performs any query settings data migrations needed when downgrading to 'targetFCV'. The
@@ -297,22 +269,12 @@ public:
     void validateQuerySettings(const QuerySettings& querySettings) const;
 
     /**
-     * Validates user-provided query knob overrides in 'querySettings': rejects 'queryKnobs'
-     * unless featureFlagPqsQueryKnobs is enabled, and rejects individual knobs whose minimum FCV
-     * is above the current FCV. Must be called at every entry point accepting external query
-     * settings; parsing (QuerySettingsKnobOverrides::fromBSON()) deliberately performs no FCV
-     * validation, as it also handles internal traffic and stored settings.
-     * TODO SERVER-122103: Remove the feature flag guard once featureFlagPqsQueryKnobs is removed
-     * (SPM-4364).
+     * Validates user-provided query knob overrides in 'querySettings': rejects individual knobs
+     * whose minimum FCV is above the current FCV. Must be called at every entry point accepting
+     * external query settings; parsing (QuerySettingsKnobOverrides::fromBSON()) deliberately
+     * performs no FCV validation, as it also handles internal traffic and stored settings.
      */
-    void validateQueryKnobs(OperationContext* opCtx, const QuerySettings& querySettings) const;
-
-    /**
-     * Validates that 'maxTimeMS' in 'querySettings' is only used when featureFlagPqsMaxTimeMS is
-     * enabled. Must be called at every entry point accepting external query settings, mirroring
-     * validateQueryKnobs().
-     */
-    void validateMaxTimeMS(OperationContext* opCtx, const QuerySettings& querySettings) const;
+    void validateQueryKnobs(const QuerySettings& querySettings) const;
 
     /**
      * Validates that QuerySettings can be applied to the query represented by 'queryInfo'.
@@ -354,12 +316,6 @@ public:
 };
 
 /**
- * Returns true if the aggregation pipeline 'pipeline' does not start with rejection incompatible
- * stage, and therefore can be rejected.
- */
-bool canPipelineBeRejected(const std::vector<BSONObj>& pipeline);
-
-/**
  * Determines if 'querySettings' field is allowed to be present as part of the command request for
  * the given 'client'.
  */
@@ -369,6 +325,39 @@ bool allowQuerySettingsFromClient(Client* client);
  * Returns true if given QuerySettings instance contains only default values.
  */
 bool isDefault(const QuerySettings& querySettings);
+
+/**
+ * Returns the resolved 'maxTimeMS' from 'querySettings' to forward as a shard sub-request's generic
+ * 'maxTimeMS', so the shard's deadline selection sees it before query settings are re-applied
+ * inside the command's own execution. Returns boost::none if there's nothing to forward, or if
+ * 'isExplain' is true: like 'QuerySettingsService::applyMaxTimeMSFromSettings', an explain must not
+ * be bounded by the query settings 'maxTimeMS' - it is still reported in the 'querySettings'
+ * section of explain output, but must not affect explain execution itself.
+ */
+inline boost::optional<std::int64_t> resolveMaxTimeMSForShardForwarding(
+    const QuerySettings& querySettings, bool isExplain) {
+    if (isExplain) {
+        return boost::none;
+    }
+    return querySettings.getMaxTimeMS();
+}
+
+/**
+ * Attaches 'querySettings' to a shard-bound 'request', together with the 'maxTimeMS' resolved from
+ * them. Both must be kept in step: forwarding the settings without the resolved 'maxTimeMS' leaves
+ * the shard computing its deadline from the stale, client-supplied value. A no-op for default
+ * settings.
+ */
+template <typename Request>
+void applyToShardRequest(Request& request, const QuerySettings& querySettings, bool isExplain) {
+    if (isDefault(querySettings)) {
+        return;
+    }
+    request.setQuerySettings(querySettings);
+    if (auto qsMaxTimeMS = resolveMaxTimeMSForShardForwarding(querySettings, isExplain)) {
+        request.setMaxTimeMS(*qsMaxTimeMS);
+    }
+}
 
 /**
  * Merges the query settings 'lhs' with query settings 'rhs', by replacing all attributes in 'lhs'

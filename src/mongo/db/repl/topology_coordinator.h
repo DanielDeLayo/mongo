@@ -534,6 +534,31 @@ public:
                                                             const ReplSetTagPattern& tagPattern,
                                                             bool durablyWritten);
 
+    /**
+     * Returns the highest OpTime that at least 'numNodes' nodes have reached, i.e. the highest
+     * OpTime T for which haveNumNodesReachedOpTime(T, numNodes, durablyWritten) returns true. That
+     * is the 'numNodes'-th largest current-term member OpTime, capped by self's (self is a required
+     * participant). Returns a null OpTime when fewer than 'numNodes' nodes have reached the current
+     * term, meaning no OpTime satisfies the requirement right now.
+     *
+     * Lets a caller learn the satisfiable point in one pass instead of probing a series of
+     * candidate OpTimes. "durablyWritten" indicates whether the operation has to be durably
+     * written.
+     */
+    [[MONGO_MOD_PRIVATE]] OpTime getMaxReachedOpTimeForNumNodes(int numNodes, bool durablyWritten);
+
+    /**
+     * Returns the highest OpTime that the nodes matching 'tagPattern' have reached, i.e. the
+     * highest OpTime T for which haveTaggedNodesReachedOpTime(T, tagPattern, durablyWritten)
+     * returns true. Returns a null OpTime when the pattern cannot be satisfied in the current term,
+     * meaning no OpTime satisfies the requirement right now.
+     *
+     * The tagged-nodes counterpart of getMaxReachedOpTimeForNumNodes().
+     * "durablyWritten" indicates whether the operation has to be durably written.
+     */
+    [[MONGO_MOD_PRIVATE]] OpTime getMaxReachedOpTimeForTaggedNodes(
+        const ReplSetTagPattern& tagPattern, bool durablyWritten);
+
     using MemberPredicate = std::function<bool(const MemberData&)>;
 
     /**
@@ -806,6 +831,16 @@ public:
      * Returns the current primary index.
      */
     [[MONGO_MOD_PRIVATE]] int getCurrentPrimaryIndex() const;
+
+    /**
+     * Returns the last time we received a heartbeat *request* from the current primary, or
+     * boost::none if there is no known primary other than ourselves. Unlike a heartbeat response,
+     * an inbound request proves the primary is still actively initiating work.
+     *
+     * A returned unset Date_t means we know who the primary is but have never received a request
+     * from it, which callers comparing against 'now' will read as the distant past.
+     */
+    [[MONGO_MOD_PRIVATE]] boost::optional<Date_t> getLastHeartbeatRecvFromPrimary() const;
 
     /**
      * Transitions to the candidate role if the node is electable.

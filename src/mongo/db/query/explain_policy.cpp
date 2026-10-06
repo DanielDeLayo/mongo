@@ -11,8 +11,9 @@ ExplainPolicy explainPolicyFor(ExplainOptions::Verbosity v) {
     using V = ExplainOptions::Verbosity;
     using C = ExplainSettings;
 
-    // Explain V1/V2 verbosities are additive.
-    constexpr auto queryPlanner = C::kPlannerInfo | C::kRejectedPlans;
+    // Explain V1/V2 verbosities are additive. Every legacy verbosity shows the cost-based ranker's
+    // estimates, which the legacy node shape has always emitted from its lowest verbosity.
+    constexpr auto queryPlanner = C::kPlannerInfo | C::kRejectedPlans | C::kCostBasedStats;
     constexpr auto execStats = queryPlanner | C::kExecStats;
     constexpr auto execAllPlans = execStats | C::kAllPlansExecStats;
 
@@ -28,18 +29,30 @@ ExplainPolicy explainPolicyFor(ExplainOptions::Verbosity v) {
             // allPlansExecution content.
             return ExplainPolicy(execAllPlans | C::kBytecode);
 
-        // TODO SERVER-130529: Remove these transitional V3 rows. Until the V3 output format is
-        // implemented, a V3 verbosity is normally translated to a legacy verbosity before any
-        // content decision. The one exception is DocumentSourceUnionWith::optimizeAt(), which reads
-        // the originally requested (possibly-V3) verbosity straight off the ExpressionContext and
-        // feeds it here. Mapping every V3 value to the kExecAllPlans policy keeps that site
-        // byte-identical: before SERVER-130812 it evaluated "v3Verbosity >= kExecStats", which was
-        // true for every V3 value, so its effective content matched kExecAllPlans.
+        // Explain V3 verbosities: a separate sequence of verbosities, each one adds contents on
+        // top of the previous one: plannerChoice ⊆ plannerStats ⊆ execStats.
+        // planSummary is currently legacy-delegated (TODO SERVER-133235) and therefore does not
+        // follow this nesting at the policy/output level yet.
         case V::kPlanSummary:
+            // The planSummary output is still legacy-delegated (TODO SERVER-133235).
+            return ExplainPolicy(queryPlanner);
         case V::kPlannerChoice:
+            // Plan structure only: every candidate's stages, with no ranking statistics
+            // (multi-planning trial counters or cost-based estimates) and no execution statistics.
+            // This is the one policy that excludes kCostBasedStats, which is why the V3
+            // planner-only content cannot reuse the legacy 'queryPlanner' baseline - the legacy
+            // node shape emits estimates even at its lowest verbosity.
+            return ExplainPolicy(C::kPlannerInfo | C::kRejectedPlans);
         case V::kPlannerStats:
+            // Trial/per-candidate statistics without winner-execution statistics — a combination
+            // no legacy verbosity produces; the V3 plan serializer keys off it. The query is not
+            // executed at this verbosity.
+            return ExplainPolicy(C::kPlannerInfo | C::kRejectedPlans | C::kCostBasedStats |
+                                 C::kAllPlansExecStats);
         case V::kExecStatsV3:
-            return ExplainPolicy(execAllPlans);
+            // plannerStats content plus the retained "executionStats" section (winner executed).
+            return ExplainPolicy(C::kPlannerInfo | C::kRejectedPlans | C::kCostBasedStats |
+                                 C::kAllPlansExecStats | C::kExecStats);
     }
     MONGO_UNREACHABLE_TASSERT(10812000);
 }

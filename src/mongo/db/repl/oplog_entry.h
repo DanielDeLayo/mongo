@@ -10,6 +10,7 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/repl/apply_ops_gen.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/optime.h"
@@ -207,14 +208,14 @@ public:
     }
 
     /**
-     * In-memory tag identifying a group of operations that should be kept together when packing
-     * operations into applyOps entries.
+     * In-memory only (not serialized): the record id of the group this operation belongs to. Lets
+     * the applyOps packer keep a group's operations in one entry.
      */
-    boost::optional<int32_t> getAtomicGroupId() const {
-        return _atomicGroupId;
+    boost::optional<RecordId> getGroupRecordId() const {
+        return _groupRecordId;
     }
-    void setAtomicGroupId(boost::optional<int32_t> value) {
-        _atomicGroupId = value;
+    void setGroupRecordId(boost::optional<RecordId> value) {
+        _groupRecordId = std::move(value);
     }
 
     /**
@@ -285,8 +286,8 @@ private:
     // transaction.
     bool _preImageRecordedForRetryableInternalTransaction{false};
 
-    // In-memory tag for grouping operations during applyOps packing.
-    boost::optional<int32_t> _atomicGroupId;
+    // Record id saved to identify this operation's group during applyOps packing.
+    boost::optional<RecordId> _groupRecordId;
 };
 
 /**
@@ -373,10 +374,6 @@ public:
 
     void setSizeMetadata(boost::optional<OplogEntrySizeMetadata> value) & {
         getDurableReplOperation().setSizeMetadata(std::move(value));
-    }
-
-    void setDocHash(boost::optional<std::int64_t> value) & {
-        getDurableReplOperation().setDocHash(std::move(value));
     }
 
     void setRecordId(RecordId rid) & {
@@ -551,7 +548,6 @@ public:
     using MutableOplogEntry::getCheckExistenceForDiffInsert;
     using MutableOplogEntry::getContainer;
     using MutableOplogEntry::getDestinedRecipient;
-    using MutableOplogEntry::getDocHash;
     using MutableOplogEntry::getDurableReplOperation;
     using MutableOplogEntry::getFromMigrate;
     using MutableOplogEntry::getIsTimeseries;
@@ -624,9 +620,10 @@ public:
     bool isCommand() const;
 
     /**
-     * Returns if the applyOps oplog entry is linked through its prevOpTime field as part of a
-     * transaction, rather than as a retryable write or stand-alone applyOps.  Valid only for
-     * applyOps entries.
+     * Returns if the applyOps oplog entry has a prevOpTime link to follow, i.e. prevOpTime is set
+     * and this is not a stand-alone kApplyOpsAppliedSeparately entry.  Valid only for applyOps
+     * entries.  A true result does not mean the linked entry belongs to the same unit of work: a
+     * retryable batch's first entry links to the previous statement.
      */
     bool applyOpsIsLinkedTransactionally() const;
 
@@ -888,7 +885,6 @@ public:
     const mongo::BSONObj& getObject() const;
     const boost::optional<mongo::BSONObj>& getObject2() const;
     boost::optional<bool> getIsTimeseries() const;
-    boost::optional<std::int64_t> getDocHash() const;
     const boost::optional<mongo::repl::OplogEntrySizeMetadata>& getSizeMetadata() const;
     boost::optional<bool> getUpsert() const;
     const boost::optional<mongo::repl::OpTime>& getPreImageOpTime() const;

@@ -402,6 +402,39 @@ TEST(AsioTransportLayer, CheckClientWRShutdownWithoutClose) {
     tf.runTestWithClientDroppingConnectionBeforeServerCreatesSession(
         [&](ConnectionThread& client) { shutdown(client.socket().rawFD(), SHUT_WR); });
 }
+
+/**
+ * isConnected() must report false once the peer has shut down its write side, even when data the
+ * peer sent beforehand is still buffered unread on the socket. Detecting the half-close under
+ * buffered data requires POLLRDHUP, so this holds on Linux only. (SERVER-131398)
+ */
+TEST(AsioTransportLayer, IsConnectedFalseWithBufferedDataAfterClientWRShutdown) {
+    TestFixture tf;
+    Notification<test::SessionThread*> mockSessionCreated;
+    tf.sessionManager().setOnStartSession(
+        [&](test::SessionThread& st) { mockSessionCreated.set(&st); });
+
+    ConnectionThread connectThread(tf.tla().listenerMainPort());
+    connectThread.wait();
+
+    auto session = mockSessionCreated.get()->session();
+    ASSERT_TRUE(session->isConnected());
+
+    // Send a byte that the server never reads, then half-close the client side.
+    const char testByte = 'x';
+    ASSERT_EQ(::send(connectThread.socket().rawFD(), &testByte, sizeof(testByte), 0),
+              static_cast<ssize_t>(sizeof(testByte)));
+    ASSERT_TRUE(session->isConnected());
+
+    ::shutdown(connectThread.socket().rawFD(), SHUT_WR);
+
+    // The FIN is delivered asynchronously even over loopback, so allow some time for it to arrive.
+    const Date_t deadline = Date_t::now() + Seconds{10};
+    while (session->isConnected() && Date_t::now() < deadline) {
+        sleepFor(Milliseconds{10});
+    }
+    ASSERT_FALSE(session->isConnected());
+}
 #endif  // __linux__
 
 TEST(AsioTransportLayer, StopAcceptingSessionsBeforeStart) {
@@ -565,12 +598,14 @@ TEST(AsioTransportLayer, ThrowOnNetworkErrorInEnsureSync) {
     connectThread.close();
 
     // On Mac, setsockopt will immediately throw a SocketException since the socket is closed.
-    // On Linux, we will throw HostUnreachable once we try to actually read the socket.
-    // We allow for either exception here.
+    // On Linux, reading the closed socket yields EOF, which maps to ConnectionClosedByPeer.
+    // We allow for any of these here.
     using namespace unittest::match;
-    ASSERT_THAT(
-        st.session()->sourceMessage().getStatus(),
-        StatusIs(AnyOf(Eq(ErrorCodes::HostUnreachable), Eq(ErrorCodes::SocketException)), Any()));
+    ASSERT_THAT(st.session()->sourceMessage().getStatus(),
+                StatusIs(AnyOf(Eq(ErrorCodes::HostUnreachable),
+                               Eq(ErrorCodes::SocketException),
+                               Eq(ErrorCodes::ConnectionClosedByPeer)),
+                         Any()));
 }
 
 /* check that timeouts actually time out */
@@ -1371,10 +1406,12 @@ TEST_F(AsioTransportLayerTLSHandshakeTest, SuccessfulHandshakes) {
         const otel::metrics::HistogramData histogramData =
             capturer.readInt64Histogram(MetricNames::kIngressTLSHandshakeLatency);
         EXPECT_EQ(histogramData.count, 2);
-        // We can't really control the latency in the test, but 100ms per handshake seems like a
-        // good upper bound for a unit test. If this causes significant flakiness, increase this
-        // value.
-        EXPECT_LE(histogramData.sum, 200);
+        // The recorded values are verified exactly, with a mocked tick source, in
+        // ingress_handshake_metrics_test.cpp. This is only an order-of-magnitude sanity check
+        // that the production call site records a plausible per-handshake duration in
+        // milliseconds (rather than e.g. raw ticks or an absolute timestamp), so it is
+        // intentionally far above any latency reachable on a slow test host.
+        EXPECT_LE(histogramData.sum, 20'000);
     }
 }
 #endif  // MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
@@ -2140,9 +2177,9 @@ public:
     using OnStartSessionFn = std::function<void(std::shared_ptr<Session>)>;
 
     void startSession(std::shared_ptr<Session> session) override {
+        MockSessionManagerCommon::startSession(session);
         if (_onStartSession)
-            _onStartSession(session);
-        MockSessionManagerCommon::startSession(std::move(session));
+            _onStartSession(std::move(session));
     }
 
     void setOnStartSession(OnStartSessionFn cb) {

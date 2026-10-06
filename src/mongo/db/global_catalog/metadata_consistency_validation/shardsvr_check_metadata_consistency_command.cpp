@@ -14,6 +14,7 @@
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/basic_types_gen.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/global_catalog/ddl/sharded_ddl_commands_gen.h"
 #include "mongo/db/global_catalog/metadata_consistency_validation/metadata_consistency_types_gen.h"
@@ -37,12 +38,14 @@
 #include "mongo/db/shard_role/ddl/ddl_lock_manager.h"
 #include "mongo/db/shard_role/lock_manager/d_concurrency.h"
 #include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+#include "mongo/db/shard_role/shard_catalog/metadata_consistency_checks/non_existing_database_metadata_checks.h"
 #include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
 #include "mongo/db/shard_role/shard_catalog/shard_filtering_metadata_refresh.h"
 #include "mongo/db/sharding_environment/client/shard.h"
 #include "mongo/db/sharding_environment/grid.h"
 #include "mongo/db/sharding_environment/shard_id.h"
 #include "mongo/db/sharding_environment/sharding_feature_flags_gen.h"
+#include "mongo/db/sharding_environment/sharding_statistics.h"
 #include "mongo/db/topology/shard_registry.h"
 #include "mongo/db/topology/sharding_state.h"
 #include "mongo/db/versioning_protocol/database_version.h"
@@ -169,7 +172,7 @@ public:
                         repl::ReplicationCoordinator::get(opCtx)->getMemberState().primary());
             }
 
-            if (TestingProctor::instance().isEnabled()) {
+            if (TestingProctor::instance().isEnabled() && getTestCommandsEnabled()) {
                 _secondaryMode =
                     request().getCommonFields().get_checkSecondariesMode().value_or_eval([&] {
                         const auto mode = opCtx->getClient()->getPrng().trueWithProbability(0.5)
@@ -281,6 +284,9 @@ public:
                             });
                             DDLLockManager::ScopedDatabaseDDLLock dbDDLLock{
                                 opCtx, dbNss.dbName(), kDDLLockReason, MODE_S, backoffStrategy};
+                            auto& stats = ShardingStatistics::get(opCtx).checkMetadataStatistics;
+                            auto recorder = stats.registerDatabaseDDLLockForStatistics();
+
                             tassert(
                                 9504001,
                                 "Expected interrupt before tripwireShardCheckMetadataAfterDDLLock",
@@ -365,6 +371,18 @@ public:
             auto localInconsistencies = metadata_consistency_util::
                 checkShardCatalogCollectionsConsistentWithAuthoritativeness(opCtx);
 
+            // TODO SERVER-133990: We should also check on secondaries.
+            auto nonExistingDatabaseInconsistencies =
+                non_existing_database_metadata_consistency_checks::
+                    checkNonExistingDatabaseMetadataConsistency(
+                        opCtx,
+                        ShardingState::get(opCtx)->shardId(),
+                        metadata_consistency_util::RSNodeMode::kPrimary);
+            localInconsistencies.insert(
+                localInconsistencies.end(),
+                std::make_move_iterator(nonExistingDatabaseInconsistencies.begin()),
+                std::make_move_iterator(nonExistingDatabaseInconsistencies.end()));
+
             return _mergeCursors(opCtx, nss, std::move(cursors), std::move(localInconsistencies));
         }
 
@@ -374,6 +392,9 @@ public:
                     hangShardCheckMetadataBeforeDDLLock.pauseWhileSet();
                     DDLLockManager::ScopedDatabaseDDLLock dbDDLLock{
                         opCtx, nss.dbName(), kDDLLockReason, MODE_S};
+                    auto& stats = ShardingStatistics::get(opCtx).checkMetadataStatistics;
+                    auto recorder = stats.registerDatabaseDDLLockForStatistics();
+
                     tassert(9504002,
                             "Expected interrupt before tripwireShardCheckMetadataAfterDDLLock",
                             !tripwireShardCheckMetadataAfterDDLLock.shouldFail());
@@ -397,6 +418,9 @@ public:
                 hangShardCheckMetadataBeforeDDLLock.pauseWhileSet();
                 DDLLockManager::ScopedCollectionDDLLock dbDDLLock{
                     opCtx, nss, kDDLLockReason, MODE_S};
+                auto& stats = ShardingStatistics::get(opCtx).checkMetadataStatistics;
+                auto recorder = stats.registerCollectionDDLLockForStatistics();
+
                 tassert(9504003,
                         "Expected interrupt before tripwireShardCheckMetadataAfterDDLLock",
                         !tripwireShardCheckMetadataAfterDDLLock.shouldFail());

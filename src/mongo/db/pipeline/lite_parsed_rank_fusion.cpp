@@ -16,7 +16,6 @@
 #include "mongo/db/pipeline/search/search_helper.h"
 #include "mongo/db/pipeline/stage_params.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
-#include "mongo/db/query/util/rank_fusion_util.h"
 
 #include <string_view>
 
@@ -38,12 +37,6 @@ std::unique_ptr<LiteParsedRankFusion> LiteParsedRankFusion::parse(
     auto parsedSpec = RankFusionSpec::parse(spec.embeddedObject(),
                                             IDLParserContext(DocumentSourceRankFusion::kStageName));
 
-    if (parsedSpec.getScoreDetails()) {
-        uassert(ErrorCodes::QueryFeatureNotAllowed,
-                "'featureFlagRankFusionFull' must be enabled to use scoreDetails",
-                isRankFusionFullEnabled());
-    }
-
     auto inputPipesObj = parsedSpec.getInput().getPipelines();
 
     // Only parse input pipelines here. All semantic validation happens in validate().
@@ -60,7 +53,7 @@ std::unique_ptr<LiteParsedRankFusion> LiteParsedRankFusion::parse(
                                                   extensionsInHybridSearchEnabled);
 }
 
-void LiteParsedRankFusion::validate() const {
+void LiteParsedRankFusion::validate(const OperationContext* opCtx) const {
     static const std::string rankPipelineMsg =
         "All input pipelines to the $rankFusion stage must begin with one of $search, "
         "$vectorSearch, $geoNear, or have a $sort in the pipeline.";

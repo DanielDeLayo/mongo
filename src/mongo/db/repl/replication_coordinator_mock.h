@@ -328,7 +328,8 @@ public:
                              const OpTime& lastOpTimeFromClient,
                              BSONObjBuilder* builder) const override;
 
-    Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
+    Status processHeartbeatV1(OperationContext* opCtx,
+                              const ReplSetHeartbeatArgsV1& args,
                               ReplSetHeartbeatResponse* response) override;
 
     /**
@@ -357,7 +358,10 @@ public:
 
     WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(WriteConcernOptions wc) override;
 
-    Status stepUpIfEligible(OperationContext* opCtx, bool skipDryRun) override;
+    Status stepUpIfEligible(
+        OperationContext* opCtx,
+        bool skipDryRun,
+        boost::optional<Date_t> priorPrimaryStopAcceptingWritesTime = boost::none) override;
 
     /**
      * Sets the return value for calls to getConfig.
@@ -379,6 +383,13 @@ public:
                               const BSONObj& cmdObj,
                               OnRemoteCmdScheduledFn onRemoteCmdScheduled,
                               OnRemoteCmdCompleteFn onRemoteCmdComplete)>;
+
+    /**
+     * Injects a custom 'runCmdOnPrimaryAndAwaitResponse' functor. Unless one is set, commands
+     * are silently discarded and answered with a successful {"ok": 1} response.
+     */
+    void setRunCmdOnPrimaryAndAwaitResponseFunction(
+        RunCmdOnPrimaryAndAwaitResponseFunction runCmdFunction);
 
     /**
      * Always allow writes even if this node is a writable primary. Used by sharding unit tests.

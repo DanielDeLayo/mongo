@@ -11,6 +11,7 @@
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/repl/oplog_entry.h"
@@ -143,7 +144,12 @@ private:
         // reverse chronological order) but because this is a stack, the iterator will process them
         // in the opposite order, allowing iteration to proceed forwards and return operations in
         // chronological order.
-        void _collectAllOpTimesFromTransaction(OperationContext* opCtx, repl::OpTime firstOpTime);
+        //
+        // 'opsStillToCollect' bounds the walk for a retryable batch; an empty budget walks to the
+        // end of the chain, as a transaction does. See walkApplyOpsChain().
+        void _collectAllOpTimesFromTransaction(OperationContext* opCtx,
+                                               repl::OpTime firstOpTime,
+                                               boost::optional<std::size_t> opsStillToCollect);
 
         // Adds more transaction related information to the document containing unwinded
         // transaction.

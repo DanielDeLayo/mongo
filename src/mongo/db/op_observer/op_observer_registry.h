@@ -199,7 +199,7 @@ public:
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
                    const std::vector<RecordId>& recordIds,
-                   std::vector<bool> fromMigrate,
+                   const std::vector<bool>& fromMigrate,
                    bool defaultFromMigrate,
                    OpStateAccumulator* opAccumulator = nullptr) override {
         ReservedTimes times{opCtx};
@@ -293,6 +293,26 @@ public:
         }
     }
 
+    void onContainerInsert(OperationContext* opCtx,
+                           std::string_view ident,
+                           std::span<const std::span<const char>> keys,
+                           std::span<const char> value) override {
+        ReservedTimes times{opCtx};
+        for (auto&& observer : _observers) {
+            observer->onContainerInsert(opCtx, ident, keys, value);
+        }
+    }
+
+    void onContainerInsert(OperationContext* opCtx,
+                           std::string_view ident,
+                           int64_t key,
+                           std::span<const std::span<const char>> vals) override {
+        ReservedTimes times{opCtx};
+        for (auto&& observer : _observers) {
+            observer->onContainerInsert(opCtx, ident, key, vals);
+        }
+    }
+
     void onContainerUpdate(OperationContext* opCtx,
                            std::string_view ident,
                            int64_t key,
@@ -317,6 +337,15 @@ public:
         ReservedTimes times{opCtx};
         for (auto&& observer : _observers) {
             observer->onContainerDelete(opCtx, ident, key);
+        }
+    }
+
+    void onContainerDelete(OperationContext* opCtx,
+                           std::string_view ident,
+                           std::span<const std::span<const char>> keys) override {
+        ReservedTimes times{opCtx};
+        for (auto&& observer : _observers) {
+            observer->onContainerDelete(opCtx, ident, keys);
         }
     }
 
@@ -666,6 +695,18 @@ public:
     void onDropDatabaseMetadata(OperationContext* opCtx, const repl::OplogEntry& op) override {
         for (auto& o : _observers)
             o->onDropDatabaseMetadata(opCtx, op);
+    }
+
+    void onInvalidateAllCollectionMetadata(OperationContext* opCtx,
+                                           const repl::OplogEntry& op) override {
+        for (auto& o : _observers)
+            o->onInvalidateAllCollectionMetadata(opCtx, op);
+    }
+
+    void onInvalidateAllDatabaseMetadata(OperationContext* opCtx,
+                                         const repl::OplogEntry& op) override {
+        for (auto& o : _observers)
+            o->onInvalidateAllDatabaseMetadata(opCtx, op);
     }
 
     void onInvalidateCollectionMetadata(OperationContext* opCtx,

@@ -248,13 +248,25 @@ struct SerializationOptions {
     // re-resolve the view. getInRouter() alone isn't enough — it's false on a shard sub-router.
     bool isSerializingForRemoteDispatch = false;
 
+    // If true, the output will be re-parsed (e.g., view-resolution round-trip on the
+    // router). Stages that envelop user input into an internal IDL spec at parse time (e.g.
+    // $search, $searchMeta, $vectorSearch) must emit the original user form so re-parse is
+    // idempotent and does not trip internal-field validation.
+    // TODO SERVER-118740: Remove this flag once the DocumentSource-layer parse→serialize→reparse
+    // round-trip is no longer needed.
+    bool serializeForReparse = false;
+
     // Serialization state check helpers.
     bool isDefaultSerialization() const;
     bool isKeepingLiteralsUnchanged() const;
     bool isSerializingLiteralsAsDebugTypes() const;
     bool isReplacingLiteralsWithRepresentativeValues() const;
     bool isSerializingForExplain() const;
-    bool isSerializingForQueryStats() const;
+
+    // True when serializing to a query shape, i.e. literals are abstracted and/or identifiers are
+    // transformed. This is the case for shape consumers such as query stats and persistent query
+    // settings.
+    bool isShapifying() const;
 };
 
 }  // namespace query_shape

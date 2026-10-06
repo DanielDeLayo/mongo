@@ -2,11 +2,6 @@
 // SPDX-License-Identifier: SSPL-1.0
 
 
-#include <boost/move/utility_core.hpp>
-#include <boost/none.hpp>
-#include <boost/optional/optional.hpp>
-#include <fmt/format.h>
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
@@ -37,7 +32,6 @@
 #include "mongo/db/session/session_catalog_mongod.h"
 #include "mongo/db/sharding_environment/config_server_test_fixture.h"
 #include "mongo/db/sharding_environment/shard_id.h"
-#include "mongo/db/sharding_environment/shard_ref.h"
 #include "mongo/db/version_context.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
@@ -51,6 +45,12 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -66,7 +66,7 @@ protected:
     void setUp() override {
         ConfigServerTestFixture::setUp();
         ShardType shard;
-        shard.setHandle(ShardHandle{ShardId(_shardName), boost::none});
+        shard.setName(_shardName);
         shard.setHost(_shardName + ":12");
         setupShards({shard});
 
@@ -952,7 +952,7 @@ protected:
             chunk.setCollectionUUID(_collUuid);
             chunk.setVersion(collPlacementVersion);
             collPlacementVersion.incMinor();
-            chunk.setShard(ShardRef{shard.getName()});
+            chunk.setShard(shard.getName());
             chunk.setRange({min, max});
 
             // When `onCurrentShardSince` is set to "Timestamp(0, 1)", the chunk is mergeable
@@ -960,7 +960,7 @@ protected:
             // mergeable because the snapshot window did not pass
             auto randomValidAfter = _random.nextInt64() % 2 ? Timestamp(0, 1) : Timestamp::max();
             chunk.setOnCurrentShardSince(randomValidAfter);
-            chunk.setHistory({ChunkHistory{randomValidAfter, ShardRef{shard.getName()}}});
+            chunk.setHistory({ChunkHistory{randomValidAfter, shard.getName()}});
 
             // Rarely create a jumbo chunk (not mergeable)
             chunk.setJumbo(_random.nextInt64() % 10 == 0);
@@ -1111,7 +1111,7 @@ protected:
                 !(*(prevChunk.getOnCurrentShardSince()) == Timestamp::max()) &&
                 !currChunk.getJumbo() &&
                 !(*(currChunk.getOnCurrentShardSince()) == Timestamp::max())) {
-                if (prevChunk.getShard() != currChunk.getShard()) {
+                if (prevChunk.getShard().compare(currChunk.getShard()) != 0) {
                     // Chunks belong to different shards
                     continue;
                 }
@@ -1350,27 +1350,26 @@ TEST_F(MergeAllChunksOnShardTest, AllMergeableChunksGetSquashed) {
 
 TEST_F(MergeAllChunksOnShardTest, RetryCommittedMergeAllChunksOnShardSucceedsDuringFCVTransition) {
     const ShardId shardId{_shards.at(0).getName()};
-    const ShardRef shardRef{shardId};
     auto version = ChunkVersion{{_epoch, _ts}, {1, 0}};
 
     ChunkType chunk;
     chunk.setName(OID::gen());
     chunk.setCollectionUUID(_collUuid);
     chunk.setVersion(version);
-    chunk.setShard(shardRef);
+    chunk.setShard(shardId);
     chunk.setRange({_keyPattern.globalMin(), BSON("x" << 0)});
     chunk.setOnCurrentShardSince(Timestamp(0, 1));
-    chunk.setHistory({ChunkHistory{*chunk.getOnCurrentShardSince(), shardRef}});
+    chunk.setHistory({ChunkHistory{*chunk.getOnCurrentShardSince(), shardId}});
 
     version.incMinor();
     ChunkType chunk2;
     chunk2.setName(OID::gen());
     chunk2.setCollectionUUID(_collUuid);
     chunk2.setVersion(version);
-    chunk2.setShard(shardRef);
+    chunk2.setShard(shardId);
     chunk2.setRange({BSON("x" << 0), _keyPattern.globalMax()});
     chunk2.setOnCurrentShardSince(Timestamp(0, 1));
-    chunk2.setHistory({ChunkHistory{*chunk2.getOnCurrentShardSince(), shardRef}});
+    chunk2.setHistory({ChunkHistory{*chunk2.getOnCurrentShardSince(), shardId}});
 
     setupCollection(_nss, _keyPattern, {chunk, chunk2});
 
@@ -1578,27 +1577,26 @@ protected:
     // Sets up '_nss' with two contiguous mergeable chunks on shard0 spanning [MinKey, 0) and
     // [0, MaxKey).
     void setupTwoContiguousChunksOnShard0() {
-        const ShardRef shardRef{shard0()};
         auto version = ChunkVersion{{_epoch, _ts}, {1, 0}};
 
         ChunkType chunk;
         chunk.setName(OID::gen());
         chunk.setCollectionUUID(_collUuid);
         chunk.setVersion(version);
-        chunk.setShard(shardRef);
+        chunk.setShard(shard0());
         chunk.setRange({_keyPattern.globalMin(), BSON("x" << 0)});
         chunk.setOnCurrentShardSince(Timestamp(0, 1));
-        chunk.setHistory({ChunkHistory{Timestamp(0, 1), shardRef}});
+        chunk.setHistory({ChunkHistory{Timestamp(0, 1), shard0()}});
 
         version.incMinor();
         ChunkType chunk2;
         chunk2.setName(OID::gen());
         chunk2.setCollectionUUID(_collUuid);
         chunk2.setVersion(version);
-        chunk2.setShard(shardRef);
+        chunk2.setShard(shard0());
         chunk2.setRange({BSON("x" << 0), _keyPattern.globalMax()});
         chunk2.setOnCurrentShardSince(Timestamp(0, 1));
-        chunk2.setHistory({ChunkHistory{Timestamp(0, 1), shardRef}});
+        chunk2.setHistory({ChunkHistory{Timestamp(0, 1), shard0()}});
 
         setupCollection(_nss, _keyPattern, {chunk, chunk2});
     }
@@ -1606,15 +1604,14 @@ protected:
     // Builds the precomputed post-merge layout to commit: a single chunk on shard0 spanning the
     // whole key space. The embedded version is ignored (recomputed under the chunk-op lock).
     std::vector<ChunkType> makeMergedChunkList() {
-        const ShardRef shardRef{shard0()};
         ChunkType merged;
         merged.setName(OID::gen());
         merged.setCollectionUUID(_collUuid);
         merged.setVersion(ChunkVersion{{_epoch, _ts}, {1, 0}});
-        merged.setShard(shardRef);
+        merged.setShard(shard0());
         merged.setRange({_keyPattern.globalMin(), _keyPattern.globalMax()});
         merged.setOnCurrentShardSince(Timestamp(0, 1));
-        merged.setHistory({ChunkHistory{Timestamp(0, 1), shardRef}});
+        merged.setHistory({ChunkHistory{Timestamp(0, 1), shard0()}});
         return {merged};
     }
 

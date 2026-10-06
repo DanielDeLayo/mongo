@@ -5,7 +5,8 @@ description: >-
   featureFlagExtensionsInsideHybridSearch.
 excludes:
   - "with_mongot_extension.exclude_incompatible_tests"
-  - "with_mongot_extension.exclude_search_extension_incompatible"
 overrides:
   - "with_mongot_extension.load_extension"
   - "with_mongot_extension.extension_flags_hybridSearch_disabled"
+extends:
+  - "with_mongot_extension.search_extension_only_roots"

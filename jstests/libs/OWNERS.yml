@@ -60,6 +60,9 @@ filters:
   - "feature_compatibility_version.js":
     approvers:
       - 10gen/server-catalog-and-routing-routing-and-topology
+  - "set_fcv_helpers.js":
+    approvers:
+      - 10gen/query-integration-features
   - "*.pem":
     approvers:
       - 10gen/server-security
@@ -111,9 +114,9 @@ filters:
   - "oplog_truncation_util.js":
     approvers:
       - 10gen/server-oplog
-  - "os_helpers.js":
-    approvers:
-      - 10gen/server-security
   - "js_engine_util.js":
     approvers:
       - 10gen/query-integration-features
+  - "assertions_core.js":
+    approvers:
+      - 10gen/devprod-test-infrastructure

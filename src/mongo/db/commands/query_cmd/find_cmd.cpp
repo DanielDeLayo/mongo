@@ -33,6 +33,7 @@
 #include "mongo/db/fle_crud.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregation_request_helper.h"
@@ -325,6 +326,8 @@ public:
                 CommandHelpers::ensureValidCollectionName(request().getNamespaceOrUUID().nss());
             }
             assertInternalParamsAreSetByInternalClients(opCtx->getClient(), request());
+            Variables::validateRuntimeConstantsArePermitted(opCtx,
+                                                            request().getLegacyRuntimeConstants());
             uassert(ErrorCodes::FailedToParse,
                     "Use of forcedPlanSolutionHash not permitted.",
                     !request().getForcedPlanSolutionHash() ||
@@ -387,7 +390,7 @@ public:
                         nsOrUUID.nss().isValid());
                 uassertStatusOK(auth::checkAuthForFind(authSession, nsOrUUID.nss(), hasTerm));
             } else {
-                const auto resolvedNss = shard_role_nocheck::resolveNssWithoutAcquisition(
+                const auto resolvedNss = shard_role_nocheck::resolveNssWithoutAcquisitionAtLatest(
                     opCtx, nsOrUUID.dbName(), nsOrUUID.uuid());
                 uassertStatusOK(auth::checkAuthForFind(authSession, resolvedNss, hasTerm));
             }
@@ -655,7 +658,9 @@ public:
                     CurOpFailpointHelpers::waitWhileFailPointEnabled(
                         &hangBeforeFetcherFindCommandOnOplog,
                         opCtx,
-                        "hangBeforeFetcherFindCommandOnOplog");
+                        "hangBeforeFetcherFindCommandOnOplog",
+                        nullptr,
+                        _ns);
                 }
                 // We do not want to wait to take tickets for internal (replication) oplog reads.
                 // Stalling on ticket acquisition can cause complicated deadlocks. Primaries may
@@ -1043,19 +1048,24 @@ public:
                                                     false));
             // This will do view definition resolution for views and timeseries things for
             // timeseries queries.
-            const auto status = runAggregate(opCtx,
-                                             aggRequest,
-                                             {aggRequest},
-                                             unparsedRequest().body,
-                                             privileges,
-                                             verbosity,
-                                             replyBuilder);
-            if (status.code() == ErrorCodes::InvalidPipelineOperator) {
-                uasserted(ErrorCodes::InvalidPipelineOperator,
-                          str::stream{} << "Unsupported operator in converted pipeline: "
-                                        << status.reason());
-            }
-            uassertStatusOK(status);
+            //
+            // This aggregation was derived locally from the find, so any IFR flag kickback it
+            // raises has to be absorbed here rather than propagated to the router.
+            retryOnLocalIFRFlagKickback(opCtx, aggRequest, "find as aggregation", [&] {
+                const auto status = runAggregate(opCtx,
+                                                 aggRequest,
+                                                 {aggRequest},
+                                                 unparsedRequest().body,
+                                                 privileges,
+                                                 verbosity,
+                                                 replyBuilder);
+                if (status.code() == ErrorCodes::InvalidPipelineOperator) {
+                    uasserted(ErrorCodes::InvalidPipelineOperator,
+                              str::stream{} << "Unsupported operator in converted pipeline: "
+                                            << status.reason());
+                }
+                uassertStatusOK(status);
+            });
         }
 
         void appendMirrorableRequest(BSONObjBuilder* bob) const override {

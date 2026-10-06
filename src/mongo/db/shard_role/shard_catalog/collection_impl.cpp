@@ -3,23 +3,6 @@
 
 #include "mongo/db/shard_role/shard_catalog/collection_impl.h"
 
-#include <mutex>
-#include <string_view>
-
-#include <absl/container/flat_hash_map.h>
-#include <boost/container/flat_set.hpp>
-#include <boost/container/small_vector.hpp>
-#include <boost/container/vector.hpp>
-#include <boost/move/utility_core.hpp>
-#include <boost/none.hpp>
-#include <boost/optional.hpp>
-#include <boost/optional/optional.hpp>
-#include <boost/smart_ptr.hpp>
-#include <boost/smart_ptr/intrusive_ptr.hpp>
-#include <fmt/format.h>
-// IWYU pragma: no_include "ext/alloc_traits.h"
-// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
-
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
@@ -91,15 +74,34 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/string_map.h"
 
+#include <mutex>
+#include <string_view>
+
+#include <absl/container/flat_hash_map.h>
+#include <boost/container/flat_set.hpp>
+#include <boost/container/small_vector.hpp>
+#include <boost/container/vector.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <fmt/format.h>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 namespace mongo {
 using namespace std::literals::string_view_literals;
+
+// This fail point allows collections to be given malformed validators. With parseValidator: true,
+// the collection stores the parse error and rejects writes instead of bypassing the parser.
+MONGO_FAIL_POINT_DEFINE(allowSettingMalformedCollectionValidators);
+
 namespace {
 
-// This fail point allows collections to be given malformed validator. A malformed validator
-// will not (and cannot) be enforced but it will be persisted.
-MONGO_FAIL_POINT_DEFINE(allowSettingMalformedCollectionValidators);
 MONGO_FAIL_POINT_DEFINE(skipCappedDeletes);
 // Simulate the behavior of mixed-schema flag of MongoDB versions without SERVER-91195:
 // Only set the legacy time-series mixed-schema flag at the top level of the catalog,
@@ -602,19 +604,21 @@ std::pair<Collection::DocumentValidationResult, Status> CollectionImpl::checkVal
     }
 
     // Strict validation for bucket documents in timeseries collections
-    try {
-        timeseries::validateBucketConsistency(this, document);
-        return {DVR{SVR::kPass, NCR::kNone}, Status::OK()};
-    } catch (DBException& ex) {
+    {
+        using BCV = DVR::BucketConsistencyViolation;
+        const BCV violation = timeseries::validateBucketConsistency(this, document);
+        if (violation == BCV::kNone) {
+            return {DVR{SVR::kPass, NCR::kNone}, Status::OK()};
+        }
         // For strict timeseries validation we ensure that we only return kError or kErrorAndLog.
         const SVR svr = validationActionOrDefault(_metadata->options.validationAction) ==
                 ValidationActionEnum::errorAndLog
             ? SVR::kErrorAndLog
             : SVR::kError;
-        return {DVR{svr, NCR::kTimeseriesSchemaViolation},
+        return {DVR{svr, NCR::kTimeseriesSchemaViolation, violation},
                 Status(doc_validation_error::DocumentValidationFailureInfo(document),
-                       ex.toStatus().toString())};
-    };
+                       "Time-series bucket document failed consistency check")};
+    }
 }
 
 Status CollectionImpl::checkValidationAndParseResult(OperationContext* opCtx,
@@ -653,7 +657,8 @@ Collection::Validator CollectionImpl::parseValidator(
     OperationContext* opCtx,
     const BSONObj& validator,
     MatchExpressionParser::AllowedFeatureSet allowedFeatures) const {
-    if (MONGO_unlikely(allowSettingMalformedCollectionValidators.shouldFail())) {
+    if (MONGO_unlikely(allowSettingMalformedCollectionValidators.shouldFail(
+            [](const BSONObj& data) { return !data.getBoolField("parseValidator"); }))) {
         return {validator, nullptr, nullptr};
     }
 
@@ -946,7 +951,7 @@ Status CollectionImpl::updateCappedSize(OperationContext* opCtx,
             return status;
         }
         if (auto truncateMarkers = LocalOplogInfo::get(opCtx)->getTruncateMarkers()) {
-            truncateMarkers->adjust(*newCappedSize);
+            truncateMarkers->adjust(*_shared->_recordStore);
         }
     }
 
@@ -1031,14 +1036,14 @@ long long CollectionImpl::getCappedMaxSize() const {
 long long CollectionImpl::numRecords(OperationContext* opCtx) const {
     return (shouldReadFromReplicatedFastCount(opCtx, _ns))
         ? _shared->_recordStore->accurateNumRecords() +
-            UncommittedFastCountChange::getForRead(opCtx).find(uuid()).count
+            UncommittedFastCountChanges::getForRead(opCtx).find(uuid()).count
         : _shared->_recordStore->numRecords();
 }
 
 long long CollectionImpl::dataSize(OperationContext* opCtx) const {
     return (shouldReadFromReplicatedFastCount(opCtx, _ns))
         ? _shared->_recordStore->accurateDataSize() +
-            UncommittedFastCountChange::getForRead(opCtx).find(uuid()).size
+            UncommittedFastCountChanges::getForRead(opCtx).find(uuid()).size
         : _shared->_recordStore->dataSize();
 }
 
@@ -1059,7 +1064,7 @@ CollectionSizeCount CollectionImpl::persistedSizeCount(OperationContext* opCtx) 
             fmt::format("Expected the size/count store to contain an entry for UUID={}",
                         uuid().toString()),
             persisted.has_value());
-    return persisted->first;
+    return persisted->first.sizeCount;
 }
 
 int64_t CollectionImpl::sizeOnDisk(OperationContext* opCtx,
@@ -1171,7 +1176,18 @@ Status CollectionImpl::setValidationOptions(
         mustReparse) {
         _validator = parseValidator(opCtx, _validator.validatorDoc, allowedFeatures);
         if (!_validator.isOK()) {
-            return _validator.getStatus();
+            // Do not enforce an OK result during oplog application: as at startup, the
+            // validator may have been well formed on the version that wrote it. Keeping it
+            // rejects writes to the collection (fail closed) rather than allowing them
+            // unvalidated (SERVER-134863).
+            if (opCtx->writesAreReplicated()) {
+                return _validator.getStatus();
+            }
+            LOGV2_WARNING(13486300,
+                          "Re-parsing of a malformed collection validator failed during oplog "
+                          "application, keeping it",
+                          logAttrs(ns()),
+                          "validatorStatus"_attr = _validator.getStatus());
         }
     }
 

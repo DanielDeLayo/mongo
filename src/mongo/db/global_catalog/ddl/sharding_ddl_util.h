@@ -19,7 +19,6 @@
 #include "mongo/db/shard_role/shard_catalog/participant_block_gen.h"
 #include "mongo/db/sharding_environment/client/shard.h"
 #include "mongo/db/sharding_environment/shard_id.h"
-#include "mongo/db/sharding_environment/shard_ref.h"
 #include "mongo/db/transaction/transaction_api.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/executor/scoped_task_executor.h"
@@ -29,6 +28,7 @@
 #include "mongo/util/modules.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/uuid.h"
+#include "mongo/util/version/releases.h"
 
 #include <memory>
 #include <vector>
@@ -458,8 +458,6 @@ generateMetadataForUnsplittableCollectionCreation(OperationContext* opCtx,
  * (the database primary always tracks the collection). When omitted it defaults to the shard
  * running this code, which is correct only when that shard is the database primary. Callers that
  * run elsewhere - such as the migration donor - must pass the real database primary shard.
- *
- * TODO (SERVER-129204): Review shard catalog commit modularity.
  */
 [[MONGO_MOD_NEEDS_REPLACEMENT]] void commitCreateCollectionMetadataToShardCatalog(
     OperationContext* opCtx,
@@ -534,6 +532,25 @@ generateMetadataForUnsplittableCollectionCreation(OperationContext* opCtx,
 getGrantedAuthoritativeMetadataAccessLevel(const VersionContext& vCtx,
                                            const ServerGlobalParams::FCVSnapshot& snapshot);
 
+/**
+ * Reads the featureCompatibilityVersion document from the given shard's admin.system.version
+ * collection and returns the parsed FCV.
+ *
+ * TODO (SERVER-98118): remove once 9.0 becomes last LTS.
+ */
+[[MONGO_MOD_PRIVATE]] multiversion::FeatureCompatibilityVersion getShardFCV(OperationContext* opCtx,
+                                                                            const ShardId& shardId);
+
+/**
+ * Rejects movePrimary when the donor or receiver is in an FCV transition (upgrade/downgrade). This
+ * simplifies the set of considerations to have when running movePrimary since it could lead to
+ * correctness issues. For more details see SERVER-132179.
+ */
+[[MONGO_MOD_PRIVATE]] void assertShardsAreNotInFCVTransitionsForMovePrimary(
+    OperationContext* opCtx,
+    const ShardId& recipientShardId,
+    AuthoritativeMetadataAccessLevelEnum donorAccessLevel);
+
 /*
  * Provided a collection UUID, returns the ID of one of the shards that are currently owning its
  * chunks (or boost:node when the collection is untracked or non-existing).
@@ -548,7 +565,7 @@ getGrantedAuthoritativeMetadataAccessLevel(const VersionContext& vCtx,
  * Returns the list of shards that currently own chunks for the given collection UUID.
  * Queries config.chunks to determine the current placement.
  */
-[[MONGO_MOD_PRIVATE]] std::vector<ShardRef> getListOfShardsOwningChunksForCollection(
+[[MONGO_MOD_PRIVATE]] std::vector<ShardId> getListOfShardsOwningChunksForCollection(
     OperationContext* opCtx, const UUID& collUuid);
 
 /**
@@ -560,7 +577,7 @@ getGrantedAuthoritativeMetadataAccessLevel(const VersionContext& vCtx,
     const NamespaceString& nss,
     const boost::optional<UUID>& uuid,
     const Timestamp& timestamp,
-    const std::vector<ShardRef>& shards,
+    const std::vector<ShardId>& shards,
     int stmtId);
 
 /**

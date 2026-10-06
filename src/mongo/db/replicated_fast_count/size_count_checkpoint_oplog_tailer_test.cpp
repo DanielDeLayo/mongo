@@ -10,7 +10,10 @@
 #include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
 #include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
 #include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/record_store_write_conflict_fail_points.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/otel/metrics/metric_names.h"
+#include "mongo/otel/metrics/metrics_test_util.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
@@ -67,16 +70,18 @@ TEST_F(OplogTailerTest, ScanFromBeginningAccountsAllVisibleEntries) {
     const boost::optional<OplogScanResult> checkedOutBuffer = buffer.checkoutForFlush();
     const OplogScanResult expectedCheckedOutBuffer{
         .deltas =
-            SizeCountDeltas{
+            ReplicatedMetadataDeltas{
                 {_collA.uuid,
-                 SizeCountDelta{.sizeCount = CollectionSizeCount{.size = 30, .count = 2}}},
+                 ReplicatedMetadataDelta{
+                     .metadata = {.sizeCount = CollectionSizeCount{.size = 30, .count = 2}}}},
                 {oplogUuid(),
-                 SizeCountDelta{.sizeCount = scanForAccurateSizeCount(
-                                    _opCtx, NamespaceString::kRsOplogNamespace)}}},
+                 ReplicatedMetadataDelta{
+                     .metadata = {.sizeCount = scanForAccurateSizeCount(
+                                      _opCtx, NamespaceString::kRsOplogNamespace)}}}},
         .lastTimestamp = Timestamp(1, 2)};
     EXPECT_EQ(checkedOutBuffer, expectedCheckedOutBuffer);
 
-    buffer.acknowledgeFlushSuccess();
+    buffer.acknowledgeFlush();
     EXPECT_FALSE(buffer.checkoutForFlush().has_value());
 }
 
@@ -123,18 +128,21 @@ TEST_F(OplogTailerTest, MultipleIterationsAccumulateInBuffer) {
     EXPECT_EQ(checkedOutBuffer->lastTimestamp, Timestamp(1, 3));
     const OplogScanResult expectedCheckedOutBuffer{
         .deltas =
-            SizeCountDeltas{
+            ReplicatedMetadataDeltas{
                 {_collA.uuid,
-                 SizeCountDelta{.sizeCount = CollectionSizeCount{.size = 30, .count = 2}}},
+                 ReplicatedMetadataDelta{
+                     .metadata = {.sizeCount = CollectionSizeCount{.size = 30, .count = 2}}}},
                 {_collB.uuid,
-                 SizeCountDelta{.sizeCount = CollectionSizeCount{.size = 7, .count = 1}}},
+                 ReplicatedMetadataDelta{
+                     .metadata = {.sizeCount = CollectionSizeCount{.size = 7, .count = 1}}}},
                 {oplogUuid(),
-                 SizeCountDelta{.sizeCount = scanForAccurateSizeCount(
-                                    _opCtx, NamespaceString::kRsOplogNamespace)}}},
+                 ReplicatedMetadataDelta{
+                     .metadata = {.sizeCount = scanForAccurateSizeCount(
+                                      _opCtx, NamespaceString::kRsOplogNamespace)}}}},
         .lastTimestamp = Timestamp(1, 3)};
     EXPECT_EQ(checkedOutBuffer, expectedCheckedOutBuffer);
 
-    buffer.acknowledgeFlushSuccess();
+    buffer.acknowledgeFlush();
     EXPECT_FALSE(buffer.checkoutForFlush().has_value());
 
     bufferNewOplogEntries(_opCtx, buffer);
@@ -172,6 +180,8 @@ TEST_F(OplogTailerTest, RunInterruptedWhileWaitingExitsPromptly) {
 }
 
 TEST_F(OplogTailerTest, RetriesScanOnWriteConflict) {
+    otel::metrics::OtelMetricsCapturer capturer;
+
     writeToOplog(
         _opCtx,
         makeOplogEntry(Timestamp(1, 1), _collA, repl::OpTypeEnum::kInsert, /*sizeDelta=*/10));
@@ -183,25 +193,33 @@ TEST_F(OplogTailerTest, RetriesScanOnWriteConflict) {
 
     {
         // Make bufferNewOplogEntries() fail twice before successfully scanning the oplog.
-        FailPointEnableBlock fp("WTWriteConflictExceptionForReads",
-                                FailPoint::ModeOptions{.mode = FailPoint::nTimes, .val = 2});
+        auto fp = enableWriteConflictForReads(
+            FailPoint::ModeOptions{.mode = FailPoint::nTimes, .val = 2});
         bufferNewOplogEntries(_opCtx, buffer);
     }
 
     const boost::optional<OplogScanResult> checkedOutBuffer = buffer.checkoutForFlush();
     const OplogScanResult expectedCheckedOutBuffer{
         .deltas =
-            SizeCountDeltas{
+            ReplicatedMetadataDeltas{
                 {_collA.uuid,
-                 SizeCountDelta{.sizeCount = CollectionSizeCount{.size = 30, .count = 2}}},
+                 ReplicatedMetadataDelta{
+                     .metadata = {.sizeCount = CollectionSizeCount{.size = 30, .count = 2}}}},
                 {oplogUuid(),
-                 SizeCountDelta{.sizeCount = scanForAccurateSizeCount(
-                                    _opCtx, NamespaceString::kRsOplogNamespace)}}},
+                 ReplicatedMetadataDelta{
+                     .metadata = {.sizeCount = scanForAccurateSizeCount(
+                                      _opCtx, NamespaceString::kRsOplogNamespace)}}}},
         .lastTimestamp = Timestamp(1, 2)};
     EXPECT_EQ(checkedOutBuffer, expectedCheckedOutBuffer);
 
-    buffer.acknowledgeFlushSuccess();
+    buffer.acknowledgeFlush();
     EXPECT_FALSE(buffer.checkoutForFlush().has_value());
+
+    if (capturer.canReadMetrics()) {
+        EXPECT_EQ(capturer.readInt64Counter(
+                      otel::metrics::MetricNames::kReplicatedFastCountTailerRetriedScanCount),
+                  2);
+    }
 }
 
 using OplogTailerDeathTest = OplogTailerTest;

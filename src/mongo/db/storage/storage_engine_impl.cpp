@@ -26,6 +26,7 @@
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/mdb_catalog.h"
 #include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
 #include "mongo/db/storage/spill_table.h"
 #include "mongo/db/storage/storage_options.h"
@@ -177,7 +178,13 @@ void StorageEngineImpl::loadMDBCatalog(OperationContext* opCtx,
     // This maintains current and earlier behavior of a MongoD.
     const auto catalogRecordStoreOpts = RecordStore::Options{};
     if (!catalogExists) {
-        WriteUnitOfWork uow(opCtx);
+        StorageWriteTransaction uow(ru);
+        // Normally schema epochs are set based on the timestamp, but we have to create the catalog
+        // before we can begin timestamping operations, so explicitly set the stable epoch to the
+        // initial value and the schema epoch for this write to a sentinel value. Has no effect if
+        // schema epochs are not in use.
+        _engine->setStableSchemaEpoch(KVEngine::kInitialSchemaEpoch);
+        ru.setSchemaEpoch(KVEngine::kUntimestampedSchemaEpoch);
 
         auto& provider = rss::ReplicatedStorageService::get(opCtx).getPersistenceProvider();
         LOGV2(11503104, "Creating MDB catalog as it did not already exist");
@@ -211,8 +218,7 @@ void StorageEngineImpl::loadMDBCatalog(OperationContext* opCtx,
     _catalog->init(opCtx);
 
     LOGV2(9529902, "Retrieving all idents from storage engine");
-    std::vector<std::string> identsKnownToStorageEngine =
-        _engine->getAllIdents(*shard_role_details::getRecoveryUnit(opCtx));
+    std::vector<std::string> identsKnownToStorageEngine = _engine->getAllIdents(ru);
     std::sort(identsKnownToStorageEngine.begin(), identsKnownToStorageEngine.end());
 
     std::vector<MDBCatalog::EntryIdentifier> catalogEntries = _catalog->getAllCatalogEntries(opCtx);
@@ -256,8 +262,7 @@ void StorageEngineImpl::loadMDBCatalog(OperationContext* opCtx,
                     // collection, we create an new entry for it.
                     WriteUnitOfWork wuow(opCtx);
 
-                    auto keyFormat =
-                        _engine->getKeyFormat(*shard_role_details::getRecoveryUnit(opCtx), ident);
+                    auto keyFormat = _engine->getKeyFormat(ru, ident);
                     // TODO SERVER-105436 investigate usage of isClustered
                     bool isClustered = keyFormat == KeyFormat::String;
                     StatusWith<std::string> statusWithNs =
@@ -392,7 +397,7 @@ void StorageEngineImpl::loadMDBCatalog(OperationContext* opCtx,
         }
     }
 
-    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
+    ru.abandonSnapshot();
 }
 
 void StorageEngineImpl::closeMDBCatalog(OperationContext* opCtx) {
@@ -691,10 +696,7 @@ void StorageEngineImpl::dropSpillTable(RecoveryUnit& ru, std::string_view ident)
     // Dropping the spill table may transiently return ObjectIsBusy if another spill engine user has
     // a storage snapshot from before an earlier write to this table. Retry until the drop succeeds.
     for (size_t retries = 0;; ++retries) {
-        auto status = _spillEngine->dropIdent(ru,
-                                              ident,
-                                              false, /* identHasSizeInfo */
-                                              nullptr /* onDrop */);
+        auto status = _spillEngine->dropIdent(ru, ident, false /* identHasSizeInfo */);
         if (status.isOK()) {
             return;
         }
@@ -778,16 +780,16 @@ void StorageEngineImpl::setLastMaterializedLsn(uint64_t lsn) {
     _engine->setLastMaterializedLsn(lsn);
 }
 
-void StorageEngineImpl::setRecoveryCheckpointMetadata(std::string_view checkpointMetadata) {
-    _engine->setRecoveryCheckpointMetadata(checkpointMetadata);
+Status StorageEngineImpl::setRecoveryCheckpointMetadata(std::string_view checkpointMetadata) {
+    return _engine->setRecoveryCheckpointMetadata(checkpointMetadata);
 }
 
 void StorageEngineImpl::promoteToLeader() {
     _engine->promoteToLeader();
 }
 
-void StorageEngineImpl::demoteFromLeader() {
-    // The engine itself doesn't need to do anything here yet.
+void StorageEngineImpl::demoteToFollower() {
+    _engine->demoteToFollower();
 }
 
 void StorageEngineImpl::setStableTimestamp(Timestamp stableTimestamp, bool force) {
@@ -798,8 +800,8 @@ Timestamp StorageEngineImpl::getStableTimestamp() const {
     return _engine->getStableTimestamp();
 }
 
-void StorageEngineImpl::setStepDownTimestamp(Timestamp stepDownTimestamp) {
-    _engine->setStepDownTimestamp(stepDownTimestamp);
+void StorageEngineImpl::setStepDownTimestamp(WithLock lock, Timestamp stepDownTimestamp) {
+    _engine->setStepDownTimestamp(lock, stepDownTimestamp);
 }
 
 Timestamp StorageEngineImpl::getStepDownTimestamp() const {
@@ -917,14 +919,13 @@ void StorageEngineImpl::dropIdent(RecoveryUnit& ru, std::string_view ident) {
         // A concurrent operation, such as a checkpoint could be holding an open data
         // handle on the ident. Handoff the ident drop to the ident reaper to retry
         // later.
-        addDropPendingIdent(Immediate{}, std::make_shared<Ident>(ident), nullptr);
+        addDropPendingIdent(Immediate{}, std::make_shared<Ident>(ident));
     }
 }
 
 void StorageEngineImpl::addDropPendingIdent(const DropTime& dropTime,
-                                            std::shared_ptr<Ident> ident,
-                                            DropIdentCallback&& onDrop) {
-    _dropPendingIdentReaper.addDropPendingIdent(dropTime, ident, std::move(onDrop));
+                                            std::shared_ptr<Ident> ident) {
+    _dropPendingIdentReaper.addDropPendingIdent(dropTime, ident);
 }
 
 void StorageEngineImpl::dropUnknownIdent(RecoveryUnit& ru,
@@ -1195,15 +1196,13 @@ const Milliseconds kAutoCompactReconfigureRetryInterval{50};
 constexpr int kMaxAutoCompactReconfigureAttempts = 600;  // ~30s of retrying before giving up.
 
 /**
- * Runs an auto-compaction reconfigure for a write block transition under the global lock, retrying
+ * Pauses auto-compaction for a write block transition under the global lock, retrying
  * the transient ObjectIsBusy (a previous reconfigure not yet applied by the background server) up
  * to kMaxAutoCompactReconfigureAttempts so the change isn't dropped. A non-OK status is logged, not
  * thrown, to avoid failing the replica set write block.
  */
-void retryPauseOrResumeAutoCompactForWriteBlock(
-    OperationContext* opCtx,
-    std::string_view operation,
-    const std::function<Status(RecoveryUnit&)>& reconfigure) {
+void retryPauseAutoCompactForReplicaSetWritesBlock(
+    OperationContext* opCtx, const std::function<Status(RecoveryUnit&)>& reconfigure) {
     Status status = Status::OK();
     for (int attempt = 0; attempt < kMaxAutoCompactReconfigureAttempts; ++attempt) {
         status = [&] {
@@ -1225,42 +1224,22 @@ void retryPauseOrResumeAutoCompactForWriteBlock(
     }
 
     // IllegalOperation means auto-compaction is simply not applicable, so there is nothing to
-    // stop or restore. Warn only on unexpected errors.
+    // stop. Warn only on unexpected errors.
     if (!status.isOK() && status != ErrorCodes::IllegalOperation) {
         LOGV2_WARNING(12966500,
-                      "Failed to reconfigure auto-compaction for replica set write block",
-                      "operation"_attr = operation,
+                      "Failed to pause auto-compaction for replica set write block",
                       "error"_attr = status);
     }
 }
 }  // namespace
 
-void StorageEngineImpl::pauseOrResumeAutoCompactForWriteBlock(OperationContext* opCtx,
-                                                              bool pause,
-                                                              std::string_view oplogIdent) {
+void StorageEngineImpl::pauseAutoCompactForReplicaSetWritesBlock(OperationContext* opCtx) {
     if (!rss::ReplicatedStorageService::get(opCtx).getPersistenceProvider().supportsCompaction()) {
         return;
     }
 
-    if (pause) {
-        // The engine saves the currently-active configuration before stopping compaction so it can
-        // be restored on resume; stopping when nothing is running is a no-op.
-        retryPauseOrResumeAutoCompactForWriteBlock(opCtx, "pause", [&](RecoveryUnit& ru) {
-            return _engine->pauseOrResumeAutoCompactForWriteBlock(
-                ru, pause, {} /* excludedIdents */);
-        });
-        return;
-    }
-
-    // On resume the engine restores the saved configuration, excluding the current oplog ident
-    // supplied by the caller (the saved options intentionally omit the non-owning excludedIdents,
-    // so the exclusion is recomputed by the caller on each resume rather than restored).
-    std::vector<std::string_view> excludedIdents;
-    if (!oplogIdent.empty()) {
-        excludedIdents.push_back(oplogIdent);
-    }
-    retryPauseOrResumeAutoCompactForWriteBlock(opCtx, "resume", [&](RecoveryUnit& ru) {
-        return _engine->pauseOrResumeAutoCompactForWriteBlock(ru, pause, excludedIdents);
+    retryPauseAutoCompactForReplicaSetWritesBlock(opCtx, [&](RecoveryUnit& ru) {
+        return _engine->pauseAutoCompactForReplicaSetWritesBlock(ru);
     });
 }
 
@@ -1283,6 +1262,11 @@ bool StorageEngineImpl::isInLeaderMode() {
 StatusWith<int64_t> StorageEngineImpl::getIndexStorageSize(
     OperationContext* opCtx, const std::vector<std::string>& indexIdents) const {
     return _engine->getIndexStorageSize(opCtx, indexIdents);
+}
+
+StatusWith<int64_t> StorageEngineImpl::getSharedHistoryStoreStorageSize(
+    OperationContext* opCtx) const {
+    return _engine->getSharedHistoryStoreStorageSize(opCtx);
 }
 
 }  // namespace mongo

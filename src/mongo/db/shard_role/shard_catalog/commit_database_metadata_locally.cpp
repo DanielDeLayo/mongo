@@ -37,13 +37,16 @@ repl::MutableOplogEntry makeDatabaseMetadataOplogEntry(OperationContext* opCtx,
     return oplogEntry;
 }
 
+}  // namespace
+
 void writeDatabaseMetadataOplogEntry(OperationContext* opCtx,
                                      repl::MutableOplogEntry& oplogEntry,
                                      std::string_view commandName) {
+    repl::OpTime opTime;
     writeConflictRetry(opCtx, commandName, NamespaceString::kRsOplogNamespace, [&] {
         AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
         WriteUnitOfWork wuow(opCtx);
-        const repl::OpTime opTime = repl::logOp(opCtx, &oplogEntry);
+        opTime = repl::logOp(opCtx, &oplogEntry);
         uassert(9980400,
                 str::stream() << "Failed to create oplog entry for " << commandName
                               << " with opTime: " << oplogEntry.getOpTime().toString() << ": "
@@ -51,9 +54,12 @@ void writeDatabaseMetadataOplogEntry(OperationContext* opCtx,
                 !opTime.isNull());
         wuow.commit();
     });
-}
 
-}  // namespace
+    // repl::logOp() clears the mutable oplog entry's OpTime before returning so the entry can be
+    // reused on a write-conflict retry. Restore the OpTime to the actual value after the oplog
+    // entry is successfully committed; otherwise, it will remain 0.
+    oplogEntry.setOpTime(opTime);
+}
 
 void commitCreateDatabaseMetadataLocally(OperationContext* opCtx,
                                          const DatabaseType& dbMetadata,
@@ -108,7 +114,11 @@ void commitCreateDatabaseMetadataLocally(OperationContext* opCtx,
               : dbStats.registerLocalDatabaseMetadataCommit();
 }
 
-void commitDropDatabaseMetadataLocally(OperationContext* opCtx, const DatabaseName& dbName) {
+// TODO SERVER-98118: Remove writeDropDBMetadataEntry after v9.0 branch out; always write the oplog
+// entry.
+void commitDropDatabaseMetadataLocally(OperationContext* opCtx,
+                                       const DatabaseName& dbName,
+                                       bool writeDropDBMetadataEntry) {
     // The shard catalog commit holds the critical section blocking reads and writes, so it must not
     // be deprioritized by execution control.
     admission::execution_control::ScopedTaskTypeNonDeprioritizable deprioGuard(opCtx);
@@ -137,18 +147,33 @@ void commitDropDatabaseMetadataLocally(OperationContext* opCtx, const DatabaseNa
     }
 
     // Write an oplog 'c' entry to invalidate the DSS on secondaries.
-    auto oplogEntry = makeDatabaseMetadataOplogEntry(
-        opCtx, dbName, DropDatabaseMetadataOplogEntry{dbNameStr, dbName}.toBSON());
-    writeDatabaseMetadataOplogEntry(opCtx, oplogEntry, "dropDatabaseMetadata");
+    if (writeDropDBMetadataEntry) {
+        auto oplogEntry = makeDatabaseMetadataOplogEntry(
+            opCtx, dbName, DropDatabaseMetadataOplogEntry{dbNameStr, dbName}.toBSON());
+        writeDatabaseMetadataOplogEntry(opCtx, oplogEntry, "dropDatabaseMetadata");
 
-    // Update DSR in primary node.
-    {
-        auto scopedDsr = DatabaseShardingRuntime::acquireExclusive(opCtx, dbName);
-        scopedDsr->clearDbMetadata(opCtx);
+        // Apply the entry on this (primary) node through the same op observer hook used to apply it
+        // on secondaries, so the DSR update and any stale collection metadata clearing stay in sync
+        // between the two paths.
+        opCtx->getServiceContext()->getOpObserver()->onDropDatabaseMetadata(
+            opCtx, repl::OplogEntry(oplogEntry.toBSON()));
     }
 
     ShardingStatistics::get(opCtx)
         .databaseShardingMetadataStatistics.registerLocalDatabaseMetadataDrop();
+}
+
+void commitInvalidateAllDatabaseMetadata(OperationContext* opCtx) {
+    LOGV2_DEBUG(13169800, 1, "Emitting invalidateAllDatabaseMetadata oplog entry");
+
+    InvalidateAllDatabaseMetadataOplogEntry entry;
+    entry.setInvalidateAllDatabaseMetadata(1);
+    auto oplogEntry = makeDatabaseMetadataOplogEntry(opCtx, DatabaseName::kAdmin, entry.toBSON());
+
+    writeDatabaseMetadataOplogEntry(opCtx, oplogEntry, "invalidateAllDatabaseMetadata");
+
+    opCtx->getServiceContext()->getOpObserver()->onInvalidateAllDatabaseMetadata(
+        opCtx, repl::OplogEntry(oplogEntry.toBSON()));
 }
 
 }  // namespace shard_catalog_commit

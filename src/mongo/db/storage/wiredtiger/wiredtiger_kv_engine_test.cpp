@@ -13,6 +13,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/rss/attached_storage/attached_persistence_provider.h"
 #include "mongo/db/rss/replicated_storage_service.h"
 #include "mongo/db/rss/stub_persistence_provider.h"
 #include "mongo/db/server_options.h"
@@ -972,9 +973,41 @@ TEST_F(WiredTigerKVEngineTest, RollbackToStableEBUSY) {
     ASSERT_OK(_helper->getWiredTigerKVEngine()->recoverToStableTimestamp(*opCtxPtr.get()));
 }
 
-// Background auto-compact reconfigures are applied asynchronously, so a reconfigure issued while a
+TEST_F(WiredTigerKVEngineTest, GetIndexStorageSizeReturnsBusyWhenStableFileBusy) {
+    auto opCtxPtr = _makeOperationContext();
+    FailPointEnableBlock failPoint("WTIndexStorageSizeReturnBusy");
+    // With the failpoint active, the stable-file statistics open is treated as EBUSY.
+    // getIndexStorageSize must surface this as the retryable ObjectIsBusy rather than a hard error.
+    EXPECT_EQ(ErrorCodes::ObjectIsBusy,
+              _helper->getWiredTigerKVEngine()
+                  ->getIndexStorageSize(opCtxPtr.get(), {"some-index-ident"})
+                  .getStatus()
+                  .code());
+}
+
+TEST_F(WiredTigerKVEngineTest, GetIndexStorageSizeAbsentStableFileContributesZero) {
+    auto opCtxPtr = _makeOperationContext();
+    // No .wt_stable checkpoint file exists for this ident, so the statistics open fails with
+    // NoSuchKey and the ident contributes zero without erroring.
+    const StatusWith<int64_t> swSize = _helper->getWiredTigerKVEngine()->getIndexStorageSize(
+        opCtxPtr.get(), {"nonexistent-index-ident"});
+    ASSERT_OK(swSize.getStatus());
+    EXPECT_EQ(swSize.getValue(), 0);
+}
+
+TEST_F(WiredTigerKVEngineTest, GetSharedHistoryStoreStorageSizeAbsentFileContributesZero) {
+    auto opCtxPtr = _makeOperationContext();
+    // Attached-storage WiredTiger cannot create WiredTigerSharedHS.wt_stable: the disaggregated
+    // block manager requires a page log. This fixture only covers the missing-file path.
+    const StatusWith<int64_t> swSize =
+        _helper->getWiredTigerKVEngine()->getSharedHistoryStoreStorageSize(opCtxPtr.get());
+    ASSERT_OK(swSize.getStatus());
+    EXPECT_EQ(swSize.getValue(), 0);
+}
+
+// Pausing auto-compact in background is applied asynchronously, so a pause issued while a
 // previous one is still being consumed is transiently rejected with ObjectIsBusy. Production wraps
-// these calls in a retry loop (see StorageEngineImpl::pauseOrResumeAutoCompactForWriteBlock);
+// these calls in a retry loop (see StorageEngineImpl::pauseAutoCompactForReplicaSetWritesBlock);
 // mirror that here so back-to-back reconfigures in the tests below are not racy.
 Status retryWhileAutoCompactBusy(const std::function<Status()>& op) {
     Status status = Status::OK();
@@ -988,9 +1021,9 @@ Status retryWhileAutoCompactBusy(const std::function<Status()>& op) {
     return status;
 }
 
-// Pausing auto-compaction for a write block stops it but saves the active configuration; resuming
-// restarts compaction with the saved configuration.
-TEST_F(WiredTigerKVEngineTest, AutoCompactPauseThenResumeRestoresConfig) {
+// Pausing auto-compaction for a write block stops it without saving the active configuration (no
+// restore is performed after).
+TEST_F(WiredTigerKVEngineTest, AutoCompactPauseStopsCompaction) {
     // canRunAutoCompact() requires checkpoints to be enabled.
     storageGlobalParams.syncdelay.store(1);
     ON_BLOCK_EXIT([] { storageGlobalParams.syncdelay.store(0); });
@@ -1004,46 +1037,16 @@ TEST_F(WiredTigerKVEngineTest, AutoCompactPauseThenResumeRestoresConfig) {
                                                      false /* runOnce */,
                                                      50 /* freeSpaceTargetMB */,
                                                      {} /* excludedIdents */}));
-    ASSERT_TRUE(engine->getActiveAutoCompactOptions());
 
+    ASSERT_OK(retryWhileAutoCompactBusy(
+        [&] { return engine->pauseAutoCompactForReplicaSetWritesBlock(ru); }));
     ASSERT_OK(retryWhileAutoCompactBusy([&] {
-        return engine->pauseOrResumeAutoCompactForWriteBlock(
-            ru, true /* pause */, {} /* excludedIdents */);
+        return engine->autoCompact(ru,
+                                   AutoCompactOptions{true /* enable */,
+                                                      false /* runOnce */,
+                                                      51 /* freeSpaceTargetMB */,
+                                                      {} /* excludedIdents */});
     }));
-    ASSERT_FALSE(engine->getActiveAutoCompactOptions());
-
-    ASSERT_OK(retryWhileAutoCompactBusy([&] {
-        return engine->pauseOrResumeAutoCompactForWriteBlock(
-            ru, false /* pause */, {} /* excludedIdents */);
-    }));
-    auto active = engine->getActiveAutoCompactOptions();
-    ASSERT_TRUE(active);
-    ASSERT_TRUE(active->enable);
-    ASSERT_TRUE(active->freeSpaceTargetMB);
-    ASSERT_EQ(*active->freeSpaceTargetMB, 50);
-}
-
-// An explicit user disable discards the configuration saved for a write-block restore, so a
-// subsequent resume does not resurrect the compaction the user turned off.
-TEST_F(WiredTigerKVEngineTest, AutoCompactUserDisableDiscardsSavedRestore) {
-    storageGlobalParams.syncdelay.store(1);
-    ON_BLOCK_EXIT([] { storageGlobalParams.syncdelay.store(0); });
-
-    auto* engine = _helper->getWiredTigerKVEngine();
-    auto opCtx = _makeOperationContext();
-    auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
-
-    ASSERT_OK(engine->autoCompact(ru,
-                                  AutoCompactOptions{true /* enable */,
-                                                     false /* runOnce */,
-                                                     50 /* freeSpaceTargetMB */,
-                                                     {} /* excludedIdents */}));
-    ASSERT_OK(retryWhileAutoCompactBusy([&] {
-        return engine->pauseOrResumeAutoCompactForWriteBlock(
-            ru, true /* pause */, {} /* excludedIdents */);
-    }));
-
-    // The user explicitly disables auto-compaction while it is paused.
     ASSERT_OK(retryWhileAutoCompactBusy([&] {
         return engine->autoCompact(ru,
                                    AutoCompactOptions{false /* enable */,
@@ -1051,18 +1054,10 @@ TEST_F(WiredTigerKVEngineTest, AutoCompactUserDisableDiscardsSavedRestore) {
                                                       boost::none /* freeSpaceTargetMB */,
                                                       {} /* excludedIdents */});
     }));
-
-    // Resuming is a no-op because the saved configuration was discarded.
-    ASSERT_OK(retryWhileAutoCompactBusy([&] {
-        return engine->pauseOrResumeAutoCompactForWriteBlock(
-            ru, false /* pause */, {} /* excludedIdents */);
-    }));
-    ASSERT_FALSE(engine->getActiveAutoCompactOptions());
 }
 
-// Pausing is idempotent: a second pause while nothing is active must not clobber the configuration
-// saved by the first pause, so a later resume still restores it.
-TEST_F(WiredTigerKVEngineTest, AutoCompactRepeatedPausePreservesSavedConfig) {
+// Pausing is idempotent: a second pause while nothing is active leaves compaction stopped.
+TEST_F(WiredTigerKVEngineTest, AutoCompactRepeatedPauseLeavesCompactionStopped) {
     storageGlobalParams.syncdelay.store(1);
     ON_BLOCK_EXIT([] { storageGlobalParams.syncdelay.store(0); });
 
@@ -1076,47 +1071,29 @@ TEST_F(WiredTigerKVEngineTest, AutoCompactRepeatedPausePreservesSavedConfig) {
                                                      50 /* freeSpaceTargetMB */,
                                                      {} /* excludedIdents */}));
 
-    // First pause saves the active configuration; the second pause finds nothing active and must
-    // leave the saved configuration untouched.
-    ASSERT_OK(retryWhileAutoCompactBusy([&] {
-        return engine->pauseOrResumeAutoCompactForWriteBlock(
-            ru, true /* pause */, {} /* excludedIdents */);
-    }));
-    ASSERT_OK(retryWhileAutoCompactBusy([&] {
-        return engine->pauseOrResumeAutoCompactForWriteBlock(
-            ru, true /* pause */, {} /* excludedIdents */);
-    }));
+    // The second pause finds nothing active and must leave compaction stopped.
+    ASSERT_OK(retryWhileAutoCompactBusy(
+        [&] { return engine->pauseAutoCompactForReplicaSetWritesBlock(ru); }));
+    ASSERT_OK(retryWhileAutoCompactBusy(
+        [&] { return engine->pauseAutoCompactForReplicaSetWritesBlock(ru); }));
 
     ASSERT_OK(retryWhileAutoCompactBusy([&] {
-        return engine->pauseOrResumeAutoCompactForWriteBlock(
-            ru, false /* pause */, {} /* excludedIdents */);
+        return engine->autoCompact(ru,
+                                   AutoCompactOptions{true /* enable */,
+                                                      false /* runOnce */,
+                                                      51 /* freeSpaceTargetMB */,
+                                                      {} /* excludedIdents */});
     }));
-    auto active = engine->getActiveAutoCompactOptions();
-    ASSERT_TRUE(active);
-    ASSERT_TRUE(active->freeSpaceTargetMB);
-    ASSERT_EQ(*active->freeSpaceTargetMB, 50);
+    ASSERT_OK(retryWhileAutoCompactBusy([&] {
+        return engine->autoCompact(ru,
+                                   AutoCompactOptions{false /* enable */,
+                                                      false /* runOnce */,
+                                                      boost::none /* freeSpaceTargetMB */,
+                                                      {} /* excludedIdents */});
+    }));
 }
 
-// Resuming without a prior pause has nothing saved to restore, so it is a no-op and leaves
-// compaction off.
-TEST_F(WiredTigerKVEngineTest, AutoCompactResumeWithoutPauseIsNoop) {
-    storageGlobalParams.syncdelay.store(1);
-    ON_BLOCK_EXIT([] { storageGlobalParams.syncdelay.store(0); });
-
-    auto* engine = _helper->getWiredTigerKVEngine();
-    auto opCtx = _makeOperationContext();
-    auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
-
-    ASSERT_OK(retryWhileAutoCompactBusy([&] {
-        return engine->pauseOrResumeAutoCompactForWriteBlock(
-            ru, false /* pause */, {} /* excludedIdents */);
-    }));
-    ASSERT_FALSE(engine->getActiveAutoCompactOptions());
-}
-
-// A run-once compaction is not treated as active, so pausing does not save it and a later resume
-// restores nothing.
-TEST_F(WiredTigerKVEngineTest, AutoCompactRunOnceNotRestoredAcrossPause) {
+TEST_F(WiredTigerKVEngineTest, AutoCompactPauseStopsRunOnceCompaction) {
     storageGlobalParams.syncdelay.store(1);
     ON_BLOCK_EXIT([] { storageGlobalParams.syncdelay.store(0); });
 
@@ -1130,64 +1107,22 @@ TEST_F(WiredTigerKVEngineTest, AutoCompactRunOnceNotRestoredAcrossPause) {
                                                      boost::none /* freeSpaceTargetMB */,
                                                      {} /* excludedIdents */}));
 
+    ASSERT_OK(retryWhileAutoCompactBusy(
+        [&] { return engine->pauseAutoCompactForReplicaSetWritesBlock(ru); }));
     ASSERT_OK(retryWhileAutoCompactBusy([&] {
-        return engine->pauseOrResumeAutoCompactForWriteBlock(
-            ru, true /* pause */, {} /* excludedIdents */);
+        return engine->autoCompact(ru,
+                                   AutoCompactOptions{true /* enable */,
+                                                      false /* runOnce */,
+                                                      50 /* freeSpaceTargetMB */,
+                                                      {} /* excludedIdents */});
     }));
-
-    // Nothing was saved because run-once is never treated as active, so resume is a no-op.
     ASSERT_OK(retryWhileAutoCompactBusy([&] {
-        return engine->pauseOrResumeAutoCompactForWriteBlock(
-            ru, false /* pause */, {} /* excludedIdents */);
+        return engine->autoCompact(ru,
+                                   AutoCompactOptions{false /* enable */,
+                                                      false /* runOnce */,
+                                                      boost::none /* freeSpaceTargetMB */,
+                                                      {} /* excludedIdents */});
     }));
-    ASSERT_FALSE(engine->getActiveAutoCompactOptions());
-}
-
-// Enabling continuous (non run-once) auto-compaction caches the active configuration.
-TEST_F(WiredTigerKVEngineTest, AutoCompactCachesContinuousOptions) {
-    // canRunAutoCompact() requires checkpoints to be enabled.
-    storageGlobalParams.syncdelay.store(1);
-    ON_BLOCK_EXIT([] { storageGlobalParams.syncdelay.store(0); });
-
-    auto* engine = _helper->getWiredTigerKVEngine();
-    auto opCtx = _makeOperationContext();
-    auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
-
-    ASSERT_FALSE(engine->getActiveAutoCompactOptions());
-
-    ASSERT_OK(engine->autoCompact(ru,
-                                  AutoCompactOptions{true /* enable */,
-                                                     false /* runOnce */,
-                                                     100 /* freeSpaceTargetMB */,
-                                                     {} /* excludedIdents */}));
-
-    auto active = engine->getActiveAutoCompactOptions();
-    ASSERT_TRUE(active);
-    ASSERT_TRUE(active->enable);
-    ASSERT_FALSE(active->runOnce);
-    ASSERT_TRUE(active->freeSpaceTargetMB);
-    ASSERT_EQ(*active->freeSpaceTargetMB, 100);
-    // The cached options never retain excludedIdents: each enable
-    // caller recomputes the oplog exclusion itself.
-    ASSERT_TRUE(active->excludedIdents.empty());
-}
-
-// A run-once compaction is a transient one-shot, so it is not cached as the active configuration.
-TEST_F(WiredTigerKVEngineTest, AutoCompactDoesNotCacheRunOnce) {
-    storageGlobalParams.syncdelay.store(1);
-    ON_BLOCK_EXIT([] { storageGlobalParams.syncdelay.store(0); });
-
-    auto* engine = _helper->getWiredTigerKVEngine();
-    auto opCtx = _makeOperationContext();
-    auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
-
-    ASSERT_OK(engine->autoCompact(ru,
-                                  AutoCompactOptions{true /* enable */,
-                                                     true /* runOnce */,
-                                                     boost::none /* freeSpaceTargetMB */,
-                                                     {} /* excludedIdents */}));
-
-    ASSERT_FALSE(engine->getActiveAutoCompactOptions());
 }
 
 std::unique_ptr<KVHarnessHelper> makeHelper(ServiceContext* svcCtx) {
@@ -1951,6 +1886,82 @@ TEST_F(WiredTigerKVEngineTest, IsColdCollectionRecordStore) {
     ASSERT_TRUE(coldRs->isColdCollection());
 }
 
+// Creates a record store via getRecordStore(), inserts a few records, and reads the in-memory
+// _sizeInfo, which _changeNumRecordsAndDataSize only mutates when the store was created with
+// tracksSizeAdjustments=true.
+int64_t insertRecordsAndGetSizeInfoCount(WiredTigerKVEngine* engine,
+                                         OperationContext* opCtx,
+                                         RecoveryUnit& ru,
+                                         const NamespaceString& nss,
+                                         const std::string& ident) {
+    auto& provider = rss::ReplicatedStorageService::get(opCtx).getPersistenceProvider();
+    const RecordStore::Options rsOptions;
+    {
+        StorageWriteTransaction txn(ru);
+        ASSERT_OK(engine->createRecordStore(provider, ru, nss, ident, rsOptions));
+        txn.commit();
+    }
+    auto rs = engine->getRecordStore(opCtx, nss, ident, rsOptions, UUID::gen());
+    ASSERT(rs);
+
+    constexpr int64_t kNumRecords = 3;
+    {
+        StorageWriteTransaction txn(ru);
+        for (int64_t i = 0; i < kNumRecords; ++i) {
+            const std::string doc = "record";
+            ASSERT_OK(
+                rs->insertRecord(opCtx, ru, doc.c_str(), doc.size() + 1, Timestamp()).getStatus());
+        }
+        txn.commit();
+    }
+    return rs->numRecords();
+}
+
+TEST_F(WiredTigerKVEngineTest, GetRecordStoreTracksSizeAdjustmentsWhenNotUsingReplicatedFastCount) {
+    auto* engine = _helper->getWiredTigerKVEngine();
+    auto opCtxPtr = _makeOperationContext();
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtxPtr.get());
+
+    // The attached provider does not use replicated fast count, so getRecordStore() sets
+    // tracksSizeAdjustments=true and inserts are reflected in the sizeInfo.
+    ASSERT_FALSE(rss::ReplicatedStorageService::get(opCtxPtr.get())
+                     .getPersistenceProvider()
+                     .shouldUseReplicatedFastCount());
+    ASSERT_EQ(3,
+              insertRecordsAndGetSizeInfoCount(
+                  engine,
+                  opCtxPtr.get(),
+                  ru,
+                  NamespaceString::createNamespaceString_forTest("test.tracked"),
+                  "collection-tracked"));
+}
+
+TEST_F(WiredTigerKVEngineTest,
+       GetRecordStoreDoesNotTrackSizeAdjustmentsWhenUsingReplicatedFastCount) {
+    auto* engine = _helper->getWiredTigerKVEngine();
+    auto opCtxPtr = _makeOperationContext();
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtxPtr.get());
+
+    // A provider that uses replicated fast count makes getRecordStore() set
+    // tracksSizeAdjustments=false, so _changeNumRecordsAndDataSize is a no-op and the sizeInfo
+    // stays zero even though records were inserted.
+    class ReplicatedFastCountProvider : public rss::AttachedPersistenceProvider {
+    public:
+        bool shouldUseReplicatedFastCount() const override {
+            return true;
+        }
+    };
+    rss::ReplicatedStorageService::get(getServiceContext())
+        .setPersistenceProvider(std::make_unique<ReplicatedFastCountProvider>());
+    ASSERT_EQ(0,
+              insertRecordsAndGetSizeInfoCount(
+                  engine,
+                  opCtxPtr.get(),
+                  ru,
+                  NamespaceString::createNamespaceString_forTest("test.untracked"),
+                  "collection-untracked"));
+}
+
 TEST_F(WiredTigerKVEngineTest, GetStorageTierFromStorageOptionsNone) {
     auto* engine = _helper->getWiredTigerKVEngine();
     // WiredTiger's default config string uses storage_tier=none, which should be treated as unset.
@@ -1971,6 +1982,26 @@ TEST_F(WiredTigerKVEngineTest, GetStorageTierFromStorageOptionsCold) {
 TEST_F(WiredTigerKVEngineTest, GetStorageTierFromStorageOptionsEmpty) {
     auto* engine = _helper->getWiredTigerKVEngine();
     ASSERT_EQ(engine->getStorageTierFromStorageOptions(BSONObj()), boost::none);
+}
+
+TEST_F(WiredTigerKVEngineTest, MaterializationFrontierIgnoresLowerAndEqualNotifications) {
+    auto* engine = _helper->getWiredTigerKVEngine();
+    auto* conn = engine->getConn();
+    const auto first = Timestamp(10, 1).asULL();
+    const auto next = Timestamp(20, 1).asULL();
+
+    engine->setLastMaterializedLsn(first);
+    engine->setLastMaterializedLsn(first);
+    engine->setLastMaterializedLsn(first - 1);
+    ASSERT_EQ(EINVAL,
+              conn->set_context_uint(conn, WT_CONTEXT_TYPE_LAST_MATERIALIZED_LSN, first - 1));
+    ASSERT_EQ(0, conn->set_context_uint(conn, WT_CONTEXT_TYPE_LAST_MATERIALIZED_LSN, first));
+
+    engine->setLastMaterializedLsn(next);
+    engine->setLastMaterializedLsn(first);
+    ASSERT_EQ(EINVAL,
+              conn->set_context_uint(conn, WT_CONTEXT_TYPE_LAST_MATERIALIZED_LSN, next - 1));
+    ASSERT_EQ(0, conn->set_context_uint(conn, WT_CONTEXT_TYPE_LAST_MATERIALIZED_LSN, next));
 }
 
 // Minimal FlushAllFilesObserver that records how many times it was notified.
@@ -2105,7 +2136,6 @@ TEST_F(WiredTigerKVEngineTest, DropIdentReturnsLockBusyWhenSchemaLockHeld) {
         return engine->dropIdent(*shard_role_details::getRecoveryUnit(opCtxPtr.get()),
                                  ident,
                                  /*identHasSizeInfo=*/true,
-                                 /*onDrop=*/nullptr,
                                  /*schemaEpoch=*/boost::none,
                                  /*waitForLocks=*/false);
     }();
@@ -2115,6 +2145,16 @@ TEST_F(WiredTigerKVEngineTest, DropIdentReturnsLockBusyWhenSchemaLockHeld) {
     // pointer to it and will call terminate() on teardown
     opCtxPtr.reset();
     _helper.reset();
+}
+
+TEST_F(WiredTigerKVEngineTest, DumpAcceptsAllDebugInfoCategories) {
+    unittest::LogCaptureGuard logs;
+    _helper->getWiredTigerKVEngine()->dump();
+    logs.stop();
+
+    // A category WiredTiger doesn't know about makes debug_info() fail with EINVAL, so a successful
+    // dump means every category in the config string is still valid.
+    ASSERT_EQ(logs.countBSONContainingSubset(BSON("id" << 6117700)), 1);
 }
 
 }  // namespace

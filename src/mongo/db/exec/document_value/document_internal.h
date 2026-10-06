@@ -390,13 +390,7 @@ public:
     }
 
     // The function adds up all iterator counts. Exp. runtime is O(N).
-    size_t computeSize() const {
-        // can't use _numFields because it includes removed Fields
-        size_t count = 0;
-        for (DocumentStorageIterator it = iterator(); !it.atEnd(); it.advance())
-            count++;
-        return count;
-    }
+    size_t computeSize() const;
 
     /// Returns the position of the next field to be inserted
     Position getNextPosition() const {
@@ -507,6 +501,10 @@ public:
         return _bson.objsize();
     }
 
+    bool bsonObjIsEmpty() const {
+        return _bson.isEmpty();
+    }
+
     /**
      * Returns the size of backing BSON object minus the size of BSON fields that are already
      * brought into the cache.
@@ -526,7 +524,7 @@ public:
     bool isOwned() const {
         // An empty BSON can be a special case, it can be treated 'owned'. We save on memory
         // allocation when constructing an empty Document.
-        return _bson.isEmptyPrototype() || _bson.isOwned();
+        return _bson.isOwned() || _bson.isEmptyPrototype();
     }
 
     void makeOwned() {

@@ -120,12 +120,9 @@ public:
     }
 
     std::shared_ptr<executor::AsyncClientFactory::AsyncClientHandle> getClient(
-        const HostAndPort& target) {
-        return getFactory()
-            .get(target,
-                 ConnectSSLMode::kGlobalSSLMode,
-                 CommandServiceTestFixtures::kDefaultConnectTimeout)
-            .get();
+        const HostAndPort& target,
+        Milliseconds timeout = CommandServiceTestFixtures::kDefaultConnectTimeout) {
+        return getFactory().get(target, ConnectSSLMode::kGlobalSSLMode, timeout).get();
     }
 
     std::shared_ptr<executor::AsyncClientFactory::AsyncClientHandle> getLeasedClient() {
@@ -224,7 +221,7 @@ TEST_F(GRPCAsyncClientFactoryTest, Ping) {
         auto handle = getClient();
         ON_BLOCK_EXIT([&] { handle->indicateSuccess(); });
         auto msg = makeUniqueMessage();
-        auto resp = handle->getClient().runCommand(OpMsgRequest::parse(msg)).get();
+        auto resp = handle->getClient().runCommand_forTest(OpMsgRequest::parse(msg)).get();
         ASSERT_OK(getStatusFromCommandResult(resp->getCommandReply()));
         handle->indicateSuccess();
     }
@@ -239,10 +236,12 @@ TEST_F(GRPCAsyncClientFactoryTest, ConcurrentUsage) {
 
         for (int i = 0; i < concurrentThreads; i++) {
             auto th = monitor.spawn([&] {
-                auto handle = getClient();
+                auto handle =
+                    getClient(getTarget(), CommandServiceTestFixtures::kConcurrentConnectTimeout);
                 for (int req = 0; req < 5; req++) {
                     auto msg = makeUniqueMessage();
-                    auto resp = handle->getClient().runCommand(OpMsgRequest::parse(msg)).get();
+                    auto resp =
+                        handle->getClient().runCommand_forTest(OpMsgRequest::parse(msg)).get();
                     ON_BLOCK_EXIT([&] { handle->indicateSuccess(); });
                     ASSERT_OK(getStatusFromCommandResult(resp->getCommandReply()));
                 }
@@ -271,8 +270,10 @@ TEST_F(GRPCAsyncClientFactoryTest, DropAllConnections) {
 
         getFactory().dropConnections();
         auto msg = OpMsgRequest::parseOwned(makeUniqueMessage());
-        ASSERT_EQ(handle1->getClient().runCommand(msg).getNoThrow(), ErrorCodes::CallbackCanceled);
-        ASSERT_EQ(handle2->getClient().runCommand(msg).getNoThrow(), ErrorCodes::CallbackCanceled);
+        ASSERT_EQ(handle1->getClient().runCommand_forTest(msg).getNoThrow(),
+                  ErrorCodes::CallbackCanceled);
+        ASSERT_EQ(handle2->getClient().runCommand_forTest(msg).getNoThrow(),
+                  ErrorCodes::CallbackCanceled);
 
         // New sessions succeed and use a different underlying channel.
         auto handle3 = getClient();
@@ -280,7 +281,7 @@ TEST_F(GRPCAsyncClientFactoryTest, DropAllConnections) {
 
         ASSERT_NE(handle1ChannelId, getChannelIdForClient(handle3));
 
-        ASSERT_OK(handle3->getClient().runCommand(msg).getNoThrow());
+        ASSERT_OK(handle3->getClient().runCommand_forTest(msg).getNoThrow());
     }
 
     shutdownAndAssertOnTransportStats(1 /*successful streams*/, 2 /*failed streams*/);
@@ -302,10 +303,11 @@ TEST_F(GRPCAsyncClientFactoryTest, DropConnectionToTarget) {
         getFactory().dropConnections(target1);
 
         auto msg = OpMsgRequest::parseOwned(makeUniqueMessage());
-        ASSERT_EQ(handle1->getClient().runCommand(msg).getNoThrow(), ErrorCodes::CallbackCanceled);
+        ASSERT_EQ(handle1->getClient().runCommand_forTest(msg).getNoThrow(),
+                  ErrorCodes::CallbackCanceled);
 
         // The other target is unaffected by dropConnections.
-        ASSERT_OK(handle2->getClient().runCommand(msg).getNoThrow());
+        ASSERT_OK(handle2->getClient().runCommand_forTest(msg).getNoThrow());
     }
 
     shutdownAndAssertOnTransportStats(1 /*successful streams*/, 1 /*failed streams*/);
@@ -365,12 +367,12 @@ TEST_F(GRPCAsyncClientFactoryTest, KeepOpen) {
 
         auto msg = OpMsgRequest::parseOwned(makeUniqueMessage());
         // We can still run a command on the old session.
-        ASSERT_OK(handle1->getClient().runCommand(msg).getNoThrow());
+        ASSERT_OK(handle1->getClient().runCommand_forTest(msg).getNoThrow());
 
         // New sessions are also unaffected.
         auto handle2 = getClient();
         ON_BLOCK_EXIT([&] { handle2->indicateSuccess(); });
-        ASSERT_OK(handle2->getClient().runCommand(msg).getNoThrow());
+        ASSERT_OK(handle2->getClient().runCommand_forTest(msg).getNoThrow());
 
         // The same channel is used for the remote on new sessions because it was kept open.
         ASSERT_EQ(getChannelIdForClient(handle1), getChannelIdForClient(handle2));
@@ -397,8 +399,10 @@ TEST_F(GRPCAsyncClientFactoryTest, Shutdown) {
         waitForDisconnected(handle1);
         waitForDisconnected(handle2);
         auto msg = OpMsgRequest::parseOwned(makeUniqueMessage());
-        ASSERT_EQ(handle1->getClient().runCommand(msg).getNoThrow(), ErrorCodes::CallbackCanceled);
-        ASSERT_EQ(handle2->getClient().runCommand(msg).getNoThrow(), ErrorCodes::CallbackCanceled);
+        ASSERT_EQ(handle1->getClient().runCommand_forTest(msg).getNoThrow(),
+                  ErrorCodes::CallbackCanceled);
+        ASSERT_EQ(handle2->getClient().runCommand_forTest(msg).getNoThrow(),
+                  ErrorCodes::CallbackCanceled);
 
         ASSERT_FALSE(pf.future.isReady());
     }
@@ -421,7 +425,8 @@ TEST_F(GRPCAsyncClientFactoryTest, RefuseShutdownWithActiveClient) {
         });
         waitForDisconnected(handle1);
         auto msg = OpMsgRequest::parseOwned(makeUniqueMessage());
-        ASSERT_EQ(handle1->getClient().runCommand(msg).getNoThrow(), ErrorCodes::CallbackCanceled);
+        ASSERT_EQ(handle1->getClient().runCommand_forTest(msg).getNoThrow(),
+                  ErrorCodes::CallbackCanceled);
 
         ASSERT_FALSE(pf.future.isReady());
 
@@ -452,7 +457,7 @@ TEST_F(GRPCAsyncClientFactoryTest, PerClientStatsTest) {
     assertStatsSoon(3 /*created*/, 1 /*inUse*/, 0 /*leased*/, 1 /*open*/);
 
     auto msg = makeUniqueMessage();
-    auto resp = anotherHandle->getClient().runCommand(OpMsgRequest::parse(msg)).get();
+    auto resp = anotherHandle->getClient().runCommand_forTest(OpMsgRequest::parse(msg)).get();
     ASSERT_OK(getStatusFromCommandResult(resp->getCommandReply()));
 
     // A handle is still in use after a command is run and before it is destroyed.

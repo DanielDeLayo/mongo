@@ -50,6 +50,9 @@ CardinalityEstimator::CardinalityEstimator(const CollectionInfo& collInfo,
         tassert(9746501,
                 "samplingEstimator cannot be null when CBRCEMode is samplingCE",
                 _samplingEstimator != nullptr);
+        // Sampling CE uses the sampler's cardinality as the collection baseline.
+        _collCard = _samplingEstimator->getCollCard();
+        _inputCard = _collCard;
     }
     for (auto&& indexEntry : _collInfo.indexes) {
         for (auto&& indexedPath : indexEntry.keyPattern) {
@@ -82,31 +85,46 @@ CEResult CardinalityEstimator::estimatePlan(const QuerySolution& plan) {
     return _qsnEstimates.at(plan.root())->outCE;
 }
 
-void CardinalityEstimator::clampZeroEstimates() {
-    const auto clamp = [](CardinalityEstimate ce) -> CardinalityEstimate {
-        if (ce != zeroCE) {
-            return ce;
-        }
-        switch (ce.source()) {
-            case EstimationSource::Sampling:
-            case EstimationSource::Histogram:
-            case EstimationSource::Heuristics:
-            case EstimationSource::Mixed:
-                return CardinalityEstimate{CardinalityType{kMinCE}, ce.source()};
-            case EstimationSource::Metadata:
-            case EstimationSource::Code:
-                return ce;
-            case EstimationSource::Unknown:
-                tasserted(12307002, "Encountered a CE with unknown source during clamping");
-        }
-        MONGO_UNREACHABLE;
-    };
+CEResult CardinalityEstimator::estimateFilter(const MatchExpression* filter) {
+    // Restore initial state so the estimator can be reused across filters/plans.
+    _inputCard = _collCard;
+    _conjSels.clear();
 
+    auto ceRes = estimate(filter, true /* isFilterRoot */);
+    if (!ceRes.isOK()) {
+        return ceRes;
+    }
+    // A stanalone filter returns directly and never populates _qsnEstimates, so
+    // clampZeroEstimates() (which walks that map) would not see it. Apply the same policy to the
+    // scalar result here.
+    return clampZeroEstimate(ceRes.getValue());
+}
+
+CardinalityEstimate CardinalityEstimator::clampZeroEstimate(CardinalityEstimate ce) {
+    if (ce != zeroCE) {
+        return ce;
+    }
+    switch (ce.source()) {
+        case EstimationSource::Sampling:
+        case EstimationSource::Histogram:
+        case EstimationSource::Heuristics:
+        case EstimationSource::Mixed:
+            return CardinalityEstimate{CardinalityType{kMinCE}, ce.source()};
+        case EstimationSource::Metadata:
+        case EstimationSource::Code:
+            return ce;
+        case EstimationSource::Unknown:
+            tasserted(12307002, "Encountered a CE with unknown source during clamping");
+    }
+    MONGO_UNREACHABLE;
+}
+
+void CardinalityEstimator::clampZeroEstimates() {
     for (auto& [node, est] : _qsnEstimates) {
         if (est->inCE) {
-            est->inCE = clamp(*est->inCE);
+            est->inCE = clampZeroEstimate(*est->inCE);
         }
-        est->outCE = clamp(est->outCE);
+        est->outCE = clampZeroEstimate(est->outCE);
     }
 }
 
@@ -145,7 +163,7 @@ CEResult CardinalityEstimator::estimate(const QuerySolutionNode* node) {
             ceRes = indexIntersectionCard(static_cast<const AndSortedNode*>(node));
             break;
         case STAGE_OR:
-            // Notice that his is not a conjunction breaker because the result can be combined with
+            // Notice that this is not a conjunction breaker because the result can be combined with
             // the parent's node estimates. Thus indexUnionCard is responsible for replacing the
             // selectivities of the union's children with the selectivity of the union as a whole.
             ceRes = indexUnionCard(static_cast<const OrNode*>(node));
@@ -305,7 +323,7 @@ CEResult CardinalityEstimator::estimate(const MatchExpression* node, const bool 
     /**
      * Estimate via heuristic CE any leaf match expression. Notice that there are other such nodes
      * besides LeafMatchExpression subclasses. Heuristic CE doesn't estimate non-leaf nodes. This
-     * is done be the switch statement below.
+     * is done by the switch statement below.
      */
     bool useHeuristic = _ceMode == QueryCBRCEModeEnum::kHeuristicCE;
     if (useHeuristic && heuristicIsEstimable(node)) {
@@ -368,7 +386,12 @@ CEResult CardinalityEstimator::estimate(const MatchExpression* node, const bool 
                 estimate(static_cast<const InternalSchemaAllowedPropertiesMatchExpression*>(node));
             break;
         default:
-            MONGO_UNIMPLEMENTED_TASSERT(9586708);
+            // CBR does not know how to estimate this match expression type. Fall back to
+            // multi-planning.
+            return Status(ErrorCodes::UnsupportedCbrNode,
+                          str::stream() << "unsupported match expression type "
+                                        << static_cast<int>(node->matchType())
+                                        << " for CBR CE mode " << idlSerialize(_ceMode));
     }
 
     return ceRes;
@@ -1542,7 +1565,12 @@ void CardinalityEstimator::propagateLimit(const QuerySolutionNode* node, size_t 
         }
         case STAGE_PROJECTION_DEFAULT:
         case STAGE_PROJECTION_COVERED:
-        case STAGE_PROJECTION_SIMPLE: {
+        case STAGE_PROJECTION_SIMPLE:
+        // A shard filter is estimated as a pass-through on the basis that chunk migrations are rare
+        // and so effectively no documents are filtered out. The limit is therefore propagated
+        // through it unchanged, consistent with that estimate.
+        // TODO SERVER-132848: Move these passthrough stages to be with the FETCH node.
+        case STAGE_SHARDING_FILTER: {
             // passthrough
             applyLimitToSelf();
             propagateToChildren(limit);

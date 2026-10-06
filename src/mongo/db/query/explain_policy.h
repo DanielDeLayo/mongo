@@ -24,6 +24,8 @@ enum class ExplainSettings : uint32_t {
     kExecStats = 1u << 2,      // winning-plan execution statistics
     kAllPlansExecStats = 1u << 3,  // per-candidate all-plans multiplanning statistics
     kBytecode = 1u << 4,           // SBE virtual-machine bytecode of the winning plan
+    kCostBasedStats = 1u << 5,     // per-node cost-based ranker estimates (cost, cardinality, CE
+                                   // source)
 };
 
 constexpr ExplainSettings operator|(ExplainSettings a, ExplainSettings b) {
@@ -65,6 +67,13 @@ public:
     constexpr bool hasAllPlansStats() const {
         return has(ExplainSettings::kAllPlansExecStats);
     }
+    // Whether the cost-based ranker's per-node estimates should be present. Separate from
+    // hasAllPlansStats(): the two ranking-statistics families are computed independently (a plan
+    // can carry either, both, or neither), and the V3 plannerChoice mode excludes both while still
+    // showing every candidate's plan structure.
+    constexpr bool hasCostBasedStats() const {
+        return has(ExplainSettings::kCostBasedStats);
+    }
     // Whether the winning plan's SBE virtual-machine bytecode should be present.
     constexpr bool hasByteCode() const {
         return has(ExplainSettings::kBytecode);
@@ -102,14 +111,9 @@ private:
 ExplainPolicy explainPolicyFor(ExplainOptions::Verbosity v);
 
 /**
- * Maps a requested (possibly V3) verbosity to the nearest legacy verbosity. Used only by the
- * interim V3 explain hooks, which still delegate to the legacy generators; the mapping matches the
- * legacy verbosities the pre-refactor dispatch passed explicitly (planSummary / plannerChoice ->
- * queryPlanner, plannerStats -> execAllPlans, execStatsV3 -> execStats), and legacy verbosities map
- * to themselves.
- *
- * TODO SERVER-130529 (find path) / SERVER-130810 (aggregation path): remove this once the real V3
- * output format is produced directly instead of via legacy delegation.
+ * Maps a requested (possibly V3) verbosity to the nearest legacy verbosity (planSummary /
+ * plannerChoice -> queryPlanner, plannerStats -> execAllPlans, execStatsV3 -> execStats; legacy
+ * verbosities map to themselves).
  */
 ExplainOptions::Verbosity mapV3ToLegacyVerbosity(ExplainOptions::Verbosity v);
 

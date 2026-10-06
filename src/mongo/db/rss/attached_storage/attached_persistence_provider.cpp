@@ -85,6 +85,14 @@ bool AttachedPersistenceProvider::shouldUseReplicatedFastCount() const {
     return false;
 }
 
+bool AttachedPersistenceProvider::shouldUseContinuousInternodeValidation() const {
+    return false;
+}
+
+bool AttachedPersistenceProvider::relaxContainerOplogConstraints() const {
+    return true;
+}
+
 bool AttachedPersistenceProvider::shouldUseOplogWritesForFlowControlSampling() const {
     return true;
 }
@@ -117,6 +125,10 @@ bool AttachedPersistenceProvider::supportsPreservingPreparedTxnInPreciseCheckpoi
     return false;
 }
 
+bool AttachedPersistenceProvider::supportsVersionCursor() const {
+    return true;
+}
+
 bool AttachedPersistenceProvider::supportsTableLogging() const {
     return true;
 }
@@ -139,6 +151,10 @@ bool AttachedPersistenceProvider::supportsAsyncOplogMarkerGeneration() const {
 }
 
 bool AttachedPersistenceProvider::supportsOplogSampling() const {
+    return true;
+}
+
+bool AttachedPersistenceProvider::supportsOplogScanning() const {
     return true;
 }
 
@@ -165,6 +181,10 @@ multiversion::FeatureCompatibilityVersion AttachedPersistenceProvider::getMinimu
 
 const char* AttachedPersistenceProvider::getWTMemoryPageMaxForOplogStrValue() const {
     return "10m";  // 10MB
+}
+
+double AttachedPersistenceProvider::getMinOplogSizeMB() const {
+    return 990;
 }
 
 bool AttachedPersistenceProvider::supportsCompaction() const {
@@ -218,9 +238,21 @@ bool AttachedPersistenceProvider::supportsLegacyReplSetCommands() const {
     return true;
 }
 
+bool AttachedPersistenceProvider::supportsDBHashExternalCall() const {
+    return true;
+}
+
 std::unique_ptr<CheckpointSchedulePolicy>
 AttachedPersistenceProvider::makeCheckpointSchedulePolicy() const {
     return createFixedIntervalPolicy();
+}
+
+bool AttachedPersistenceProvider::supportsApplyOpsCommand() const {
+    return true;
+}
+
+bool AttachedPersistenceProvider::supportsGetDiagnosticDataExternalCall() const {
+    return true;
 }
 
 }  // namespace mongo::rss

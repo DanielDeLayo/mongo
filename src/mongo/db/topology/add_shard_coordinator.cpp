@@ -259,10 +259,9 @@ ExecutorFuture<void> AddShardCoordinator::_runImpl(
                 auto shardMembershipLock =
                     shardingCatalogManager.acquireShardMembershipLockForTopologyChange(opCtx);
 
-
                 ShardType shard;
-                shard.setHandle(
-                    ShardHandle(ShardId(std::string{*_doc.getChosenName()}), _doc.getShardUuid()));
+                shard.setName(std::string{*_doc.getChosenName()});
+                shard.setUuid(_doc.getShardUuid());
                 shard.setHost(targeter.connectionString().toString());
 
                 auto newTopologyTime = VectorClockMutable::get(opCtx)->tickClusterTime(1);
@@ -344,7 +343,7 @@ ExecutorFuture<void> AddShardCoordinator::_runImpl(
                 shardRegistry->reload(opCtx);
                 tassert(9870601,
                         "Shard not found in ShardRegistry after committing addShard",
-                        shardRegistry->getShard(opCtx, ShardRef(shard.getName())).isOK());
+                        shardRegistry->getShard(opCtx, shard.getName()).isOK());
 
                 topology_change_helpers::
                     hangAddShardBeforeUpdatingClusterCardinalityParameterFailpoint(opCtx);

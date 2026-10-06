@@ -31,6 +31,7 @@ mongo_cc_unit_test(
     target_compatible_with = OTEL_TARGET_COMPATIBLE_WITH,
     deps = [
         ":span_telemetry_context",
+        "//src/mongo/stdx",
     ],
 )
 
@@ -87,7 +88,6 @@ mongo_cc_library(
     deps = [
         ":span_name",
         "//src/mongo:base",
-        "//src/mongo/otel/traces/sampler",
     ],
 )
 

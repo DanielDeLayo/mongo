@@ -258,6 +258,9 @@ let testCases = {
     streams_writeCheckpoint: {skip: "internal command"},
     streams_sendEvent: {skip: "internal command"},
     streams_updateConnection: {skip: "internal command"},
+    streams_previewStream: {skip: "internal command"},
+    streams_getMorePreview: {skip: "internal command"},
+    streams_stopPreview: {skip: "internal command"},
     _transferMods: {skip: "internal command"},
     abortMoveCollection: {skip: "does not accept read or write concern"},
     abortReshardCollection: {skip: "does not accept read or write concern"},
@@ -307,7 +310,9 @@ let testCases = {
         command: {aggregate: coll, pipeline: [{$match: {x: 1}}, {$out: "out"}], cursor: {}},
         checkReadConcern: true,
         checkWriteConcern: true,
-        // TODO SERVER-119827: Remove this once the issue is fixed.
+        // An aggregation may fail with QueryPlanKilled if the targeted collection is created
+        // concurrently while the aggregation is running. This is expected behavior by design
+        // (see SERVER-119827).
         expectedErrors: [ErrorCodes.QueryPlanKilled],
     },
     analyze: {skip: "TODO SERVER-67772"},
@@ -351,6 +356,7 @@ let testCases = {
     checkShardingIndex: {skip: "does not accept read or write concern"},
     cleanupOrphaned: {skip: "only on shard server"},
     cleanupStructuredEncryptionData: {skip: "does not accept read or write concern"},
+    clearJoinPlanCache: {skip: "does not accept read or write concern"},
     clearJumboFlag: {skip: "does not accept read or write concern"},
     clearLog: {skip: "does not accept read or write concern"},
     clone: {skip: "deprecated"},
@@ -629,6 +635,7 @@ let testCases = {
     getESECMKIdentifierListStatus: {skip: "does not accept read or write concern"},
     getESERotateActiveKEKStatus: {skip: "does not accept read or write concern"},
     getLog: {skip: "does not accept read or write concern"},
+    getMetricsFilteringAllowlist: {skip: "does not accept read or write concern"},
     getMore: {skip: "does not accept read or write concern"},
     getParameter: {skip: "does not accept read or write concern"},
     getQueryableEncryptionCountInfo: {skip: "not profiled or logged"},
@@ -791,6 +798,14 @@ let testCases = {
         checkReadConcern: false,
         checkWriteConcern: true,
     },
+    repairReplicatedMetadata: {
+        command: {repairReplicatedMetadata: 1, uuid: UUID(), metadata: {}},
+        checkReadConcern: false,
+        checkWriteConcern: true,
+        target: "replset",
+        db: "admin",
+        useLogs: true,
+    },
     replicateSearchIndexCommand: {skip: "internal command"},
     replSetAbortPrimaryCatchUp: {skip: "does not accept read or write concern"},
     replSetFreeze: {skip: "does not accept read or write concern"},
@@ -922,7 +937,7 @@ let testCases = {
     stopTrafficRecording: {skip: "does not accept read or write concern"},
     stopTransitionToDedicatedConfigServer: {skip: "does not accept read or write concern"},
     sysprofile: {skip: "internal command"},
-    testCommandFeatureFlaggedOnLatestFCV83: {skip: "internal command"},
+    testCommandFeatureFlaggedOnLatestFCV91: {skip: "internal command"},
     testDeprecation: {skip: "does not accept read or write concern"},
     testDeprecationInVersion2: {skip: "does not accept read or write concern"},
     testInternalTransactions: {skip: "internal command"},
@@ -949,6 +964,7 @@ let testCases = {
         useLogs: true,
     },
     updateESECMKIdentifierList: {skip: "does not accept read or write concern"},
+    updateMetricsFilteringAllowlist: {skip: "does not accept read or write concern"},
     updateRole: {
         setUp: function (conn) {
             assert.commandWorked(
@@ -1062,14 +1078,27 @@ function checkLogEntryRWC(
 ) {
     // Some commands (e.g. bulkWrite, createRole) propagate the comment to inner write sub-ops,
     // which are also logged with the same comment but without a top-level writeConcern/readConcern
-    // in the log attr. Require those fields to be present so we skip inner-op entries and land on
-    // the outer command log entry.
+    // in the log attr. Slow in-progress query logs (SLOWPROG) can contain the same comment and a
+    // nested command.writeConcern before wait-for-WC has populated attr.writeConcern. Skip those
+    // in-progress entries unless applied attr.writeConcern.w is already present, and require the
+    // attr-level fields so we land on the completed outer command log otherwise.
     const logs = checkLog.getGlobalLog(checkConn);
     const logLine =
         logs?.find((l) => {
             if (!l.includes(targetId)) return false;
-            if (test.checkWriteConcern && !l.includes('"writeConcern"')) return false;
-            if (test.checkReadConcern && !l.includes('"readConcern"')) return false;
+            let entry;
+            try {
+                entry = JSON.parse(l);
+            } catch (e) {
+                return false;
+            }
+            const attr = entry.attr;
+            // Exclude Slow in-progress query unless it has already reported applied attr.writeConcern.w.
+            if (entry.msg === "Slow in-progress query" && attr?.writeConcern?.w === undefined) {
+                return false;
+            }
+            if (test.checkWriteConcern && attr?.writeConcern === undefined) return false;
+            if (test.checkReadConcern && attr?.readConcern === undefined) return false;
             return true;
         }) ?? null;
     assert(
@@ -1328,7 +1357,6 @@ function runScenario(
         // Run the command.
         let res = conn.getDB("db" in test ? test.db : db).runCommand(actualCmd);
 
-        // TODO SERVER-119827: Remove expectedErrors check once the issue is fixed.
         if (!test.expectedErrors) {
             assert.commandWorked(res);
         } else {

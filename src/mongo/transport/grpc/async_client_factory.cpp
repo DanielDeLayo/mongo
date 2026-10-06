@@ -64,7 +64,8 @@ SemiFuture<std::shared_ptr<GRPCAsyncClientFactory::AsyncClientHandle>> GRPCAsync
     const HostAndPort& target,
     transport::ConnectSSLMode sslMode,
     Milliseconds timeout,
-    const CancellationToken& token) {
+    const CancellationToken& token,
+    executor::ConnectionAcquisitionPurpose /*purpose*/) {
 
     return _get(false, target, sslMode, timeout, token).semi();
 }
@@ -198,7 +199,7 @@ Future<std::shared_ptr<GRPCAsyncClientFactory::AsyncClientHandle>> GRPCAsyncClie
                   connMetrics)
         .then([target, reactor = _reactor, svcCtx = _svcCtx](
                   std::shared_ptr<transport::Session> session) {
-            return std::make_shared<AsyncDBClient>(target, std::move(session), svcCtx, reactor);
+            return AsyncDBClient::create(target, std::move(session), svcCtx, reactor);
         })
         .tapError([target](Status s) {
             LOGV2_DEBUG(9936103,

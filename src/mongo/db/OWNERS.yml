@@ -65,6 +65,10 @@ filters:
   - "generic_argument_util.*":
     approvers:
       - 10gen/server-programmability
+  - "ifr_context_decoration.*":
+    approvers:
+      - 10gen/server-catalog-and-routing
+      - 10gen/query-execution
   - "ifr_flag_registry.yml":
     approvers:
       - 10gen/rollout-flag-managers
@@ -152,6 +156,9 @@ filters:
   - "*txn*":
     approvers:
       - 10gen/server-transactions
+  - "initialize_operation_session_info*":
+    approvers:
+      - 10gen/server-transactions
   - "dbdirectclient*":
     approvers:
       - 10gen/server-programmability
@@ -176,6 +183,9 @@ filters:
     approvers:
       - 10gen/server-security
   - "/keyfile_option*":
+    approvers:
+      - 10gen/server-security
+  - "landlock*":
     approvers:
       - 10gen/server-security
   - "server_options*":
@@ -376,3 +386,12 @@ filters:
     approvers:
       - 10gen/server-catalog-and-routing
       - 10gen/query-execution
+  - "metrics_filtering_util*":
+    approvers:
+      - 10gen/server-networking-and-observability
+  - "metrics_policy_manager*":
+    approvers:
+      - 10gen/server-networking-and-observability
+  - "metrics_category.idl":
+    approvers:
+      - 10gen/server-networking-and-observability

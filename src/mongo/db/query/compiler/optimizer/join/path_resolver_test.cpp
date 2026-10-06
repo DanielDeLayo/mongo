@@ -33,9 +33,32 @@ void testResolve(PathResolver& pr,
                  const NodeId expectedNode,
                  const DocumentSource* at = nullptr,
                  boost::optional<NodeId> nodeId = boost::none) {
-    auto pathId = pr.resolve(field, at, nodeId);
+    boost::optional<JoinFallbackReason> fallbackReason;
+    auto pathId = pr.resolve(field, at, nodeId, fallbackReason);
     validatePath(pathId, pr, expectedPath, expectedNode);
-    ASSERT_EQ(pr.resolve(field, at, nodeId), pathId);
+    ASSERT_FALSE(fallbackReason.has_value());
+    ASSERT_EQ(pr.resolve(field, at, nodeId, fallbackReason), pathId);
+    ASSERT_FALSE(fallbackReason.has_value());
+}
+
+// Like testResolve(), but additionally asserts that the resolved path tracks the given rename
+// (the field name as it appears after any renaming projections have been applied).
+void testResolveRename(PathResolver& pr,
+                       const FieldPath& field,
+                       const FieldPath& expectedPath,
+                       const NodeId expectedNode,
+                       const FieldPath& expectedRename,
+                       const DocumentSource* at = nullptr,
+                       boost::optional<NodeId> nodeId = boost::none) {
+    boost::optional<JoinFallbackReason> fallbackReason;
+    auto pathId = pr.resolve(field, at, nodeId, fallbackReason);
+    validatePath(pathId, pr, expectedPath, expectedNode);
+    ASSERT_FALSE(fallbackReason.has_value());
+    ASSERT_EQ(pr.resolve(field, at, nodeId, fallbackReason), pathId);
+    ASSERT_FALSE(fallbackReason.has_value());
+    const auto& path = pr.resolvedPaths()[*pathId];
+    ASSERT(path.fieldPathAfterRenames.has_value());
+    ASSERT_EQ(path.fieldPathAfterRenames->fullPath(), expectedRename.fullPath());
 }
 
 class PathResolverTest : public AggJoinModelFixture {
@@ -370,7 +393,10 @@ TEST_F(PathResolverTest, HandleSubpipelineProject) {
     testResolve(pr, "embed2.someOtherField2", "someOtherField2", 2, nullptr);
 
     // However, we will fail to resolve a field that was dropped by the sub-pipeline $project!
-    ASSERT_FALSE(pr.resolve("embed.someDroppedField", nullptr));
+    boost::optional<JoinFallbackReason> fallbackReason;
+    ASSERT_FALSE(pr.resolve("embed.someDroppedField", nullptr, boost::none, fallbackReason));
+    ASSERT_EQ(toStringData(*fallbackReason),
+              toStringData(JoinFallbackReason::kUnresolvableJoinPath));
 }
 
 TEST_F(PathResolverTest, PathValidation_NumericComponentOnBaseCollection) {
@@ -391,10 +417,13 @@ TEST_F(PathResolverTest, PathValidation_NumericComponentOnBaseCollection) {
     ASSERT_TRUE(pr.trackEmbedPath(*lookup, kForeignNode));
 
     // A path with a purely numeric component at any position is rejected.
-    ASSERT_FALSE(pr.resolve("a.0", dsLookup));
-    ASSERT_FALSE(pr.resolve("0.a", dsLookup));
-    ASSERT_FALSE(pr.resolve("a.0.b", dsLookup));
-    ASSERT_FALSE(pr.resolve("0", dsLookup));
+    boost::optional<JoinFallbackReason> fallbackReason;
+    for (auto&& path : {"a.0", "0.a", "a.0.b", "0"}) {
+        fallbackReason = boost::none;
+        ASSERT_FALSE(pr.resolve(path, dsLookup, boost::none, fallbackReason));
+        ASSERT_EQ(toStringData(*fallbackReason),
+                  toStringData(JoinFallbackReason::kPredicateFieldNumericComponent));
+    }
 
     // Paths where a component merely starts or ends with digits are valid.
     testResolve(pr, "a0", "a0", kBaseNode, dsLookup);
@@ -419,9 +448,13 @@ TEST_F(PathResolverTest, PathValidation_NumericComponentOnEmbeddedPath) {
     ASSERT_TRUE(pr.trackEmbedPath(*lookup, kForeignNode));
 
     // Numeric component in the portion after the embed prefix is rejected.
-    ASSERT_FALSE(pr.resolve("embed.0", nullptr));
-    ASSERT_FALSE(pr.resolve("embed.0.b", nullptr));
-    ASSERT_FALSE(pr.resolve("embed.a.1", nullptr));
+    boost::optional<JoinFallbackReason> fallbackReason;
+    for (auto&& path : {"embed.0", "embed.0.b", "embed.a.1"}) {
+        fallbackReason = boost::none;
+        ASSERT_FALSE(pr.resolve(path, nullptr, boost::none, fallbackReason));
+        ASSERT_EQ(toStringData(*fallbackReason),
+                  toStringData(JoinFallbackReason::kPredicateFieldNumericComponent));
+    }
 
     // The embed prefix itself is never numeric (it is "embed"), so a non-numeric suffix is valid.
     testResolve(pr, "embed.ff", "ff", kForeignNode, nullptr);
@@ -446,7 +479,10 @@ TEST_F(PathResolverTest, PathValidation_ArrayPathOnForeignCollection) {
     ASSERT_TRUE(pr.trackEmbedPath(*lookup, kForeignNode));
 
     // "ff" is not marked as scalar, so it can be an array and cannot be used in a join predicate.
-    ASSERT_FALSE(pr.resolve("ff", nullptr, kForeignNode));
+    boost::optional<JoinFallbackReason> fallbackReason;
+    ASSERT_FALSE(pr.resolve("ff", nullptr, kForeignNode, fallbackReason));
+    ASSERT_EQ(toStringData(*fallbackReason),
+              toStringData(JoinFallbackReason::kPredicateFieldCouldBeArray));
 
     // "scalarField" is marked as scalar so it is valid as a join predicate field.
     testResolve(pr, "scalarField", "scalarField", kForeignNode, nullptr, kForeignNode);
@@ -472,7 +508,10 @@ TEST_F(PathResolverTest, PathValidation_ArrayPathOnBaseCollection) {
     ASSERT_TRUE(pr.trackEmbedPath(*lookup, kForeignNode));
 
     // "arrayField" can be an array on the base collection, so it is not a valid predicate path.
-    ASSERT_FALSE(pr.resolve("arrayField", dsLookup));
+    boost::optional<JoinFallbackReason> fallbackReason;
+    ASSERT_FALSE(pr.resolve("arrayField", dsLookup, boost::none, fallbackReason));
+    ASSERT_EQ(toStringData(*fallbackReason),
+              toStringData(JoinFallbackReason::kPredicateFieldCouldBeArray));
 
     // "lf" is not known to be an array so it resolves correctly.
     testResolve(pr, "lf", "lf", kBaseNode, dsLookup);
@@ -510,7 +549,10 @@ TEST_F(PathResolverTest, HandleMainPipelineProject) {
     testResolve(pr, "embed.bar", "bar", 1, nullptr);
 
     // Validate that we can't resolve a path dropped by the $project.
-    ASSERT_FALSE(pr.resolve("someOtherPath", nullptr));
+    boost::optional<JoinFallbackReason> fallbackReason;
+    ASSERT_FALSE(pr.resolve("someOtherPath", nullptr, boost::none, fallbackReason));
+    ASSERT_EQ(toStringData(*fallbackReason),
+              toStringData(JoinFallbackReason::kUnresolvableJoinPath));
 
     // Tracking second embed path fine.
     const auto* dsLookup2 = (++it)->get();
@@ -519,7 +561,118 @@ TEST_F(PathResolverTest, HandleMainPipelineProject) {
     ASSERT_TRUE(pr.trackEmbedPath(*lookup2, 2));
 
     // BUT we can't resolve the computed local field!
-    ASSERT_FALSE(pr.resolve("lf2", nullptr));
+    fallbackReason = boost::none;
+    ASSERT_FALSE(pr.resolve("lf2", nullptr, boost::none, fallbackReason));
+    ASSERT_EQ(toStringData(*fallbackReason),
+              toStringData(JoinFallbackReason::kUnresolvableJoinPath));
+}
+
+TEST_F(PathResolverTest, HandleMainPipelineConsecutiveProjectsSameField) {
+    // Rename a to r1 then to r2- note that this isn't yet supported by pushdown to CQ, so wouldn't
+    // actually participate in join reordering.
+    auto pipeline =
+        makeBasicTestPipeline("r2",
+                              "ff",
+                              "embed",
+                              "lf2",
+                              "ff2",
+                              "embed2",
+                              /* prefix */ R"({$project: {r1: "$a"}}, {$project: {r2: "$r1"}},)");
+    markFieldsAsScalar(*pipeline, {}, {{"foreign", {"ff"}}, {"foreign2", {"ff2"}}});
+    pipeline::dependency_graph::DependencyGraph dg(pipeline->getSources(),
+                                                   mainCollPathAlwaysScalar);
+    PathResolver pr(0, dg);
+
+    // The first $lookup is the third stage, after the two $project stages.
+    auto it = pipeline->getSources().begin();
+    std::advance(it, 2);
+    const auto* dsLookup = it->get();
+    const auto* lookup = dynamic_cast<const DocumentSourceLookUp*>(dsLookup);
+    ASSERT(lookup);
+    ASSERT_TRUE(pr.trackEmbedPath(*lookup, 1));
+
+    // Resolving the local field "r2" traces the two renames back to base field "a", and records
+    // "r2" as the field name after renames.
+    testResolveRename(pr, "r2", "a", 0, "r2", dsLookup);
+    testResolve(pr, "ff", "ff", 1, nullptr, 1);
+
+    // Tracking the second embed path is fine.
+    const auto* dsLookup2 = (++it)->get();
+    const auto* lookup2 = dynamic_cast<const DocumentSourceLookUp*>(dsLookup2);
+    ASSERT(lookup2);
+    ASSERT_TRUE(pr.trackEmbedPath(*lookup2, 2));
+
+    // The intermediate names "r1" and the now-dropped "a" no longer resolve on the post-project
+    // pipeline.
+    boost::optional<JoinFallbackReason> fallbackReason;
+    for (auto&& path : {"a", "r1"}) {
+        fallbackReason = boost::none;
+        ASSERT_FALSE(pr.resolve(path, dsLookup, boost::none, fallbackReason));
+        ASSERT_EQ(toStringData(*fallbackReason),
+                  toStringData(JoinFallbackReason::kUnresolvableJoinPath));
+    }
+}
+
+TEST_F(PathResolverTest, HandleMainPipelineConsecutiveProjectsDottedPath) {
+    // Same as above, but now with dotted paths.
+    auto pipeline = makeBasicTestPipeline(
+        "r2",
+        "ff",
+        "embed",
+        "lf2",
+        "ff2",
+        "embed2",
+        /* prefix */ R"({$project: {r1: "$a.b"}}, {$project: {"r2.c": "$r1"}},)");
+    markFieldsAsScalar(*pipeline, {"r2"}, {{"foreign", {"ff"}}, {"foreign2", {"ff2"}}});
+    pipeline::dependency_graph::DependencyGraph dg(pipeline->getSources(),
+                                                   mainCollPathAlwaysScalar);
+    PathResolver pr(0, dg);
+
+    // The first $lookup is the third stage, after the two $project stages.
+    auto it = pipeline->getSources().begin();
+    std::advance(it, 2);
+    const auto* dsLookup = it->get();
+    const auto* lookup = dynamic_cast<const DocumentSourceLookUp*>(dsLookup);
+    ASSERT(lookup);
+    ASSERT_TRUE(pr.trackEmbedPath(*lookup, 1));
+
+    // Resolving the local field "r2.c" traces the renames back to the dotted base path "a.b", and
+    // records "r2.c" as the field path after renames. Note that we must resolve "r2.c" (the field
+    // the second $project actually produces), not "r2": "r2" is a computed subdocument {c: <a.b>},
+    // not a plain rename, so it has no alias origin.
+    testResolveRename(pr, "r2.c", "a.b", 0, "r2.c", dsLookup);
+    testResolve(pr, "ff", "ff", 1, nullptr, 1);
+}
+
+TEST_F(PathResolverTest, HandleSubpipelineConsecutiveRenamesSameField) {
+    // Same as above, but now in a sub-pipeline.
+    auto pipeline = makeSubpipelineTestPipeline(
+        R"({aaa: "$lf"})",
+        R"([{$match: {$expr: ["$$aaa", "$ff"]}}, {$project: {renamedFF: "$ff"}}, {$project: {renamedFF2: "$renamedFF"}}])",
+        "embed",
+        "lf2",
+        "ff2",
+        "embed2");
+    markFieldsAsScalar(*pipeline, {}, {{"foreign", {"ff"}}, {"foreign2", {"ff2"}}});
+    pipeline::dependency_graph::DependencyGraph dg(pipeline->getSources(),
+                                                   mainCollPathAlwaysScalar);
+    PathResolver pr(0, dg);
+
+    auto it = pipeline->getSources().begin();
+    const auto* dsLookup = it->get();
+    const auto* lookup = dynamic_cast<const DocumentSourceLookUp*>(dsLookup);
+    ASSERT(lookup);
+    ASSERT_TRUE(pr.trackEmbedPath(*lookup, 1));
+
+    // The local field resolves normally to the base node.
+    testResolve(pr, "lf", "lf", 0, dsLookup);
+
+    // Resolving the foreign field "ff" (scoped to the foreign node, at the subpipeline $match)
+    // traces back to base field "ff", while tracking the final subpipeline rename "renamedFF2".
+    ASSERT(lookup->getSubPipeline());
+    auto subPipelineIt = lookup->getSubPipeline()->begin();
+    ASSERT_NE(subPipelineIt, lookup->getSubPipeline()->end());
+    testResolveRename(pr, "ff", "ff", 1, "renamedFF2", subPipelineIt->get(), 1);
 }
 
 }  // namespace mongo::join_ordering

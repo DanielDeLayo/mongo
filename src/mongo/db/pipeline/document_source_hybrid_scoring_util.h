@@ -110,7 +110,9 @@ bool isHybridSearchPipeline(const std::vector<BSONObj>& bsonPipeline);
  * to shards, serializes $_internalIsHybridSearch into the BSON. For a view the shards respond that
  * the view must be executed on the router, and the router retries with the fully-desugared pipeline
  * -- where the client is not internal. To keep this retry from tripping the assertion, $lookup and
- * $unionWith omit $_internalIsHybridSearch from their explain serialization.
+ * $unionWith omit $_internalIsHybridSearch from their explain serialization. Query shapes are also
+ * re-parsed by a non-internal client when read from $queryStats, so the flag is omitted when
+ * shapifying as well.
  */
 void validateIsHybridSearchNotSetByUser(boost::intrusive_ptr<ExpressionContext> expCtx,
                                         const BSONObj& spec);
@@ -118,8 +120,17 @@ void validateIsHybridSearchNotSetByUser(boost::intrusive_ptr<ExpressionContext> 
 /**
  * Validates that a given collection/view namespace is not a timeseries collection for hybrid
  * search.
+ * TODO SERVER-121094 Remove function once 9.0 becomes last LTS and the validation is done inside
+ * '$_internalHybridSearch' lite parsed document source.
  */
 void assertForeignCollectionIsNotTimeseries(const NamespaceString& nss,
+                                            const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+/**
+ * Throws if 'nss' is a search view (its definition begins with a mongot
+ * $search/$searchMeta/$vectorSearch stage) defined over a timeseries collection.
+ */
+void assertForeignSearchViewIsNotTimeseries(const NamespaceString& nss,
                                             const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
 // -----------------------------Helper String Manipulation Functions-----------------------------

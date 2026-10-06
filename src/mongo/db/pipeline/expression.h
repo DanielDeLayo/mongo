@@ -3,13 +3,6 @@
 
 #pragma once
 
-#include <boost/intrusive_ptr.hpp>
-#include <boost/none.hpp>
-#include <boost/optional.hpp>
-#include <boost/optional/optional.hpp>
-#include <boost/smart_ptr.hpp>
-#include <boost/smart_ptr/intrusive_ptr.hpp>
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
@@ -49,6 +42,14 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <boost/intrusive_ptr.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 namespace mongo {
 using namespace std::literals::string_view_literals;
@@ -752,6 +753,31 @@ public:
     }
 };
 
+class AccumulatorMin;
+class AccumulatorSum;
+class AccumulatorMax;
+class AccumulatorAvg;
+class AccumulatorStdDevPop;
+class AccumulatorStdDevSamp;
+class AccumulatorMergeObjects;
+
+template <typename AccumulatorState>
+inline constexpr bool isAccumulatorExpressionImplementedInSbe =
+    std::is_same_v<AccumulatorState, AccumulatorMergeObjects> ||
+    std::is_same_v<AccumulatorState, AccumulatorSum> ||
+    std::is_same_v<AccumulatorState, AccumulatorMin> ||
+    std::is_same_v<AccumulatorState, AccumulatorMax> ||
+    std::is_same_v<AccumulatorState, AccumulatorAvg> ||
+    std::is_same_v<AccumulatorState, AccumulatorStdDevPop> ||
+    std::is_same_v<AccumulatorState, AccumulatorStdDevSamp>;
+
+/**
+ * Returns whether 'featureFlagSbeAccumulatorExpressions' is enabled for the current operation. Read
+ * through the IFR context so that the value stays stable for the duration of the operation. Defined
+ * out-of-line to keep the feature flag definitions out of this header.
+ */
+bool isSbeAccumulatorExpressionEnabled(ExpressionContext* expCtx);
+
 /**
  * Used to make Accumulators available as Expressions, e.g., to make $sum available as an Expression
  * use "REGISTER_STABLE_EXPRESSION(sum, ExpressionAccumulator<AccumulatorSum>::parse);".
@@ -762,14 +788,14 @@ class ExpressionFromAccumulator
 public:
     explicit ExpressionFromAccumulator(ExpressionContext* const expCtx)
         : ExpressionVariadic<ExpressionFromAccumulator<AccumulatorState>>(expCtx) {
-        expCtx->capSbeCompatibility(SbeCompatibility::notCompatible);
+        expCtx->capSbeCompatibility(getSbeCompatibility(expCtx));
     }
 
     ExpressionFromAccumulator(ExpressionContext* const expCtx,
                               Expression::ExpressionVector&& children)
         : ExpressionVariadic<ExpressionFromAccumulator<AccumulatorState>>(expCtx,
                                                                           std::move(children)) {
-        expCtx->capSbeCompatibility(SbeCompatibility::notCompatible);
+        expCtx->capSbeCompatibility(getSbeCompatibility(expCtx));
     }
 
     Value evaluate(const Document& root,
@@ -804,6 +830,16 @@ public:
     boost::intrusive_ptr<Expression> clone(ExpressionContext& expCtx) const final {
         return make_intrusive<ExpressionFromAccumulator<AccumulatorState>>(
             &expCtx, this->cloneChildren(expCtx));
+    }
+
+private:
+    static SbeCompatibility getSbeCompatibility(ExpressionContext* const expCtx) {
+        if constexpr (isAccumulatorExpressionImplementedInSbe<AccumulatorState>) {
+            return isSbeAccumulatorExpressionEnabled(expCtx) ? SbeCompatibility::noRequirements
+                                                             : SbeCompatibility::requiresSbeFull;
+        } else {
+            return SbeCompatibility::notCompatible;
+        }
     }
 };
 
@@ -1124,6 +1160,13 @@ public:
         return make_intrusive<ExpressionArray>(expCtx, std::move(children));
     }
 
+    static boost::intrusive_ptr<Expression> parse(ExpressionContext* const expCtx,
+                                                  BSONElement bsonExpr,
+                                                  const VariablesParseState& vps) {
+        expCtx->checkAndIncrementMemoryIntensiveExprCount("$array"sv);
+        return ExpressionNaryBase<ExpressionArray>::parse(expCtx, bsonExpr, vps);
+    }
+
     [[nodiscard]] boost::intrusive_ptr<Expression> optimize() final;
     const char* getOpName() const final;
 
@@ -1438,6 +1481,13 @@ public:
 
     ExpressionConcatArrays(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionVariadic<ExpressionConcatArrays>(expCtx, std::move(children)) {}
+
+    static boost::intrusive_ptr<Expression> parse(ExpressionContext* const expCtx,
+                                                  BSONElement bsonExpr,
+                                                  const VariablesParseState& vps) {
+        expCtx->checkAndIncrementMemoryIntensiveExprCount(bsonExpr.fieldNameStringData());
+        return ExpressionNaryBase<ExpressionConcatArrays>::parse(expCtx, bsonExpr, vps);
+    }
 
     Value evaluate(const Document& root,
                    Variables* variables,
@@ -2867,12 +2917,6 @@ private:
      */
     static void _assertMetaFieldCompatibleWithStrictAPI(ExpressionContext* expCtx,
                                                         DocumentMetadataFields::MetaType type);
-    /**
-     * Asserts that 'featureFlagRankFusionFull' feature flag is enabled, if the
-     * requested metadata field requires it.
-     */
-    static void _assertMetaFieldCompatibleWithHybridScoringFeatureFlag(
-        ExpressionContext* expCtx, DocumentMetadataFields::MetaType type);
 
     /**
      * Asserts that the 'featureFlagStreams' is enabled, depending on the parsed meta type and
@@ -3245,6 +3289,13 @@ public:
 
     ExpressionRange(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionRangedArity<ExpressionRange, 2, 3>(expCtx, std::move(children)) {}
+
+    static boost::intrusive_ptr<Expression> parse(ExpressionContext* const expCtx,
+                                                  BSONElement bsonExpr,
+                                                  const VariablesParseState& vps) {
+        expCtx->checkAndIncrementMemoryIntensiveExprCount(bsonExpr.fieldNameStringData());
+        return ExpressionNaryBase<ExpressionRange>::parse(expCtx, bsonExpr, vps);
+    }
 
     Value evaluate(const Document& root,
                    Variables* variables,
@@ -3665,6 +3716,13 @@ public:
         }
     }
 
+    static boost::intrusive_ptr<Expression> parse(ExpressionContext* const expCtx,
+                                                  BSONElement bsonExpr,
+                                                  const VariablesParseState& vps) {
+        expCtx->checkAndIncrementMemoryIntensiveExprCount(bsonExpr.fieldNameStringData());
+        return ExpressionNaryBase<ExpressionSetUnion>::parse(expCtx, bsonExpr, vps);
+    }
+
     Value evaluate(const Document& root,
                    Variables* variables,
                    const EvaluationContext& ctx) const final;
@@ -3830,14 +3888,10 @@ public:
 class ExpressionSize final : public ExpressionFixedArity<ExpressionSize, 1> {
 public:
     explicit ExpressionSize(ExpressionContext* const expCtx)
-        : ExpressionFixedArity<ExpressionSize, 1>(expCtx) {
-        expCtx->capSbeCompatibility(SbeCompatibility::notCompatible);
-    }
+        : ExpressionFixedArity<ExpressionSize, 1>(expCtx) {}
 
     ExpressionSize(ExpressionContext* const expCtx, ExpressionVector&& children)
-        : ExpressionFixedArity<ExpressionSize, 1>(expCtx, std::move(children)) {
-        expCtx->capSbeCompatibility(SbeCompatibility::notCompatible);
-    }
+        : ExpressionFixedArity<ExpressionSize, 1>(expCtx, std::move(children)) {}
 
     Value evaluate(const Document& root,
                    Variables* variables,
@@ -4989,11 +5043,13 @@ public:
 
 class ExpressionZip final : public Expression {
 public:
+    using ExprRef = std::reference_wrapper<boost::intrusive_ptr<Expression>>;
+
     ExpressionZip(ExpressionContext* const expCtx,
                   bool useLongestLength,
                   ExpressionVector&& children,
-                  std::vector<std::reference_wrapper<boost::intrusive_ptr<Expression>>> inputs,
-                  std::vector<std::reference_wrapper<boost::intrusive_ptr<Expression>>> defaults)
+                  std::vector<ExprRef> inputs,
+                  boost::optional<ExprRef> defaults)
         : Expression(expCtx, std::move(children)),
           _useLongestLength(useLongestLength),
           _inputs(std::move(inputs)),
@@ -5026,35 +5082,35 @@ public:
         return _useLongestLength;
     }
 
-    const std::vector<std::reference_wrapper<boost::intrusive_ptr<Expression>>>& getInputs() const {
+    const std::vector<ExprRef>& getInputs() const {
         return _inputs;
     }
 
-    const std::vector<std::reference_wrapper<boost::intrusive_ptr<Expression>>>& getDefaults()
-        const {
+    const boost::optional<ExprRef>& getDefaults() const {
         return _defaults;
     }
 
     boost::intrusive_ptr<Expression> clone(ExpressionContext& expCtx) const final {
         ExpressionVector children = cloneChildren(expCtx);
-        std::vector<std::reference_wrapper<boost::intrusive_ptr<Expression>>> inputs;
-        std::vector<std::reference_wrapper<boost::intrusive_ptr<Expression>>> defaults;
+        const size_t numDefaultChildren = _defaults ? 1 : 0;
 
         tassert(3100301,
                 fmt::format("Input and default array sizes mismatch with children array, "
                             "input={}, defaults={}, children={}",
                             _inputs.size(),
-                            _defaults.size(),
+                            numDefaultChildren,
                             children.size()),
-                _inputs.size() + _defaults.size() == children.size());
+                _inputs.size() + numDefaultChildren == children.size());
 
+        std::vector<ExprRef> inputs;
         inputs.reserve(_inputs.size());
-        defaults.reserve(_defaults.size());
         for (size_t childIdx = 0; childIdx < _inputs.size(); ++childIdx) {
             inputs.push_back(children[childIdx]);
         }
-        for (size_t childIdx = _inputs.size(); childIdx < children.size(); ++childIdx) {
-            defaults.push_back(children[childIdx]);
+
+        boost::optional<ExprRef> defaults;
+        if (_defaults) {
+            defaults = ExprRef(children.back());
         }
 
         return make_intrusive<ExpressionZip>(&expCtx,
@@ -5065,9 +5121,21 @@ public:
     }
 
 private:
+    /**
+     * Validates a literal 'defaults' array: it must have one default per input. Any other
+     * defaults expression — including one that is (or constant-folds into) a non-array constant
+     * — is deliberately validated only at evaluation time. Such a query still records a query
+     * stats entry (it parses fine and fails lazily), and its representative shape collapses the
+     * constant into a fixed placeholder (e.g. {$const: {?: "?"}} or a fixed-length array) that
+     * must survive re-parsing — and re-optimizing, for stages like $setWindowFields that
+     * optimize their expressions at parse time — when $queryStats reshapifies the entry.
+     */
+    static void _validateZipDefaults(const boost::intrusive_ptr<Expression>& defaults,
+                                     size_t numInputs);
+
     bool _useLongestLength;
-    std::vector<std::reference_wrapper<boost::intrusive_ptr<Expression>>> _inputs;
-    std::vector<std::reference_wrapper<boost::intrusive_ptr<Expression>>> _defaults;
+    std::vector<ExprRef> _inputs;
+    boost::optional<ExprRef> _defaults;
 };
 
 enum class ConversionBase {

@@ -36,7 +36,6 @@
 #include "mongo/db/sharding_environment/client/shard.h"
 #include "mongo/db/sharding_environment/grid.h"
 #include "mongo/db/sharding_environment/shard_id.h"
-#include "mongo/db/sharding_environment/shard_ref.h"
 #include "mongo/db/sharding_environment/sharding_logging.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/db/topology/shard_registry.h"
@@ -211,11 +210,6 @@ void ShardingCatalogManager::commitMovePrimary(OperationContext* opCtx,
             fmt::format("Requested primary shard {} does not exist", toShardId.toString()),
             !toShardDoc.isEmpty());
 
-    const auto toShardEntry = uassertStatusOK(ShardType::fromBSON(toShardDoc));
-    uassert(ErrorCodes::ShardNotFound,
-            fmt::format("Requested primary shard {} is draining", toShardId.toString()),
-            !toShardEntry.getDraining());
-
     const auto currentTime = VectorClock::get(opCtx)->getTime();
     const auto validAfter = currentTime.clusterTime().asTimestamp();
 
@@ -300,7 +294,7 @@ void ShardingCatalogManager::commitMovePrimary(OperationContext* opCtx,
             updatesDone++;
 
             NamespacePlacementType placementInfo(
-                NamespaceString(dbName), validAfter, std::vector<mongo::ShardRef>{toShardId});
+                NamespaceString(dbName), validAfter, std::vector<mongo::ShardId>{toShardId});
 
             write_ops::InsertCommandRequest insertPlacementHistoryOp(
                 NamespaceString::kConfigsvrPlacementHistoryNamespace);
@@ -372,8 +366,6 @@ DatabaseType ShardingCatalogManager::commitCreateDatabase(OperationContext* opCt
         const auto now = VectorClock::get(opCtx)->getTime();
         const auto clusterTime = now.clusterTime().asTimestamp();
 
-        // TODO SERVER-127411: once featureFlagUniqueShardIdentifiers is enabled, pass a ShardRef
-        // with the shard's UUID here instead of the ShardId string.
         DatabaseType db(dbName, primaryShard, DatabaseVersion(UUID::gen(), clusterTime));
 
         LOGV2(21938, "Registering new database in sharding catalog", "db"_attr = db);
@@ -390,7 +382,7 @@ DatabaseType ShardingCatalogManager::commitCreateDatabase(OperationContext* opCt
                     NamespacePlacementType placementInfo(
                         NamespaceString(db.getDbName()),
                         db.getVersion().getTimestamp(),
-                        std::vector<mongo::ShardRef>{db.getPrimary()});
+                        std::vector<mongo::ShardId>{db.getPrimary()});
                     write_ops::InsertCommandRequest insertPlacementHistoryOp(
                         NamespaceString::kConfigsvrPlacementHistoryNamespace);
                     insertPlacementHistoryOp.setDocuments({placementInfo.toBSON()});

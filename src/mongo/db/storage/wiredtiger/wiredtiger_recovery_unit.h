@@ -89,6 +89,12 @@ public:
 
     Timestamp getCommitTimestamp() const override;
 
+    void setSchemaEpoch(uint64_t schemaEpoch) override;
+
+    boost::optional<uint64_t> getSchemaEpoch() const override {
+        return _schemaEpoch;
+    }
+
     void setDurableTimestamp(Timestamp timestamp) override;
 
     Timestamp getDurableTimestamp() const override;
@@ -158,18 +164,23 @@ public:
         return _readOnce;
     };
 
+    void setSizeStatsCursor(bool sizeStatsCursor) override {
+        _sizeStatsCursor = sizeStatsCursor;
+    };
+
+    bool getSizeStatsCursor() const override {
+        return _sizeStatsCursor;
+    };
+
     std::unique_ptr<StorageStats> computeOperationStatisticsSinceLastCall() override;
 
     void ignoreAllMultiTimestampConstraints() override {
         _multiTimestampConstraintTracker.ignoreAllMultiTimestampConstraints = true;
     }
 
-    void setCacheMaxWaitTimeout(Milliseconds) override;
+    void setOperationTimeout(Milliseconds) override;
 
-    void optOutOfCacheEviction() override {
-        // 1 is a magic number in WiredTiger that opts this thread out of all optional eviction.
-        setCacheMaxWaitTimeout(Milliseconds(1));
-    }
+    void optOutOfCacheEviction() override;
 
     size_t getCacheDirtyBytes() override;
 
@@ -203,9 +214,27 @@ public:
     void setOperationContext(OperationContext* opCtx) override;
 
     /**
+     * Graceful stepdown requires that table creations be published with an epoch less than the
+     * stepdown epoch if the call to create() happened before the stepdown epoch was set, and
+     * greater than the stepdown epoch if the call to create() happened after the stepdown epoch was
+     * set. Failing to do this makes publish() fail, which is a fatal error, so we need to be able
+     * to detect if a stepdown epoch was set in between create() and when we allocate a schema
+     * epoch, and roll back the operation if that happens.
+     */
+    enum class StepdownState {
+        // The table was created before a stepdown epoch was set. This includes the case where no
+        // stepdown ever happens (i.e. the common case). If there is a stepdown epoch at commit
+        // time, the table's schema epoch must be less than the stepdown epoch.
+        before,
+        // The table was created after a stepdown epoch was set. At commit time the table's
+        // schema epoch must be greater than the stepdown epoch.
+        after,
+    };
+
+    /**
      * Annotates that this RecoveryUnit has created a table.
      */
-    void onCreateTable(const char* uri);
+    void onCreateTable(const char* uri, StepdownState state);
 
 protected:
     boost::optional<Timestamp> _determineCommitTimestamp() const override;
@@ -221,11 +250,12 @@ private:
 
     void _abort();
     void _commit(boost::optional<Timestamp> commitTime);
-    void _commitAndPublishTables(WiredTigerKVEngineBase* kvEngine,
-                                 Timestamp commitTime,
-                                 bool needsAllDurablePin);
+    void _commitAndPublishTables(WiredTigerKVEngineBase* kvEngine, bool needsAllDurablePin);
+    void _setAndValidateTableTimestamps(boost::optional<Timestamp> commitTimestamp);
+    void _publishTables(boost::optional<uint64_t> schemaEpoch);
 
     void _ensureSession();
+    void _resetPerTransactionState();
     void _txnClose(bool commit);
     void _txnOpen();
 
@@ -293,8 +323,17 @@ private:
     // new optime, and thus always call oplogDiskLocRegister() on the record store.
     bool _orderedCommit = true;
 
+    // True if the WT transaction was already released due to commit_transaction failure.
+    // We track this to transition the RecoveryUnit to the correct state, to prevent trying to
+    // rollback the WT transaction that was already released.
+    bool _wtTransactionReleasedOnCommitFailure = false;
+
     // When 'true', data read from disk should not be kept in the storage engine cache.
     bool _readOnce = false;
+
+    // When 'true', cursors opened on this unit accumulate a per-b-tree size summary as they
+    // traverse (debug=(size_stats)).
+    bool _sizeStatsCursor = false;
 
     bool _readSourcePinned = false;
 
@@ -315,16 +354,25 @@ private:
     // this timestamp if they want to avoid missing any entries in the oplog that may not yet have
     // committed ('holes'). @see StorageOplogManager::getOplogReadTimestamp
     boost::optional<int64_t> _oplogVisibleTs = boost::none;
+    boost::optional<uint64_t> _schemaEpoch;
 
     WiredTigerStats _sessionStatsAfterLastOperation;
 
-    Milliseconds _cacheMaxWaitTimeout{0};
+    bool _ignoreCacheSize = false;
+    Milliseconds _operationTimeout{0};
 
     // Detects any attempt to reconfigure options used by an open transaction.
     OpenSnapshotOptions _optionsUsedToOpenSnapshot;
 
-    // Tracks the uris of the tables created under this recovery unit.
-    std::vector<std::string> _createdTables;
+    // Tracks the tables created under this recovery unit, each with the timestamp of the write
+    // that introduces it (the current timestamp at creation, or the commit timestamp set later).
+    // Null when the transaction never sets a timestamp.
+    struct CreatedTable {
+        std::string uri;
+        Timestamp timestamp;
+        StepdownState stepdownState;
+    };
+    std::vector<CreatedTable> _createdTables;
 };
 
 // Constructs a WiredTigerCursor::Params instance from the given params and returns it.

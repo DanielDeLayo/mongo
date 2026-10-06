@@ -182,7 +182,7 @@ protected:
             ChunkType chunk(uuid,
                             {skey.getKeyPattern().globalMin(), skey.getKeyPattern().globalMax()},
                             version,
-                            ShardRef{"0"});
+                            {"0"});
             chunk.setName(OID::gen());
             version.incMinor();
 
@@ -207,7 +207,7 @@ protected:
             ChunkType chunk(uuid,
                             {skey.getKeyPattern().globalMin(), skey.getKeyPattern().globalMax()},
                             version,
-                            ShardRef{"0"});
+                            {"0"});
             chunk.setName(OID::gen());
             version.incMinor();
 
@@ -263,7 +263,7 @@ protected:
     void verifyTempReshardingCollectionAndMetadata() {
         RecipientStateMachineExternalStateImpl externalState;
         externalState.ensureTempReshardingCollectionExistsWithIndexes(
-            operationContext(), kMetadata, kDefaultFetchTimestamp);
+            operationContext(), kMetadata, kDefaultFetchTimestamp, BSON("x" << 1));
 
         auto scopedCsr =
             CollectionShardingRuntime::acquireShared(operationContext(), kReshardingNss);

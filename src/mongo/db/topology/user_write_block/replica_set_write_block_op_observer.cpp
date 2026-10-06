@@ -52,7 +52,7 @@ void ReplicaSetWriteBlockOpObserver::onInserts(OperationContext* opCtx,
                                                std::vector<InsertStatement>::const_iterator first,
                                                std::vector<InsertStatement>::const_iterator last,
                                                const std::vector<RecordId>& recordIds,
-                                               std::vector<bool> fromMigrate,
+                                               const std::vector<bool>& fromMigrate,
                                                bool defaultFromMigrate,
                                                OpStateAccumulator* opAccumulator) {
     const auto nss = coll->ns();
@@ -106,9 +106,16 @@ void ReplicaSetWriteBlockOpObserver::onUpdate(OperationContext* opCtx,
                 OperationContext* opCtx, boost::optional<Timestamp>) {
                 auto* replicaSetWriteBlockState = ReplicaSetWriteBlockState::get(opCtx);
                 if (blockWrites) {
-                    replicaSetWriteBlockState->enableReplicaSetWriteBlocking(blockUserWritesReason);
-                } else {
-                    replicaSetWriteBlockState->disableReplicaSetWriteBlocking();
+                    // An allowDeletions-only update leaves write blocking active. Count the policy
+                    // change without re-entering enableReplicaSetWriteBlocking (which only bumps
+                    // on disabled->enabled).
+                    if (!replicaSetWriteBlockState->isReplicaSetWriteBlockingEnabled()) {
+                        replicaSetWriteBlockState->enableReplicaSetWriteBlocking(
+                            blockUserWritesReason);
+                    } else {
+                        replicaSetWriteBlockState->incrementReplicaSetWritesBlockCounter(
+                            blockUserWritesReason);
+                    }
                 }
                 if (blockDeletions) {
                     replicaSetWriteBlockState->enableReplicaSetDeletionsBlocking();
@@ -143,6 +150,15 @@ void ReplicaSetWriteBlockOpObserver::onDelete(OperationContext* opCtx,
     }
 }
 
+void ReplicaSetWriteBlockOpObserver::onReplicationRollback(OperationContext* opCtx,
+                                                           const RollbackObserverInfo& rbInfo) {
+    if (rbInfo.rollbackNamespaces.find(
+            NamespaceString::kReplicaSetWritesCriticalSectionsNamespace) !=
+        rbInfo.rollbackNamespaces.end()) {
+        UserWritesRecoverableCriticalSectionService::get(opCtx)
+            ->recoverReplicaSetWritesCriticalSection(opCtx);
+    }
+}
 
 void ReplicaSetWriteBlockOpObserver::onStartIndexBuild(OperationContext* opCtx,
                                                        const NamespaceString& nss,

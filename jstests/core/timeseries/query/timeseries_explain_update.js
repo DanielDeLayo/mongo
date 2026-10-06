@@ -2,6 +2,7 @@
  * Tests whether the explain works for a single update operation on a timeseries collection.
  *
  * @tags: [
+ *   uses_explain,
  *   # We need a timeseries collection.
  *   requires_timeseries,
  *   featureFlagTimeseriesUpdatesSupport,
@@ -22,7 +23,11 @@ import {
 } from "jstests/core/timeseries/libs/timeseries_writes_util.js";
 import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
-import {getExecutionStages, getPlanStage} from "jstests/libs/query/analyze_plan.js";
+import {
+    getExecutionStages,
+    getPlanStage,
+    getWinningPlanFromExplain,
+} from "jstests/libs/query/analyze_plan.js";
 
 const dateTime = ISODate("2021-07-12T16:00:00Z");
 
@@ -63,7 +68,7 @@ function testUpdateExplain({
     const innerUpdateCommand = {update: coll.getName(), updates: [singleUpdateOp]};
     const updateExplainPlanCommand = {explain: innerUpdateCommand, verbosity: "queryPlanner"};
     let explain = assert.commandWorked(testDB.runCommand(updateExplainPlanCommand));
-    const updateStage = getPlanStage(explain.queryPlanner.winningPlan, expectedUpdateStageName);
+    const updateStage = getPlanStage(getWinningPlanFromExplain(explain), expectedUpdateStageName);
     assert.neq(
         null,
         updateStage,
@@ -86,7 +91,7 @@ function testUpdateExplain({
             `TS_MODIFY residualFilter is wrong: ${tojson(updateStage)}`,
         );
     } else {
-        const collScanStage = getPlanStage(explain.queryPlanner.winningPlan, "COLLSCAN");
+        const collScanStage = getPlanStage(getWinningPlanFromExplain(explain), "COLLSCAN");
         assert.neq(null, collScanStage, `COLLSCAN stage not found in the plan: ${tojson(explain)}`);
         assert.eq(
             expectedBucketFilter,
@@ -96,7 +101,7 @@ function testUpdateExplain({
     }
 
     if (expectedUsedIndexName) {
-        const ixscanStage = getPlanStage(explain.queryPlanner.winningPlan, "IXSCAN");
+        const ixscanStage = getPlanStage(getWinningPlanFromExplain(explain), "IXSCAN");
         assert.eq(
             expectedUsedIndexName,
             ixscanStage.indexName,

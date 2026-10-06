@@ -71,6 +71,19 @@ public:
     bool shouldUseReplicatedFastCount() const override;
 
     /**
+     * Attached storage nodes own their physical state, so per-document validation hashes are not
+     * replicated on the oplog.
+     */
+    bool shouldUseContinuousInternodeValidation() const override;
+
+    /**
+     * Attached storage nodes own their physical container state, and initial sync cannot seed
+     * container contents for unreplicated namespaces (e.g. the oplog's own fast count entry), so
+     * container op application self-heals on state mismatches.
+     */
+    bool relaxContainerOplogConstraints() const override;
+
+    /**
      * Flow control is based on the rate of generation of oplog data and the ability of the
      * secondaries to keep the majority commit point relatively up-to-date.
      */
@@ -110,6 +123,11 @@ public:
     bool supportsPreservingPreparedTxnInPreciseCheckpoints() const override;
 
     /**
+     * We can support version cursors.
+     */
+    bool supportsVersionCursor() const override;
+
+    /**
      * We can support table logging.
      */
     bool supportsTableLogging() const override;
@@ -137,9 +155,10 @@ public:
     bool supportsAsyncOplogMarkerGeneration() const override;
 
     /*
-     * We can support oplog sampling.
+     * We can support scanning and sampling the oplog.
      */
     bool supportsOplogSampling() const override;
+    bool supportsOplogScanning() const override;
 
     bool supportsWriteConcernOptions(const WriteConcernOptions& writeConcernOptions) const override;
 
@@ -155,11 +174,15 @@ public:
      */
     multiversion::FeatureCompatibilityVersion getMinimumRequiredFCV() const override;
 
-
     /**
      * The default memory_page_max value to set on WT for the oplog in string format.
      */
     const char* getWTMemoryPageMaxForOplogStrValue() const override;
+
+    /**
+     * The lowest size the oplog collection can be resized to via replSetResizeOplog.
+     */
+    double getMinOplogSizeMB() const override;
 
     /**
      * We can support compaction.
@@ -226,10 +249,25 @@ public:
     bool supportsLegacyReplSetCommands() const override;
 
     /**
+     * Attached storage supports external usage of dbHash.
+     */
+    bool supportsDBHashExternalCall() const override;
+
+    /**
      * Returns a FixedIntervalPolicy that schedules checkpoints at a fixed interval controlled by
      * the syncdelay parameter.
      */
     std::unique_ptr<CheckpointSchedulePolicy> makeCheckpointSchedulePolicy() const override;
+
+    /**
+     * Attached storage supports the apply ops user-facing command.
+     */
+    bool supportsApplyOpsCommand() const override;
+
+    /**
+     * Attached storage supports external usage of getDiagnosticData.
+     */
+    bool supportsGetDiagnosticDataExternalCall() const override;
 };
 
 }  // namespace mongo::rss

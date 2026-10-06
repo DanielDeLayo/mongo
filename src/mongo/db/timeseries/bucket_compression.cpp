@@ -4,10 +4,6 @@
 
 #include "mongo/db/timeseries/bucket_compression.h"
 
-#include <boost/move/utility_core.hpp>
-#include <boost/none.hpp>
-#include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
@@ -32,6 +28,11 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
@@ -169,14 +170,19 @@ CompressionResult _compressBucket(const BSONObj& bucketDoc,
     {
         BSONObjBuilder control(builder.subobjStart(kBucketControlFieldName));
 
-        // Set the version to indicate that the bucket was compressed. Leave other control fields
-        // unchanged.
+        // Make 2 changes to control block:
+        // 1) Set the version to indicate that the bucket was compressed and sorted above.
+        // 2) Throw out an existing count if it was written by a user directly.
         bool versionSet = false;
         for (const auto& controlField : controlElement.Obj()) {
             if (controlField.fieldNameStringData() == kBucketControlVersionFieldName) {
                 control.append(kBucketControlVersionFieldName,
                                kTimeseriesControlCompressedSortedVersion);
                 versionSet = true;
+            } else if (MONGO_unlikely(controlField.fieldNameStringData() ==
+                                      kBucketControlCountFieldName)) {
+                // Ignore an invalid control.count that shouldn't exist on a v1 bucket.
+                // Write a correct value further down in this function.
             } else {
                 control.append(controlField);
             }

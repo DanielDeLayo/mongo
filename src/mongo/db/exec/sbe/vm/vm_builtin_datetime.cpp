@@ -176,19 +176,18 @@ value::TagValueMaybeOwned ByteCode::builtinDateFromStringNoThrow(ArityType arity
     }
 }
 
-value::TagValueMaybeOwned ByteCode::dateTrunc(value::TypeTags dateTag,
-                                              value::Value dateValue,
+value::TagValueMaybeOwned ByteCode::dateTrunc(value::TagValueView date,
                                               TimeUnit unit,
                                               int64_t binSize,
                                               TimeZone timezone,
                                               DayOfWeek startOfWeek) {
     // Get date.
-    if (!coercibleToDate(dateTag)) {
+    if (!coercibleToDate(date.tag)) {
         return value::TagValueMaybeOwned::nothing();
     }
-    auto date = getDate({dateTag, dateValue});
+    auto dateValue = getDate(date);
 
-    auto truncatedDate = truncateDate(date, unit, binSize, timezone, startOfWeek);
+    auto truncatedDate = truncateDate(dateValue, unit, binSize, timezone, startOfWeek);
     return value::TagValueMaybeOwned::date(truncatedDate.toMillisSinceEpoch());
 }
 
@@ -242,7 +241,7 @@ value::TagValueMaybeOwned ByteCode::builtinDateToParts(ArityType arity) {
 
     // Get date parts.
     auto dateParts = timezone.dateParts(date);
-    value::TagValueOwned result{value::makeNewObject()};
+    value::TagValueOwned result = value::TagValueOwned::fromRaw(value::makeNewObject());
     auto dateObj = value::getObjectView(result.value());
     dateObj->reserve(7);
     dateObj->push_back_raw("year", value::TypeTags::NumberInt32, dateParts.year);
@@ -282,7 +281,7 @@ value::TagValueMaybeOwned ByteCode::builtinIsoDateToParts(ArityType arity) {
 
     // Get date parts.
     auto dateParts = timezone.dateIso8601Parts(date);
-    value::TagValueOwned result{value::makeNewObject()};
+    value::TagValueOwned result = value::TagValueOwned::fromRaw(value::makeNewObject());
     auto dateObj = value::getObjectView(result.value());
     dateObj->reserve(7);
     dateObj->push_back_raw("isoWeekYear", value::TypeTags::NumberInt32, dateParts.year);
@@ -633,7 +632,7 @@ value::TagValueMaybeOwned ByteCode::builtinDateTrunc(ArityType arity) {
     // Get date.
     auto dateView = viewFromStack(1);
 
-    return dateTrunc(dateView.tag, dateView.value, unit, binSize, timezone, startOfWeek);
+    return dateTrunc(dateView, unit, binSize, timezone, startOfWeek);
 }
 
 
@@ -772,7 +771,7 @@ bool ByteCode::validateDateAddParameters(TimeUnit* unit, int64_t* amount, TimeZo
     if (!value::isString(unitView.tag)) {
         return false;
     }
-    std::string unitStr{value::getStringView(unitView.tag, unitView.value)};
+    std::string_view unitStr = value::getStringView(unitView.tag, unitView.value);
     if (!isValidTimeUnit(unitStr)) {
         return false;
     }

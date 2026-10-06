@@ -129,7 +129,7 @@ auto& multiPlannerAllPlansHitMemoryLimitTotal =
 
 /**
  * Aggregation of the total number of times multiplanning chose the winning plan. With the
- * introduction of automaticCE mode, this may differ from the number of times multiplanning is
+ * introduction of the mixed plan ranker, this may differ from the number of times multiplanning is
  * invoked.
  */
 auto& multiPlannerChoseWinningPlan =
@@ -336,9 +336,29 @@ Status MultiPlanStage::runTrials(PlanYieldPolicy* yieldPolicy,
             multiPlannerHitWorksLimitTotal.incrementRelaxed();
         }
 
+        // The condition for candidates that met no early-exit condition of their own. 'moreToDo'
+        // distinguishes the two reasons the works loop above can end: still true means it ran to
+        // the per-plan budget, false means some candidate exited early and stopped the trial for
+        // everyone, leaving the rest with budget to spare. This is the same discriminator the
+        // 'multiPlannerHitWorksLimitTotal' counter uses.
+        const auto noEarlyExitCondition = moreToDo ? MultiPlannerStopCondition::kExhaustedBudget
+                                                   : MultiPlannerStopCondition::kTrialEndedEarly;
+
         size_t numDocsFound = 0;
-        for (const auto& candidate : _candidates) {
+        for (auto& candidate : _candidates) {
             numDocsFound += candidate.results.size();
+            // Every candidate has now run a trial, so each one has a stop condition. A candidate
+            // that did exit early keeps the reason recorded by workAllPlans(). In the capped
+            // trial flow this may set a no-early-exit condition for a candidate that a
+            // later trial phase resumes and exits early - that phase overwrites it with the real
+            // reason. A candidate that failed in a recoverable fashion already recorded kFailed at
+            // the moment it failed - its trial was ended by the failure, not by any of the trial's
+            // own bounds - so the status check preserves that reason rather than overwriting it.
+            // TODO SERVER-133123 Reconsider the override logic for when a candidate is resumed
+            // after the initial capped trial, where the stopCondition is potentially already set.
+            if (!candidate.exitedEarly && candidate.status.isOK()) {
+                candidate.stopCondition = noEarlyExitCondition;
+            }
         }
 
         _specificStats.totalWorks += totalWorks;
@@ -473,8 +493,7 @@ Status MultiPlanStage::pickBestPlan() {
 
     // Increment the server status metric when MP genuinely chose the winner. Skip for CBR-chosen
     // plans (where MP is only used for plan-cache hydration) and for branch planners.
-    // Note: planRankerMethod is recorded by the plan ranking strategy or runtime planner at the
-    // point where it is known that MP selected the winner, not here.
+    // Note: planSelectionStrategy is decided by the plan ranking strategy, not here.
     if (!_shouldNotCollectMetrics && !_isBranchPlanner) {
         multiPlannerChoseWinningPlan.increment();
     }
@@ -505,6 +524,11 @@ bool MultiPlanStage::workAllPlans(size_t numResults, PlanYieldPolicy* yieldPolic
             // as a whole only fails if _all_ candidates hit their resource consumption limit, or if
             // a different, query-fatal error code is thrown.
             candidate.status = ex.toStatus();
+            // The failure is what ended this candidate's trial. Recording it keeps every candidate
+            // that ran a trial reporting a stop condition: a failed candidate is ranked out but
+            // still displayed among the rejected plans, carrying the counters it accumulated
+            // before failing.
+            candidate.stopCondition = MultiPlannerStopCondition::kFailed;
             ++_failureCount;
 
             // If all children have failed, then rethrow. Otherwise, swallow the error and move onto
@@ -528,8 +552,13 @@ bool MultiPlanStage::workAllPlans(size_t numResults, PlanYieldPolicy* yieldPolic
             candidate.results.push_back(id);
 
             // Once a plan returns enough results, stop working.
-            if (candidate.results.size() >= numResults || candidate.root->isEOF()) {
+            const bool isEof = candidate.root->isEOF();
+            if (candidate.results.size() >= numResults || isEof) {
                 candidate.exitedEarly = true;
+                // Reaching EOF on the same work() call that produced a result is an EOF exit, even
+                // when the result also completed the batch: the plan is out of results either way.
+                candidate.stopCondition =
+                    isEof ? MultiPlannerStopCondition::kEof : MultiPlannerStopCondition::kFullBatch;
                 doneWorking = true;
 
                 if (!_shouldNotCollectMetrics) {
@@ -541,6 +570,7 @@ bool MultiPlanStage::workAllPlans(size_t numResults, PlanYieldPolicy* yieldPolic
             // Assumes that the ranking will pick this plan.
             doneWorking = true;
             candidate.exitedEarly = true;
+            candidate.stopCondition = MultiPlannerStopCondition::kEof;
 
             if (!_shouldNotCollectMetrics) {
                 multiPlannerHitEofTotal.incrementRelaxed();
@@ -637,13 +667,20 @@ bool MultiPlanStage::hasBackupPlan() const {
         planExplainerData.multiPlannerWinningPlanTrialStats =
             _candidates[_bestPlanIdx].root->getStats();
         planExplainerData.multiPlannerWinningPlanScore = getCandidateScore(_bestPlanIdx);
+        planExplainerData.multiPlannerWinningPlanStopCondition =
+            _candidates[_bestPlanIdx].stopCondition;
     }
 
     for (size_t i = 0; i < _rejected.size(); ++i) {
-        planExplainerData.rejectedPlansWithStages.push_back(
-            // Rejected plans are reordered after the non-rejected plans in the _candidates vector.
-            // See _candidates and _rejected.
-            {std::move(_candidates[i + _children.size()].solution), std::move(_rejected[i])});
+        // Rejected plans are reordered after the non-rejected plans in the _candidates vector.
+        // See _candidates and _rejected. These stage trees ran a multi-planning trial, so
+        // their counters are trial statistics ('ranTrial').
+        auto& candidate = _candidates[i + _children.size()];
+        planExplainerData.rejectedPlansWithStages.push_back({std::move(candidate.solution),
+                                                             std::move(_rejected[i]),
+                                                             /*ranTrial*/ true,
+                                                             candidate.adjustedScore,
+                                                             candidate.stopCondition});
     }
     _rejected.clear();
     return planExplainerData;

@@ -20,14 +20,11 @@
 #include <utility>
 #include <vector>
 
-#include <fmt/format.h>
-
-// IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
 #include <boost/filesystem/directory.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
 #include <boost/iterator/iterator_facade.hpp>
-// IWYU pragma: no_include "boost/system/detail/error_code.hpp"
+#include <fmt/format.h>
 
 #ifdef _WIN32
 #include <io.h>
@@ -67,6 +64,8 @@
 #include "mongo/util/text.h"          // IWYU pragma: keep
 #include "mongo/util/time_support.h"
 #include "mongo/util/version/releases.h"
+// IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
+// IWYU pragma: no_include "boost/system/detail/error_code.hpp"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
@@ -518,7 +517,7 @@ int getSignal(const BSONObj& a) {
 }
 
 BSONObj getStopMongodOpts(const BSONObj& a) {
-    if (a.nFields() == 3) {
+    if (a.nFields() >= 3) {
         BSONObjIterator i(a);
         i.next();
         i.next();
@@ -560,13 +559,14 @@ BSONObj StopMongoProgram(const BSONObj& a, void* data) {
     return BSON("" << (double)code);
 }
 
+/** stopMongoProgramByPid(pid[, signal[, opts[, waitPid]]]) */
 BSONObj StopMongoProgramByPid(const BSONObj& a, void* data) {
     int nFields = a.nFields();
-    uassert(ErrorCodes::FailedToParse, "wrong number of arguments", nFields >= 1 && nFields <= 3);
+    uassert(ErrorCodes::FailedToParse, "wrong number of arguments", nFields >= 1 && nFields <= 4);
     uassert(
         ErrorCodes::BadValue, "stopMongoProgramByPid needs a number", a.firstElement().isNumber());
     ProcessId pid = ProcessId::fromNative(int(a.firstElement().number()));
-    int code = killDb(0, pid, getSignal(a), getStopMongodOpts(a));
+    int code = killDb(0, pid, getSignal(a), getStopMongodOpts(a), getWaitPid(a));
     LOGV2_INFO(22822, "shell: Stopped mongo program with pid", "pid"_attr = pid);
     return BSON("" << (double)code);
 }

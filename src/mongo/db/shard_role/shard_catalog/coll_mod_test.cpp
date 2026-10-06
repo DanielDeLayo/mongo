@@ -475,8 +475,16 @@ public:
         return false;
     }
 
+    bool supportsOplogScanning() const override {
+        return true;
+    }
+
     bool supportsPersistentOplogCapMaintainerThread() const override {
         return true;
+    }
+
+    bool shouldUseReplicatedFastCount() const override {
+        return false;
     }
 };
 

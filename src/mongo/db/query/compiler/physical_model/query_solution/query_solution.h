@@ -4,14 +4,6 @@
 #pragma once
 
 
-#include <cstddef>
-#include <cstdint>
-
-#include <absl/container/flat_hash_map.h>
-#include <boost/none.hpp>
-#include <boost/optional/optional.hpp>
-#include <boost/smart_ptr/intrusive_ptr.hpp>
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
@@ -22,7 +14,6 @@
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/db/pipeline/window_function/window_function_statement.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/compiler/dependency_analysis/dependencies.h"
 #include "mongo/db/query/compiler/dependency_analysis/expression_dependencies.h"
@@ -38,12 +29,15 @@
 #include "mongo/db/query/plan_cache/classic_plan_cache.h"
 #include "mongo/db/query/plan_enumerator/plan_enumerator_explain_info.h"
 #include "mongo/db/query/record_id_bound.h"
+#include "mongo/db/query/record_id_range_list.h"
 #include "mongo/db/query/timeseries/bucket_spec.h"
 #include "mongo/db/shard_role/shard_catalog/clustered_collection_options_gen.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/modules.h"
 #include "mongo/util/str.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <iosfwd>
 #include <iterator>
 #include <memory>
@@ -52,6 +46,12 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <absl/container/flat_hash_map.h>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 namespace mongo {
 using namespace std::literals::string_view_literals;
@@ -520,6 +520,9 @@ public:
     PlanEnumeratorExplainInfo _enumeratorExplainInfo;
 
     // Score calculated by PlanRanker. Only present if there are multiple candidate plans.
+    // TODO SERVER-131545 Refactor QuerySolution::score into BaseCandidatePlan: a score is a
+    // property of a candidacy, not of the plan, and belongs next to
+    // BaseCandidatePlan::adjustedScore as one per-candidate scores record.
     boost::optional<double> score;
 
     // Used for populating the 'isCached' field in explain when the query is not parameterized.
@@ -565,12 +568,12 @@ struct CollectionScanNode : public QuerySolutionNodeWithSortSet {
 
     // Tells whether this scan will be performed as a clustered collection scan in SBE.
     bool doClusteredCollectionScanSbe() const {
-        return (isClustered && !isOplog && (minRecord || maxRecord || resumeScanPoint));
+        return (isClustered && !isOplog && (!rangeList.isUnbounded() || resumeScanPoint));
     }
 
     // Tells whether this scan will be performed as a clustered collection scan in classic.
     bool doClusteredCollectionScanClassic() const {
-        return (isClustered && !isOplog && (minRecord || maxRecord));
+        return (isClustered && !isOplog && !rangeList.isUnbounded());
     }
 
     void markNotEligibleForPlanCache() {
@@ -582,13 +585,9 @@ struct CollectionScanNode : public QuerySolutionNodeWithSortSet {
     // Name of the namespace.
     NamespaceString nss;
 
-    // If present, this parameter sets the start point of a forward scan or the end point of a
-    // reverse scan.
-    boost::optional<RecordIdBound> minRecord;
-
-    // If present, this parameter sets the start point of a reverse scan or the end point of a
-    // forward scan.
-    boost::optional<RecordIdBound> maxRecord;
+    // The set of RecordId ranges to scan. Default-constructed as unbounded (all records).
+    // For clustered non-oplog scans this encodes the planner-derived bounds.
+    RecordIdRangeList rangeList;
 
     // If present, this parameter denotes the clustering info on the collection
     boost::optional<ClusteredIndexSpec> clusteredIndex;
@@ -606,7 +605,7 @@ struct CollectionScanNode : public QuerySolutionNodeWithSortSet {
     // - If 'tolerateKeyNotFound' is true, and if the RecordId does not exist, it will seek to the
     // next valid one.
     // This field must only be set on forward collection scans and cannot be used in conjunction
-    // with 'minRecord' or 'maxRecord'.
+    // with 'rangeList' bounds.
     boost::optional<ResumeScanPoint> resumeScanPoint;
 
     // Should we make a tailable cursor?
@@ -628,10 +627,6 @@ struct CollectionScanNode : public QuerySolutionNodeWithSortSet {
 
     // Tells whether the collection is an oplog.
     bool isOplog = false;
-
-    // By default, includes the minRecord and maxRecord when present.
-    CollectionScanParams::ScanBoundInclusion boundInclusion =
-        CollectionScanParams::ScanBoundInclusion::kIncludeBothStartAndEndRecords;
 
     // Whether or not to wait for oplog visibility on oplog collection scans.
     bool shouldWaitForOplogVisibility = false;
@@ -1405,6 +1400,12 @@ struct GeoNear2DNode : public QuerySolutionNodeWithSortSet {
     IndexEntry index;
     bool addPointMeta;
     bool addDistMeta;
+
+    // Residual predicate to evaluate on the fetched document inside the stage, after the distance
+    // check and before BSON ownership and the distance sorter. Unlike 'filter' -- which
+    // GeoNear2DStage applies to the index KEY -- this may reference fields that are not in the
+    // index key pattern.
+    std::unique_ptr<MatchExpression> residualFilter;
 };
 
 struct GeoNear2DSphereNode : public QuerySolutionNodeWithSortSet {
@@ -1443,6 +1444,12 @@ struct GeoNear2DSphereNode : public QuerySolutionNodeWithSortSet {
     IndexEntry index;
     bool addPointMeta;
     bool addDistMeta;
+
+    // Residual predicate to evaluate on the fetched document inside the stage, after the distance
+    // check and before BSON ownership and the distance sorter. This predicate is evaluated against
+    // the fetched document, so it may reference fields that are not part of the geo index key
+    // pattern.
+    std::unique_ptr<MatchExpression> residualFilter;
 };
 
 //
@@ -1558,6 +1565,10 @@ struct DistinctNode : public QuerySolutionNodeWithSortSet {
 
     bool isShardFiltering = false;
     bool isFetching = false;
+
+    // Indicates that the distinct field may be multikey and the scan should proceed as if iterating
+    // over the sorted list of values that would result from unwinding the distinct field.
+    bool unwindsArrays = false;
 };
 
 /**
@@ -1927,7 +1938,7 @@ struct EqLookupNode : public QuerySolutionNode {
      * Only meaningful when 'lookupStrategy' is kDynamicIndexedLoopJoin. True if the chosen index
      * has a collation compatible with the query (no run-time type check needed for collation).
      * False if the collation is incompatible and the type check is required. (The other reason for
-     * DILJ -- a sparse index -- is derived at lowering directly from the index's 'sparse' flag.)
+     * DILJ - a sparse index - is derived at lowering directly from the index's 'sparse' flag.)
      */
     bool collationCompatibleForDilj = true;
 
@@ -2024,9 +2035,8 @@ struct SearchNode : public QuerySolutionNode {
     const BSONObj searchQuery;
 
     /**
-     * This will populate the docsRequested field of the cursorOptions document sent as part of the
-     * command to mongot in the case where the query has an extractable limit that can guide the
-     * number of documents that mongot returns to mongod.
+     * The extractable limit from the user pipeline, if any. Used to feed the 'searchLimit' slot
+     * for SBE limit pushdown/parameterization.
      */
     boost::optional<long long> limit;
 
@@ -2107,66 +2117,6 @@ struct UnpackTsBucketNode : public QuerySolutionNode {
     std::unique_ptr<MatchExpression> eventFilter = nullptr;
     std::unique_ptr<MatchExpression> wholeBucketFilter = nullptr;
     bool includeMeta = false;
-};
-
-struct WindowNode : public QuerySolutionNode {
-    WindowNode(std::unique_ptr<QuerySolutionNode> child,
-               boost::optional<boost::intrusive_ptr<Expression>> partitionByArg,
-               boost::optional<SortPattern> sortByArg,
-               std::vector<WindowFunctionStatement> outputFieldsArg)
-        : QuerySolutionNode(std::move(child)),
-          partitionBy(std::move(partitionByArg)),
-          sortBy(std::move(sortByArg)),
-          outputFields(std::move(outputFieldsArg)) {
-        DepsTracker partitionByDeps;
-        if (partitionBy) {
-            expression::addDependencies(partitionBy->get(), &partitionByDeps);
-        }
-        partitionByRequiredFields = std::move(partitionByDeps.fields);
-
-        DepsTracker sortByDeps;
-        if (sortBy) {
-            sortBy->addDependencies(&sortByDeps);
-        }
-        sortByRequiredFields = std::move(sortByDeps.fields);
-
-        DepsTracker outputDeps;
-        for (auto& outputField : outputFields) {
-            outputField.addDependencies(&outputDeps);
-        }
-        outputRequiredFields = std::move(outputDeps.fields);
-    }
-
-    StageType getType() const override {
-        return STAGE_WINDOW;
-    }
-
-    void appendToString(str::stream* ss, int indent) const override;
-
-    bool fetched() const override {
-        return true;
-    }
-
-    FieldAvailability getFieldAvailability(const std::string& field) const override {
-        return FieldAvailability::kFullyProvided;
-    }
-    bool sortedByDiskLoc() const override {
-        return false;
-    }
-
-    const ProvidedSortSet& providedSorts() const final {
-        return children.back()->providedSorts();
-    }
-
-    std::unique_ptr<QuerySolutionNode> clone() const final;
-
-    boost::optional<boost::intrusive_ptr<Expression>> partitionBy;
-    boost::optional<SortPattern> sortBy;
-    std::vector<WindowFunctionStatement> outputFields;
-
-    OrderedPathSet partitionByRequiredFields;
-    OrderedPathSet sortByRequiredFields;
-    OrderedPathSet outputRequiredFields;
 };
 
 /**
@@ -2354,5 +2304,11 @@ struct IndexProbeNode : public QuerySolutionNode {
     NamespaceString nss;
     IndexEntry index;
 };
+
+/**
+ * Returns the address of the 'residualFilter' member if 'node' is a $geoNear node, otherwise
+ * nullptr.
+ */
+std::unique_ptr<MatchExpression>* getGeoNearDocFilter(QuerySolutionNode& node);
 
 }  // namespace mongo

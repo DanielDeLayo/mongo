@@ -28,7 +28,7 @@
 #include "mongo/db/query/planner_ixselect.h"
 #include "mongo/db/query/query_execution_knobs_gen.h"
 #include "mongo/db/query/query_planner_params.h"
-#include "mongo/db/query/write_conflict_storm.h"
+#include "mongo/db/query/write_conflict_backoff.h"
 #include "mongo/db/query/write_ops/canonical_delete.h"
 #include "mongo/db/query/write_ops/canonical_update.h"
 #include "mongo/db/query/write_ops/delete_request_gen.h"
@@ -294,24 +294,19 @@ public:
 private:
     void readyPlanExecution(express::Ready,
                             size_t& numUnavailabilityYieldsSinceLastSuccess,
-                            size_t& numWriteConflictYieldsSinceLastSuccess,
-                            WCStormWaiterGuard& stormGuard);
+                            size_t& numWriteConflictYieldsSinceLastSuccess);
     void readyPlanExecution(express::WaitingForYield,
                             size_t& numUnavailabilityYieldsSinceLastSuccess,
-                            size_t& numWriteConflictYieldsSinceLastSuccess,
-                            WCStormWaiterGuard& stormGuard);
+                            size_t& numWriteConflictYieldsSinceLastSuccess);
     void readyPlanExecution(express::WaitingForBackoff,
                             size_t& numUnavailabilityYieldsSinceLastSuccess,
-                            size_t& numWriteConflictYieldsSinceLastSuccess,
-                            WCStormWaiterGuard& stormGuard);
+                            size_t& numWriteConflictYieldsSinceLastSuccess);
     void readyPlanExecution(express::WaitingForCondition result,
                             size_t& numUnavailabilityYieldsSinceLastSuccess,
-                            size_t& numWriteConflictYieldsSinceLastSuccess,
-                            WCStormWaiterGuard& stormGuard);
+                            size_t& numWriteConflictYieldsSinceLastSuccess);
     void readyPlanExecution(express::Exhausted,
                             size_t& numUnavailabilityYieldsSinceLastSuccess,
-                            size_t& numWriteConflictYieldsSinceLastSuccess,
-                            WCStormWaiterGuard& stormGuard);
+                            size_t& numWriteConflictYieldsSinceLastSuccess);
 
     OperationContext* _opCtx;
     std::unique_ptr<CanonicalQuery> _cq;
@@ -374,7 +369,6 @@ PlanExecutor::ExecState PlanExecutorExpress<Plan>::getNext(BSONObj* out, RecordI
 
         size_t numUnavailabilityYieldsSinceLastSuccess = 0;
         size_t numWriteConflictYieldsSinceLastSuccess = 0;
-        WCStormWaiterGuard stormGuard;
 
         checkFailPointPlanExecAlwaysFails(nss());
 
@@ -401,8 +395,7 @@ PlanExecutor::ExecState PlanExecutorExpress<Plan>::getNext(BSONObj* out, RecordI
                 [&, this](auto result) {
                     this->readyPlanExecution(std::move(result),
                                              numUnavailabilityYieldsSinceLastSuccess,
-                                             numWriteConflictYieldsSinceLastSuccess,
-                                             stormGuard);
+                                             numWriteConflictYieldsSinceLastSuccess);
                 },
                 std::move(progress));
         }
@@ -420,51 +413,39 @@ PlanExecutor::ExecState PlanExecutorExpress<Plan>::getNext(BSONObj* out, RecordI
 template <class Plan>
 void PlanExecutorExpress<Plan>::readyPlanExecution(express::Ready,
                                                    size_t& numUnavailabilityYieldsSinceLastSuccess,
-                                                   size_t& numWriteConflictYieldsSinceLastSuccess,
-                                                   WCStormWaiterGuard& stormGuard) {
+                                                   size_t& numWriteConflictYieldsSinceLastSuccess) {
     // Born ready B).
     numUnavailabilityYieldsSinceLastSuccess = 0;
     numWriteConflictYieldsSinceLastSuccess = 0;
-    stormGuard.release();
 }
 
 template <class Plan>
 void PlanExecutorExpress<Plan>::readyPlanExecution(express::WaitingForYield,
                                                    size_t& numUnavailabilityYieldsSinceLastSuccess,
-                                                   size_t& numWriteConflictYieldsSinceLastSuccess,
-                                                   WCStormWaiterGuard& stormGuard) {
+                                                   size_t& numWriteConflictYieldsSinceLastSuccess) {
     // No increasing write conflict metric as it was already increased before this point
     // in ExceptionRecoveryPolicy::recoverFromNonFatalWriteException
     auto writeConflictsInARow = ++numWriteConflictYieldsSinceLastSuccess;
 
-    // Check storm circuit breaker while still holding the ticket. Throws
-    // WriteConflictRetryLimitExceeded if the per-op retry cap is exceeded.
-    checkWriteConflictStorm(_opCtx, stormGuard, writeConflictsInARow);
-
     // When release-ticket backoff is enabled, we yield the ticket before sleeping so other
-    // writers can make progress. However, after
-    // 'gInternalQueryWriteConflictBackoffMaxReleaseTicketCycles' consecutive conflicts we fall back
-    // to sleeping while holding the ticket. Holding the ticket throttles concurrent writers from
-    // entering the conflict zone, which helps break a write-conflict storm.
-    const bool releaseTicketEnabled = internalQueryEnableWriteConflictBackoffWithoutTicket.load();
-    const bool fallbackToHoldTicket = releaseTicketEnabled &&
-        static_cast<int64_t>(writeConflictsInARow) >
-            gInternalQueryWriteConflictBackoffMaxReleaseTicketCycles.load();
-
-    if (releaseTicketEnabled && !fallbackToHoldTicket) {
+    // writers can make progress.
+    if (internalQueryEnableWriteConflictBackoffWithoutTicket.load()) {
         _plan.temporarilyReleaseResourcesAndYield(_opCtx, [this, writeConflictsInARow]() {
             if (MONGO_unlikely(expressExecutorHangBeforeLogAndBackoff.shouldFail())) {
                 expressExecutorHangBeforeLogAndBackoff.pauseWhileSet(_opCtx);
             }
-            logWriteConflictAndBackoff(writeConflictsInARow,
-                                       "plan execution",
-                                       "write contention during express execution"sv,
-                                       NamespaceStringOrUUID(_nss));
+            write_conflict_backoff::logAndBackoff(_opCtx,
+                                                  writeConflictsInARow,
+                                                  "plan execution",
+                                                  "write contention during express execution"sv,
+                                                  NamespaceStringOrUUID(_nss));
         });
     } else {
         if (MONGO_unlikely(expressExecutorHangBeforeLogAndBackoff.shouldFail())) {
             expressExecutorHangBeforeLogAndBackoff.pauseWhileSet(_opCtx);
         }
+        // Log and backoff while holding the ticket. Use the legacy stepped schedule here: the
+        // exponential ramp sleeps up to ~2x capMs, far too long to hold a ticket through.
         logWriteConflictAndBackoff(writeConflictsInARow,
                                    "plan execution",
                                    "write contention during express execution"sv,
@@ -476,8 +457,7 @@ void PlanExecutorExpress<Plan>::readyPlanExecution(express::WaitingForYield,
 template <class Plan>
 void PlanExecutorExpress<Plan>::readyPlanExecution(express::WaitingForBackoff,
                                                    size_t& numUnavailabilityYieldsSinceLastSuccess,
-                                                   size_t& numWriteConflictYieldsSinceLastSuccess,
-                                                   WCStormWaiterGuard&) {
+                                                   size_t& numWriteConflictYieldsSinceLastSuccess) {
     // Capture count before incrementing so the lambda sees the pre-increment value.
     auto numUnavailabilityAttempts = numUnavailabilityYieldsSinceLastSuccess++;
     _plan.temporarilyReleaseResourcesAndYield(
@@ -500,8 +480,7 @@ void PlanExecutorExpress<Plan>::readyPlanExecution(express::WaitingForBackoff,
 template <class Plan>
 void PlanExecutorExpress<Plan>::readyPlanExecution(express::WaitingForCondition result,
                                                    size_t& numUnavailabilityYieldsSinceLastSuccess,
-                                                   size_t& numWriteConflictYieldsSinceLastSuccess,
-                                                   WCStormWaiterGuard&) {
+                                                   size_t& numWriteConflictYieldsSinceLastSuccess) {
     _plan.temporarilyReleaseResourcesAndYield(_opCtx, [this, &result]() {
         refresh_util::waitForCriticalSectionToComplete(this->_opCtx, result.waitSignal()).ignore();
     });
@@ -510,12 +489,10 @@ void PlanExecutorExpress<Plan>::readyPlanExecution(express::WaitingForCondition 
 template <class Plan>
 void PlanExecutorExpress<Plan>::readyPlanExecution(express::Exhausted,
                                                    size_t& numUnavailabilityYieldsSinceLastSuccess,
-                                                   size_t& numWriteConflictYieldsSinceLastSuccess,
-                                                   WCStormWaiterGuard& stormGuard) {
+                                                   size_t& numWriteConflictYieldsSinceLastSuccess) {
     // No execution to get ready for.
     numUnavailabilityYieldsSinceLastSuccess = 0;
     numWriteConflictYieldsSinceLastSuccess = 0;
-    stormGuard.release();
 }
 
 template <class IteratorChoice, class WriteOperationChoice>

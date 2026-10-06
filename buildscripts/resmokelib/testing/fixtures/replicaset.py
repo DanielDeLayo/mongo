@@ -88,6 +88,7 @@ class ReplicaSetFixture(interface.ReplFixture, interface._DockerComposeInterface
         router_endpoint_for_mongot: Optional[int] = None,
         use_priority_ports=False,
         uds_path_prefix: Optional[str | bool] = None,
+        new_binary_set_parameters=None,
     ):
         """Initialize ReplicaSetFixture."""
 
@@ -98,6 +99,12 @@ class ReplicaSetFixture(interface.ReplFixture, interface._DockerComposeInterface
         self.mongod_executable = mongod_executable
         self.mongod_options = self.fixturelib.make_historic(
             certs.expand_x509_paths(self.fixturelib.default_if_none(mongod_options, {}))
+        )
+        # Only merged into the new-binary half of a mixed-bin-versions node (see
+        # _builder.py:_new_mongod); the old-binary half never receives these, since a
+        # failpoint/setParameter that doesn't exist on the old binary would fail it to start.
+        self.new_binary_set_parameters = self.fixturelib.make_historic(
+            self.fixturelib.default_if_none(new_binary_set_parameters, {})
         )
 
         # Process load_extensions: ["*"] means all, otherwise load named extensions.
@@ -364,6 +371,10 @@ class ReplicaSetFixture(interface.ReplFixture, interface._DockerComposeInterface
         # When this is True, we are running in Antithesis & modify the config to surface more bugs
         if self.config.NOOP_MONGO_D_S_PROCESSES:
             repl_config["settings"]["electionTimeoutMillis"] = 2000
+            # electionTimeoutMillis must be strictly greater than heartbeatIntervalMillis
+            # (default 2000), so shorten the heartbeat interval rather than lengthening the
+            # election timeout.
+            repl_config["settings"]["heartbeatIntervalMillis"] = 1800
             repl_config["settings"]["chainingAllowed"] = False
             repl_config["settings"]["heartbeatTimeoutSecs"] = 1
             repl_config["settings"]["catchUpTimeoutMillis"] = 0
@@ -390,12 +401,82 @@ class ReplicaSetFixture(interface.ReplFixture, interface._DockerComposeInterface
             # nodes are subsequently added to the set, since such nodes cannot set their FCV to
             # "latest". Therefore, we make sure the primary is "last-lts" FCV before adding in
             # nodes of different binary versions to the replica set.
-            client.admin.command(
-                {
-                    "setFeatureCompatibilityVersion": self.fcv,
-                    "fromConfigServer": True,
-                }
-            )
+            #
+            # An in-flight index build that has pinned a stale Operation FCV will cause setFCV to
+            # fail with BackgroundOperationInProgressForNamespace (12587). Retry until the build
+            # drains; index builds are short-lived at fixture-setup time.
+            #
+            # A previous transition that stopped while cleaning up internal server metadata blocks
+            # any transition in the opposite direction (7428200 if a downgrade stopped, 10778001 if
+            # an upgrade did). The server only accepts continuing in the interrupted direction, so
+            # drive the FCV document's targetVersion to completion and then retry ours.
+            _BACKGROUND_OPERATION_IN_PROGRESS_FOR_NAMESPACE = 12587
+            _COMMAND_NOT_SUPPORTED_ON_VIEW = 166
+            _INCOMPLETE_TRANSITION_CODES = (7428200, 10778001)
+            _SET_FCV_RETRY_TIMEOUT_SECS = 5 * 60
+            _SET_FCV_RETRY_INTERVAL_SECS = 0.2
+            start_time = time.monotonic()
+            while True:
+                try:
+                    client.admin.command(
+                        {
+                            "setFeatureCompatibilityVersion": self.fcv,
+                            "fromConfigServer": True,
+                        }
+                    )
+                    break
+                except pymongo.errors.OperationFailure as err:
+                    if (
+                        err.code != _BACKGROUND_OPERATION_IN_PROGRESS_FOR_NAMESPACE
+                        and err.code not in _INCOMPLETE_TRANSITION_CODES
+                    ):
+                        raise
+                    elapsed = time.monotonic() - start_time
+                    if elapsed > _SET_FCV_RETRY_TIMEOUT_SECS:
+                        raise pymongo.errors.OperationFailure(
+                            f"setFeatureCompatibilityVersion({self.fcv}) still failing after"
+                            f" {elapsed:.1f}s: {err}",
+                            code=err.code,
+                        )
+                    if err.code in _INCOMPLETE_TRANSITION_CODES:
+                        fcv_doc = client.admin["system.version"].find_one(
+                            {"_id": "featureCompatibilityVersion"}
+                        )
+                        pending_fcv = (fcv_doc or {}).get("targetVersion")
+                        if pending_fcv is None:
+                            raise
+                        self.logger.info(
+                            "Completing an interrupted FCV transition to %s before retrying"
+                            " setFeatureCompatibilityVersion(%s) (%.1fs elapsed): %s",
+                            pending_fcv,
+                            self.fcv,
+                            elapsed,
+                            err,
+                        )
+                        try:
+                            client.admin.command(
+                                {
+                                    "setFeatureCompatibilityVersion": pending_fcv,
+                                    "fromConfigServer": True,
+                                }
+                            )
+                        except pymongo.errors.OperationFailure as completion_err:
+                            # Best effort: the retry below observes the same incomplete-transition
+                            # error and tries again.
+                            self.logger.info(
+                                "Failed to complete the interrupted FCV transition to %s: %s",
+                                pending_fcv,
+                                completion_err,
+                            )
+                    else:
+                        self.logger.info(
+                            "Retrying setFeatureCompatibilityVersion(%s) after"
+                            " BackgroundOperationInProgressForNamespace (%.1fs elapsed): %s",
+                            self.fcv,
+                            elapsed,
+                            err,
+                        )
+                    time.sleep(_SET_FCV_RETRY_INTERVAL_SECS)
 
         if self.nodes[1:]:
             # Wait to connect to each of the secondaries before running the replSetReconfig
@@ -1426,7 +1507,18 @@ class ReplicaSetFixture(interface.ReplFixture, interface._DockerComposeInterface
                     if coll_name.endswith(".") or ".." in coll_name:
                         continue
                     # Skip collections that contain TTL indexes or TTL options.
-                    indexes = db.get_collection(coll_name).list_indexes()
+                    try:
+                        indexes = db.get_collection(coll_name).list_indexes()
+                    except pymongo.errors.OperationFailure as err:
+                        # If the replica set is running an older version, make an exclusion for
+                        # legacy timeseries collections because they are views and do not support
+                        # the listIndexes command
+                        if (
+                            err.code != _COMMAND_NOT_SUPPORTED_ON_VIEW
+                            or coll["type"] != "timeseries"
+                        ):
+                            raise
+
                     if any("expireAfterSeconds" in index for index in indexes):
                         continue
                     if "expireAfterSeconds" in coll["options"]:

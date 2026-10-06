@@ -10,7 +10,6 @@
 #include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
 #include "mongo/db/pipeline/document_source_lookup.h"
 #include "mongo/db/pipeline/document_source_replace_root.h"
-#include "mongo/db/pipeline/document_source_set_window_fields.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/document_source_skip.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
@@ -114,7 +113,6 @@ struct CompatiblePipelineStages {
     bool sort : 1;
     bool limitSkip : 1;
     bool search : 1;
-    bool window : 1;
     bool unpackBucket : 1;
 };
 
@@ -247,13 +245,6 @@ bool pipelineStageIsCompatible(const boost::intrusive_ptr<ExpressionContext>& ex
     } else if (stageId == DocumentSourceSearchMeta::id || stageId == DocumentSourceSearch::id ||
                stageId == DocumentSourceInternalSearchMongotRemote::id) {
         if (!allowedStages.search) {
-            return false;
-        }
-        return true;
-    } else if (stageId == DocumentSourceInternalSetWindowFields::id) {
-        if (!allowedStages.window ||
-            static_cast<DocumentSourceInternalSetWindowFields*>(stage.get())->sbeCompatibility() <
-                minRequiredCompatibility) {
             return false;
         }
         return true;
@@ -430,12 +421,7 @@ void prunePushdownStages(std::vector<boost::intrusive_ptr<DocumentSource>>& stag
 
 // Limit the number of aggregation pipeline stages that can be "pushed down" to the SBE stage
 // builders. Compiling too many pipeline stages during stage building would overflow the call stack.
-// The limit is higher for optimized builds, because optimization reduces the size of stack frames.
-#ifdef MONGO_CONFIG_OPTIMIZED_BUILD
-constexpr size_t kSbeMaxPipelineStages = 400;
-#else
 constexpr size_t kSbeMaxPipelineStages = 100;
-#endif
 
 size_t getNumSbeCompatibleStagesForPushdown(
     const DocumentSourceContainer& sources,
@@ -551,8 +537,7 @@ size_t getNumSbeCompatibleStagesForPushdown(
  *   - No additional criteria.
  *
  * $search and $searchMeta via 'DocumentSourceSearch':
- *   - The 'featureFlagSearchInSbe' flag is enabled.
- *   - The 'featureFlagSbeFull' flag is enabled.
+ *   - Never pushed down.
  *
  * 'DocumentSourceUnpackBucket':
  *   - The 'featureFlagSbeFull' flag is enabled.
@@ -636,12 +621,7 @@ bool findSbeCompatibleStagesForPushdown(
 
         .limitSkip = meetsRequirements(SbeCompatibility::requiresTrySbe),
 
-        // TODO (SERVER-77229): SBE execution of $search requires 'featureFlagSearchInSbe' to be
-        // enabled.
-        .search = meetsRequirements(SbeCompatibility::requiresSbeFull) &&
-            feature_flags::gFeatureFlagSearchInSbe.isEnabled(),
-
-        .window = meetsRequirements(SbeCompatibility::requiresTrySbe),
+        .search = false,
 
         // TODO (SERVER-80243): Remove 'featureFlagTimeSeriesInSbe' check.
         .unpackBucket = meetsRequirements(SbeCompatibility::noRequirements) &&

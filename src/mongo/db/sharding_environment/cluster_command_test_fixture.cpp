@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: SSPL-1.0
 
 
-#include <boost/move/utility_core.hpp>
-// IWYU pragma: no_include "cxxabi.h"
+#include "mongo/db/sharding_environment/cluster_command_test_fixture.h"
+
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonelement.h"
@@ -23,7 +23,6 @@
 #include "mongo/db/session/logical_session_cache_noop.h"
 #include "mongo/db/session/logical_session_id.h"
 #include "mongo/db/session/logical_session_id_gen.h"
-#include "mongo/db/sharding_environment/cluster_command_test_fixture.h"
 #include "mongo/db/sharding_environment/grid.h"
 #include "mongo/db/sharding_environment/mongod_and_mongos_server_parameters_gen.h"
 #include "mongo/db/topology/vector_clock/vector_clock.h"
@@ -40,6 +39,9 @@
 
 #include <system_error>
 #include <utility>
+
+#include <boost/move/utility_core.hpp>
+// IWYU pragma: no_include "cxxabi.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
@@ -347,8 +349,16 @@ void ClusterCommandTestFixture::testIncludeQueryStatsMetrics(BSONObj cmd, bool i
 
     auto expectFieldIs = [&](bool value) {
         return [value, &fieldName](const executor::RemoteCommandRequest& request) {
-            auto elt = request.cmdObj[fieldName];
-            ASSERT(!elt.eoo());
+            int n = 0;
+            BSONElement elt;
+            for (auto&& e : request.cmdObj) {
+                if (e.fieldNameStringData() == fieldName) {
+                    elt = e;
+                    ++n;
+                }
+            }
+            // A duplicate field fatals debug/ASAN mongos in OpMsgBuilder (40474).
+            ASSERT_EQ(n, 1);
             ASSERT_EQ(elt.boolean(), value);
         };
     };

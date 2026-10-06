@@ -69,8 +69,8 @@ constexpr uint8_t kProxyProtocolSSLTlvDN = 0xE0;
 /**
  * MongoDB custom PP2 TLV type as per MongoDB Proxy Protocol Technical Design document.
  * The kProxyProtocolSSLTlvPeerRoles TLV is used to indicate the roles of the peer in the SSL
- * connection. The value of this TLV is a string representing the MongoDB roles. Use the
- * parsePeerRoles function to parse this data into a format the server understands
+ * connection. The value of this TLV is a DER-encoded MongoDBAuthorizationGrants structure; use
+ * parsePeerRoles to parse it into the server's role representation.
  */
 constexpr uint8_t kProxyProtocolSSLTlvPeerRoles = 0xE1;
 

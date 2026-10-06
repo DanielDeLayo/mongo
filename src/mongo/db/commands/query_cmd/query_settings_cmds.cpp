@@ -8,12 +8,10 @@
 #include "mongo/db/commands/query_cmd/query_settings_cmds_gen.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/plan_cache/sbe_plan_cache.h"
-#include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/query_settings/query_settings_service.h"
 #include "mongo/db/topology/vector_clock/vector_clock.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/version/releases.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
@@ -48,34 +46,22 @@ auto findQueryShapeConfigurationByQueryShapeHash(
 
 using query_settings::mergeQuerySettings;
 
-bool isUpgradingToVersionThatHasDedicatedRepresentativeQueriesCollection(OperationContext* opCtx) {
-    // (Generic FCV reference): Check if the server is in the process of upgrading the FCV to the
-    // version that has 'gFeatureFlagPQSBackfill' enabled.
-    const auto version = serverGlobalParams.featureCompatibility.acquireFCVSnapshot().getVersion();
-    // we can't replace this with a switch case, as it is possible that lastLTS == lastContinuous;
-    // when this happens, kUpgradingFromLastLTSToLatest == kUpgradingFromLastContinuousToLatest
-    return version == multiversion::GenericFCV::kUpgradingFromLastLTSToLatest ||
-        version == multiversion::GenericFCV::kUpgradingFromLastContinuousToLatest;
-}
-
 /**
  * Reads, modifies, and updates the 'querySettings' cluster-wide configuration option. Follows the
  * Optimistic Offline Lock pattern when updating the option value. 'representativeQuery' indicates
- * the representative query for which an operation is performed and is used only for fail-point
- * programming.
+ * the representative query for which an operation is performed; it is recorded in the
+ * 'config.queryShapeRepresentativeQueries' collection and used for fail-point programming.
  */
 template <QuerySettingsCmdType CmdType>
 void readModifyWriteQuerySettingsConfigOption(
     OperationContext* opCtx,
-    const mongo::DatabaseName& dbName,
     const QueryShapeHashQueryInstanceOptPair& queryShapeHashQueryInstanceOptPair,
     std::function<void(std::vector<QueryShapeConfiguration>&)> modify) {
     auto& querySettingsService = QuerySettingsService::get(opCtx);
 
-    // Read the query shape configurations for the tenant from the local copy of the query settings
+    // Read the query shape configurations from the local copy of the query settings
     // cluster-wide configuration option.
-    auto queryShapeConfigurations =
-        querySettingsService.getAllQueryShapeConfigurations(dbName.tenantId());
+    auto queryShapeConfigurations = querySettingsService.getAllQueryShapeConfigurations();
 
     // Generate a new cluster parameter time that will be used when settings new version of
     // 'querySettings' cluster parameter. This cluster time will be assigned to the corresponding
@@ -94,16 +80,8 @@ void readModifyWriteQuerySettingsConfigOption(
     querySettingsService.validateQueryShapeConfigurations(queryShapeConfigurations);
 
     // Upsert QueryShapeRepresentativeQuery into the corresponding collection if provided.
-    // In case of FCV upgrade to the version that has 'gFeatureFlagPQSBackfill' enabled we act as if
-    // FCV upgrade is successful and record representative queries in the dedicated collection.
-    const bool shouldUpsertRepresentativeQuery =
-        isUpgradingToVersionThatHasDedicatedRepresentativeQueriesCollection(opCtx) ||
-        feature_flags::gFeatureFlagPQSBackfill.isEnabled(
-            VersionContext::getDecoration(opCtx),
-            serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
     if constexpr (CmdType == QuerySettingsCmdType::kSet) {
-        if (queryShapeHashQueryInstanceOptPair.second.has_value() &&
-            shouldUpsertRepresentativeQuery) {
+        if (queryShapeHashQueryInstanceOptPair.second.has_value()) {
             querySettingsService.upsertRepresentativeQueries(
                 opCtx,
                 {QueryShapeRepresentativeQuery(
@@ -184,23 +162,14 @@ void assertNoStandalone(OperationContext* opCtx, const std::string& cmdName) {
 /**
  * Validates and simplifies query settings 'querySettings' for a representative query described by
  * 'representativeQueryInfo'. An empty 'representativeQueryInfo' indicates that the representative
- * query was not provided. 'previousRepresentativeQuery' is the previous version of representative
- * query of the query settings entry being updated, if available.
+ * query was not provided.
  */
 void validateAndSimplifyQuerySettings(
     OperationContext* opCtx,
-    const boost::optional<TenantId>& tenantId,
     const boost::optional<const RepresentativeQueryInfo&>& representativeQueryInfo,
-    const boost::optional<QueryInstance>& previousRepresentativeQuery,
     QuerySettings& querySettings) {
     auto& service = QuerySettingsService::get(opCtx);
 
-    // In case the representative query was not provided but the previous representative query is
-    // available, assert that query settings will be set on a valid query.
-    if (!representativeQueryInfo && previousRepresentativeQuery) {
-        service.validateQueryCompatibleWithAnyQuerySettings(
-            createRepresentativeInfo(opCtx, *previousRepresentativeQuery, tenantId));
-    }
     if (representativeQueryInfo) {
         service.validateQueryCompatibleWithQuerySettings(*representativeQueryInfo, querySettings);
     }
@@ -249,8 +218,8 @@ public:
                                                       queryShapeHash);
                           },
                           [&](const QueryInstance& representativeQuery) {
-                              const auto representativeQueryInfo = createRepresentativeInfo(
-                                  opCtx, representativeQuery, request().getDbName().tenantId());
+                              const auto representativeQueryInfo =
+                                  createRepresentativeInfo(opCtx, representativeQuery);
                               return setQuerySettings(opCtx,
                                                       representativeQuery,
                                                       representativeQueryInfo,
@@ -288,8 +257,7 @@ public:
             const boost::optional<const RepresentativeQueryInfo&> representativeQueryInfo,
             const query_shape::QueryShapeHash& queryShapeHash) {
             auto& querySettingsService = QuerySettingsService::get(opCtx);
-            querySettingsService.validateQueryKnobs(opCtx, request().getSettings());
-            querySettingsService.validateMaxTimeMS(opCtx, request().getSettings());
+            querySettingsService.validateQueryKnobs(request().getSettings());
 
             // Validate that both 'representativeQuery' and 'representativeQueryInfo' are either
             // empty or not empty.
@@ -302,15 +270,11 @@ public:
             }
 
             SetQuerySettingsCommandReply reply;
-            auto&& tenantId = request().getDbName().tenantId();
             QueryShapeHashQueryInstanceOptPair queryShapeHashQueryInstanceOptPair = {
                 queryShapeHash, representativeQuery};
 
             readModifyWriteQuerySettingsConfigOption<QuerySettingsCmdType::kSet>(
-                opCtx,
-                request().getDbName(),
-                queryShapeHashQueryInstanceOptPair,
-                [&](auto& queryShapeConfigurations) {
+                opCtx, queryShapeHashQueryInstanceOptPair, [&](auto& queryShapeConfigurations) {
                     // Lookup a query shape configuration by query shape hash.
                     auto matchingQueryShapeConfigurationIt =
                         findQueryShapeConfigurationByQueryShapeHash(queryShapeConfigurations,
@@ -320,21 +284,10 @@ public:
                         QueryShapeConfiguration newQueryShapeConfiguration(queryShapeHash,
                                                                            request().getSettings());
 
-                        // Ensure we don't store representative query as part of
-                        // 'newQueryShapeConfiguration'.
-                        if (!feature_flags::gFeatureFlagPQSBackfill.isEnabled(
-                                VersionContext::getDecoration(opCtx),
-                                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
-                            newQueryShapeConfiguration.setRepresentativeQuery(representativeQuery);
-                        }
-
                         // Add a new query settings entry.
-                        validateAndSimplifyQuerySettings(
-                            opCtx,
-                            tenantId,
-                            representativeQueryInfo,
-                            boost::none /*previousRepresentativeQuery*/,
-                            newQueryShapeConfiguration.getSettings());
+                        validateAndSimplifyQuerySettings(opCtx,
+                                                         representativeQueryInfo,
+                                                         newQueryShapeConfiguration.getSettings());
 
                         LOGV2_DEBUG(
                             8911805,
@@ -346,7 +299,7 @@ public:
                         queryShapeConfigurations.push_back(newQueryShapeConfiguration);
 
                         // Update the reply with the new query shape configuration.
-                        newQueryShapeConfiguration.setRepresentativeQuery(representativeQuery);
+                        reply.setRepresentativeQuery(representativeQuery);
                         reply.setQueryShapeConfiguration(std::move(newQueryShapeConfiguration));
                     } else {
                         // Update an existing query settings entry by updating the existing
@@ -355,11 +308,7 @@ public:
                         auto mergedQuerySettings = mergeQuerySettings(
                             queryShapeConfigurationToUpdate.getSettings(), request().getSettings());
                         validateAndSimplifyQuerySettings(
-                            opCtx,
-                            tenantId,
-                            representativeQueryInfo,
-                            queryShapeConfigurationToUpdate.getRepresentativeQuery(),
-                            mergedQuerySettings);
+                            opCtx, representativeQueryInfo, mergedQuerySettings);
                         LOGV2_DEBUG(8911806,
                                     1,
                                     "Updating query settings entry",
@@ -367,20 +316,6 @@ public:
                                         [](const BSONObj& b) { return redact(b); }),
                                     "settings"_attr = mergedQuerySettings.toBSON());
                         queryShapeConfigurationToUpdate.setSettings(mergedQuerySettings);
-
-                        // Update the representative query if provided.
-                        if (representativeQuery) {
-                            queryShapeConfigurationToUpdate.setRepresentativeQuery(
-                                representativeQuery);
-                        }
-
-                        // Ensure we don't store representative query as part of
-                        // 'queryShapeConfigurationToUpdate'.
-                        if (feature_flags::gFeatureFlagPQSBackfill.isEnabled(
-                                VersionContext::getDecoration(opCtx),
-                                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
-                            queryShapeConfigurationToUpdate.setRepresentativeQuery(boost::none);
-                        }
 
                         // Update the reply with the updated query shape configuration.
                         reply.setQueryShapeConfiguration(queryShapeConfigurationToUpdate);
@@ -421,7 +356,6 @@ public:
 
             // Ensure FCV is not changing throughout the command execution.
             FixedFCVRegion fixedFcvRegion(opCtx);
-            auto tenantId = request().getDbName().tenantId();
             QueryShapeHashQueryInstanceOptPair queryShapeHashAndRepresentativeQuery =
                 visit(OverloadedVisitor{
                           [&](const query_shape::QueryShapeHash& queryShapeHash) {
@@ -431,7 +365,7 @@ public:
                               // Converts 'representativeQuery' into QueryShapeHash, for convenient
                               // comparison during search for the matching QueryShapeConfiguration.
                               auto representativeQueryInfo =
-                                  createRepresentativeInfo(opCtx, representativeQuery, tenantId);
+                                  createRepresentativeInfo(opCtx, representativeQuery);
 
                               return std::pair{representativeQueryInfo.queryShapeHash,
                                                boost::optional<QueryInstance>{representativeQuery}};
@@ -441,10 +375,7 @@ public:
 
             const auto& queryShapeHash = queryShapeHashAndRepresentativeQuery.first;
             readModifyWriteQuerySettingsConfigOption<QuerySettingsCmdType::kRemove>(
-                opCtx,
-                request().getDbName(),
-                queryShapeHashAndRepresentativeQuery,
-                [&](auto& queryShapeConfigurations) {
+                opCtx, queryShapeHashAndRepresentativeQuery, [&](auto& queryShapeConfigurations) {
                     // Build the new 'queryShapeConfigurations' by removing the first
                     // QueryShapeConfiguration matching the 'queryShapeHash'. There can be only one
                     // match, since 'queryShapeConfigurations' is constructed from a map where

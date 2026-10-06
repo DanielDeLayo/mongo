@@ -12,6 +12,7 @@
 #include "mongo/util/uuid.h"
 
 #include <list>
+#include <memory>
 #include <utility>
 
 #include <absl/container/flat_hash_map.h>
@@ -35,9 +36,8 @@ class ReplicatedFastCountTestPersistenceProvider : public rss::StubPersistencePr
         return "";
     }
 
-    // TODO(SERVER-126250): consult provider here.
     bool mustUseContainerWrites() const override {
-        return false;
+        return true;
     }
 
     bool shouldUseReplicatedCatalogIdentifiers() const override {
@@ -50,6 +50,12 @@ class ReplicatedFastCountTestPersistenceProvider : public rss::StubPersistencePr
     }
 
     bool shouldUseOplogWritesForFlowControlSampling() const override {
+        return false;
+    }
+
+    // The write path consults this on every operation. These tests target fast count, not
+    // continuous internode validation, so leave validation off.
+    bool shouldUseContinuousInternodeValidation() const override {
         return false;
     }
 
@@ -101,6 +107,10 @@ class ReplicatedFastCountTestPersistenceProvider : public rss::StubPersistencePr
         return false;
     }
 
+    bool supportsOplogScanning() const override {
+        return true;
+    }
+
     bool supportsWriteConcernOptions(const WriteConcernOptions&) const override {
         return true;
     }
@@ -141,13 +151,11 @@ bool findPersistedDocInContainer(OperationContext* opCtx, const UUID& uuid, BSON
  * Checks the persisted values of count and size for the given UUID in the underlying fast count
  * store.
  */
-void checkFastCountMetadataInInternalStore(
-    OperationContext* opCtx,
-    replicated_fast_count::ReplicatedFastCountManager* fastCountManager,
-    const UUID& uuid,
-    bool expectPersisted,
-    int64_t expectedCount,
-    int64_t expectedSize);
+void checkFastCountMetadataInInternalStore(OperationContext* opCtx,
+                                           const UUID& uuid,
+                                           bool expectPersisted,
+                                           int64_t expectedCount,
+                                           int64_t expectedSize);
 
 /**
  * Checks the uncommitted fast count changes for the given UUID.
@@ -354,8 +362,8 @@ boost::optional<repl::OplogEntry> getMostRecentOplogEntry(OperationContext* opCt
 CollectionSizeCount scanForAccurateSizeCount(OperationContext* opCtx, const NamespaceString& nss);
 
 /**
- * Convenience wrapper around extractSizeCountDeltasForApplyOps that constructs and returns the
- * result map.
+ * Convenience wrapper around extractReplicatedMetadataDeltasForApplyOps that constructs and returns
+ * the result map.
  */
 absl::flat_hash_map<UUID, CollectionSizeCount> extractSizeCountDeltasForApplyOps(
     const repl::OplogEntry& applyOpsEntry);
@@ -375,8 +383,17 @@ struct NsAndUUID {
 repl::OplogEntry makeOplogEntry(Timestamp ts,
                                 NsAndUUID userColl,
                                 repl::OpTypeEnum opType,
-                                int32_t sizeDelta);
+                                int32_t sizeDelta,
+                                boost::optional<int64_t> hash = boost::none);
 repl::OplogEntry makeOplogEntry(Timestamp ts, NsAndUUID userColl, repl::OpTypeEnum opType);
+
+/**
+ * Generates a synthetic top-level container-write oplog entry for the provided `containerIdent`.
+ * `opType` must be kContainerInsert, kContainerUpdate, or kContainerDelete.
+ */
+repl::OplogEntry makeContainerOplogEntry(Timestamp ts,
+                                         std::string_view containerIdent,
+                                         repl::OpTypeEnum opType);
 
 /**
  * Generates a truncateRange command oplog entry for the given collection UUID with the specified
@@ -436,4 +453,20 @@ std::span<const char> uuidSpan(const UUID& u);
  * Creates a char span for a given BSONObj.
  */
 std::span<const char> bsonSpan(const BSONObj& obj);
+
+/**
+ * The container-backed fast count stores, which are always created as a pair.
+ */
+struct ContainerFastCountStores {
+    std::unique_ptr<SizeCountStore> sizeCountStore;
+    std::unique_ptr<SizeCountTimestampStore> timestampStore;
+};
+
+/**
+ * Creates the internal fast count containers and returns container-backed stores over them.
+ *
+ * Requires a fixture whose persistence provider mandates container writes, such as
+ * `ReplicatedFastCountTestPersistenceProvider`.
+ */
+ContainerFastCountStores createContainerFastCountStores(OperationContext* opCtx);
 }  // namespace mongo::replicated_fast_count::test_helpers

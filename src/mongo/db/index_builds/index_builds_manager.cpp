@@ -425,15 +425,6 @@ void IndexBuildsManager::setIsResumable(const UUID& buildUUID, bool isResumable)
     builder.getValue()->setIsResumable(isResumable);
 }
 
-void IndexBuildsManager::writeTearableSideWriteAbortRecord(OperationContext* opCtx,
-                                                           const UUID& buildUUID) {
-    auto builder = _getBuilder(buildUUID);
-    if (!builder.isOK()) {
-        return;
-    }
-    builder.getValue()->writeTearableSideWriteAbortRecord(opCtx);
-}
-
 bool IndexBuildsManager::isBackgroundBuilding(const UUID& buildUUID) {
     auto builder = invariant(_getBuilder(buildUUID));
     return builder->isBackgroundBuilding();
@@ -448,6 +439,17 @@ void IndexBuildsManager::appendBuildInfo(const UUID& buildUUID, BSONObjBuilder* 
     }
 
     builderIt->second->appendBuildInfo(builder);
+}
+
+boost::optional<IndexBuildPhaseEnum> IndexBuildsManager::getPhase(const UUID& buildUUID) const {
+    std::unique_lock<std::mutex> lk(_mutex);
+
+    auto builderIt = _builders.find(buildUUID);
+    if (builderIt == _builders.end()) {
+        return boost::none;
+    }
+
+    return builderIt->second->getPhase();
 }
 
 void IndexBuildsManager::verifyNoIndexBuilds_forTestOnly() {

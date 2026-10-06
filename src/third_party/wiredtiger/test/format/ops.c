@@ -287,8 +287,8 @@ operations(u_int ops_seconds, u_int run_current, u_int run_total)
     WT_SESSION *session;
     STEPDOWN_ARGS stepdown_args;
     wt_thread_t alter_tid, background_compact_tid, backup_tid, checkpoint_tid, compact_tid,
-      follower_tid, hs_tid, import_tid, random_tid;
-    wt_thread_t stepdown_tid, timestamp_tid;
+      follower_tid, follower_read_no_ts_tid[2], hs_tid, import_tid, random_tid;
+    wt_thread_t key_rotation_tid, stepdown_tid, timestamp_tid;
     int64_t fourths, quit_fourths, thread_ops;
     uint32_t i;
     bool lastrun, running, stepdown_triggered, stepdown_running;
@@ -309,8 +309,10 @@ operations(u_int ops_seconds, u_int run_current, u_int run_total)
     memset(&checkpoint_tid, 0, sizeof(checkpoint_tid));
     memset(&compact_tid, 0, sizeof(compact_tid));
     memset(&follower_tid, 0, sizeof(follower_tid));
+    memset(follower_read_no_ts_tid, 0, sizeof(follower_read_no_ts_tid));
     memset(&hs_tid, 0, sizeof(hs_tid));
     memset(&import_tid, 0, sizeof(import_tid));
+    memset(&key_rotation_tid, 0, sizeof(key_rotation_tid));
     memset(&random_tid, 0, sizeof(random_tid));
     memset(&stepdown_tid, 0, sizeof(stepdown_tid));
     memset(&timestamp_tid, 0, sizeof(timestamp_tid));
@@ -342,7 +344,8 @@ operations(u_int ops_seconds, u_int run_current, u_int run_total)
              */
             thread_ops = -1;
             ops_seconds = 0;
-            g.stop_timestamp = (GV(RUNS_OPS) * (uint64_t)run_current) / run_total;
+            g.stop_timestamp =
+              g.reopen_timestamp + (GV(RUNS_OPS) * (uint64_t)run_current) / run_total;
         } else
             thread_ops = GV(RUNS_OPS) / GV(RUNS_THREADS);
     }
@@ -387,8 +390,17 @@ operations(u_int ops_seconds, u_int run_current, u_int run_total)
         testutil_check(__wt_thread_create(NULL, &backup_tid, backup, NULL));
     if (GV(OPS_COMPACTION))
         testutil_check(__wt_thread_create(NULL, &compact_tid, compact, NULL));
-    if (disagg_is_multi_node() && !g.disagg_leader)
+    if (disagg_is_multi_node() && !g.disagg_leader) {
         testutil_check(__wt_thread_create(NULL, &follower_tid, follower, NULL));
+        /*
+         * The snapshot readers fail a run when a transaction's reads change under it, so they are
+         * configured rather than implied by a multi-node run.
+         */
+        if (GV(DISAGG_SNAPSHOT_READ))
+            for (i = 0; i < WT_ELEMENTS(follower_read_no_ts_tid); ++i)
+                testutil_check(
+                  __wt_thread_create(NULL, &follower_read_no_ts_tid[i], follower_read_no_ts, NULL));
+    }
     if (GV(OPS_HS_CURSOR))
         testutil_check(__wt_thread_create(NULL, &hs_tid, hs_cursor, NULL));
     if (GV(IMPORT))
@@ -401,16 +413,20 @@ operations(u_int ops_seconds, u_int run_current, u_int run_total)
     if (g.checkpoint_config == CHECKPOINT_ON)
         testutil_check(__wt_thread_create(NULL, &checkpoint_tid, checkpoint, NULL));
 
+    if (GV(DISAGG_KEY_PROVIDER) == DISAGG_KEY_PROVIDER_PUSH)
+        testutil_check(__wt_thread_create(NULL, &key_rotation_tid, disagg_key_rotation, NULL));
+
     /* Spin on the threads, calculating the totals. */
     for (;;) {
         /*
          * When the timer expires during an async disagg leader phase, spawn the step-down in a
          * background thread. The step-down joins the checkpoint/timestamp threads, drains in-flight
-         * transactions, and takes the step-down checkpoint. Running it in a separate thread keeps
-         * the spin loop ticking (track_ops) so terminal output stays live during the drain (up to
-         * 60 s). fourths is paused at -1 while the thread runs; once it signals done, fourths is
-         * reset to grant workers additional time before operations() returns. The role transition
-         * and follower ops happen via disagg_switch_roles() and the next operations() call in t.c.
+         * transactions, pauses worker writes, takes the step-down checkpoint and completes the
+         * transition to follower. Running it in a separate thread keeps the spin loop ticking
+         * (track_ops) so terminal output stays live during the drain (up to 60 s). fourths is
+         * paused at -1 while the thread runs; once it signals done, fourths is reset to grant the
+         * workers a follower window before operations() returns. disagg_switch_roles() in t.c then
+         * performs the step-up.
          */
         if (fourths == 0 && !stepdown_triggered && disagg_is_mode_switch() && g.disagg_leader &&
           GV(DISAGG_STEPDOWN_ASYNC)) {
@@ -424,10 +440,13 @@ operations(u_int ops_seconds, u_int run_current, u_int run_total)
             fourths = -1;              /* Pause quit timer until step-down thread signals done. */
         }
 
-        /* Once the step-down thread completes, grant workers additional operation time. */
+        /*
+         * Once the step-down thread completes, the connection is a follower and writes are
+         * re-enabled; grant the workers a follower ops window.
+         */
         if (stepdown_running) {
             bool stepdown_complete;
-            WT_ACQUIRE_READ_WITH_BARRIER(stepdown_complete, stepdown_args.done);
+            stepdown_complete = __wt_atomic_load_bool_v_acquire(&stepdown_args.done);
             if (stepdown_complete) {
                 stepdown_running = false;
                 fourths = DISAGG_SWITCH_FOLLOWER_OPS_SEC * 4;
@@ -491,22 +510,8 @@ operations(u_int ops_seconds, u_int run_current, u_int run_total)
             replay_end_timed_run();
         if (fourths != -1)
             --fourths;
-        if (quit_fourths != -1 && --quit_fourths == 0) {
-            fprintf(stderr, "%s\n", "format run more than 15 minutes past the maximum time");
-            fprintf(stderr, "%s\n",
-              "format run dumping cache and transaction state, then aborting the process");
-
-            /*
-             * If the library is deadlocked, we might just join the mess, set a two-minute timer to
-             * limit our exposure.
-             */
-            set_alarm(120);
-
-            (void)conn->debug_info(conn, "txn");
-            (void)conn->debug_info(conn, "cache");
-
-            __wt_abort(NULL);
-        }
+        if (quit_fourths != -1 && --quit_fourths == 0)
+            abort_with_state_dump(conn, "format run more than 15 minutes past the maximum time");
     }
 
     /* Wait for the special-purpose threads. */
@@ -527,12 +532,18 @@ operations(u_int ops_seconds, u_int run_current, u_int run_total)
         testutil_check(__wt_thread_join(NULL, &compact_tid));
     if (GV(DISAGG_STEPDOWN_ASYNC) && stepdown_triggered)
         testutil_check(__wt_thread_join(NULL, &stepdown_tid));
-    if (disagg_is_multi_node() && !g.disagg_leader)
+    if (disagg_is_multi_node() && !g.disagg_leader) {
         testutil_check(__wt_thread_join(NULL, &follower_tid));
+        if (GV(DISAGG_SNAPSHOT_READ))
+            for (i = 0; i < WT_ELEMENTS(follower_read_no_ts_tid); ++i)
+                testutil_check(__wt_thread_join(NULL, &follower_read_no_ts_tid[i]));
+    }
     if (GV(OPS_HS_CURSOR))
         testutil_check(__wt_thread_join(NULL, &hs_tid));
     if (GV(IMPORT))
         testutil_check(__wt_thread_join(NULL, &import_tid));
+    if (GV(DISAGG_KEY_PROVIDER) == DISAGG_KEY_PROVIDER_PUSH)
+        testutil_check(__wt_thread_join(NULL, &key_rotation_tid));
     if (GV(OPS_RANDOM_CURSOR))
         testutil_check(__wt_thread_join(NULL, &random_tid));
     if (g.transaction_timestamps_config && !stepdown_triggered)
@@ -650,7 +661,7 @@ begin_transaction(TINFO *tinfo, const char *iso_config)
  * next_timestamp --
  *     Allocate the next global timestamp under the step-down read lock. The write lock is held
  *     exclusively during step-down notification; threads blocked here unblock with values strictly
- *     above step_down_ts, routing their writes to ingest.
+ *     above step_down_ts, sending their writes to ingest (mirrored to both when configured).
  */
 uint64_t
 next_timestamp(WT_SESSION *session)
@@ -713,7 +724,7 @@ commit_transaction(TINFO *tinfo, bool prepared)
      * Remember our oldest commit timestamp. Updating the thread's commit timestamp allows read,
      * oldest and stable timestamps to advance, ensure we don't race.
      */
-    WT_RELEASE_WRITE_WITH_BARRIER(tinfo->commit_ts, ts);
+    __wt_atomic_store_uint64_release(&tinfo->commit_ts, ts);
 
     trace_uri_op(tinfo, NULL, "commit read-ts=%" PRIu64 ", commit-ts=%" PRIu64, tinfo->read_ts,
       tinfo->commit_ts);
@@ -827,7 +838,7 @@ typedef enum {
  *     Per-thread table operation.
  */
 static int
-table_op(TINFO *tinfo, bool intxn, iso_level_t iso_level, thread_op op)
+table_op(TINFO *tinfo, bool intxn, iso_level_t iso_level, thread_op op, bool pause_writes)
 {
     WT_DECL_RET;
     TABLE *table;
@@ -896,8 +907,8 @@ table_op(TINFO *tinfo, bool intxn, iso_level_t iso_level, thread_op op)
          * work, but doesn't make sense. Reserving a row before a read won't be useful but it's not
          * unexpected. A row cannot be reserved with ignore prepare.
          */
-        if (intxn && iso_level == ISOLATION_SNAPSHOT && tinfo->ignore_prepare == false &&
-          mmrand(&tinfo->data_rnd, 0, 100) < GV(OPS_RESERVE)) {
+        if (!pause_writes && intxn && iso_level == ISOLATION_SNAPSHOT &&
+          tinfo->ignore_prepare == false && mmrand(&tinfo->data_rnd, 0, 100) < GV(OPS_RESERVE)) {
             switch (table->type) {
             case ROW:
                 ret = row_reserve(tinfo, positioned);
@@ -1097,11 +1108,11 @@ ops(void *arg)
     thread_op op;
     uint64_t reset_op, session_op, throttle_delay, truncate_op;
     uint64_t rlog_key, rlog_lane, rlog_read_ts, rlog_replay_ts;
-    uint32_t max_rows, ntries, range, rnd;
+    uint32_t max_rows, ntries, range, rnd, snap_retries;
     u_int i, rlog_table_id, throttle_delay_max;
     int rlog_ret;
     const char *iso_config, *rlog_op_name;
-    bool greater_than, intxn, prepared, mirrored_truncate;
+    bool greater_than, intxn, pause_writes, prepared, mirrored_truncate;
 
     tinfo = arg;
     mirrored_truncate = false;
@@ -1140,6 +1151,7 @@ ops(void *arg)
     session = NULL;
     session_op = 0;
     ntries = 0;
+    snap_retries = 0;
 
     /* Set the first operation where we'll reset the session. */
     reset_op = mmrand(&tinfo->extra_rnd, 100, 10 * WT_THOUSAND);
@@ -1147,7 +1159,13 @@ ops(void *arg)
     truncate_op = mmrand(&tinfo->data_rnd, 100, 10 * WT_THOUSAND);
 
     for (intxn = false; !tinfo->quit;) {
-        if (GV(OPS_THROTTLE)) {
+        /*
+         * Also throttle while a step-down pauses writes: the workers become full-time readers and,
+         * without a throttle, can monopolize the page log's reader-writer locks and starve the
+         * step-down checkpoint's writes.
+         */
+        pause_writes = __wt_atomic_load_bool_v_acquire(&g.stepdown_pause_writes);
+        if (GV(OPS_THROTTLE) || pause_writes) {
             /* Sleep first to avoid burst when all threads start. */
             throttle_delay = mmrand(&tinfo->extra_rnd, 0, throttle_delay_max);
             __wt_sleep(throttle_delay / WT_MILLION, throttle_delay % WT_MILLION);
@@ -1222,6 +1240,17 @@ rollback_retry:
         table = tinfo->table = table_select(tinfo, true);
 
         /*
+         * A step-down write pause is acknowledged only when no transaction is in flight: the
+         * acknowledgment guarantees this thread has no unresolved writes and, because the operation
+         * selection below sees the pause, that it will not write again until the pause is lifted.
+         */
+        pause_writes = __wt_atomic_load_bool_v_acquire(&g.stepdown_pause_writes);
+        if (!pause_writes)
+            __wt_atomic_store_bool_v_release(&tinfo->pause_ack, false);
+        else if (!intxn)
+            __wt_atomic_store_bool_v_release(&tinfo->pause_ack, true);
+
+        /*
          * If not in a transaction and in a timestamp world, start a transaction (which is always at
          * snapshot-isolation).
          *
@@ -1262,9 +1291,12 @@ rollback_retry:
         /*
          * Select an operation: updates cannot happen at lower isolation levels or with
          * ignore_prepare and modify must be in an explicit transaction.
+         *
+         * While pause_writes is set, run read-only: new dirty pages would compete with a concurrent
+         * checkpoint for cache.
          */
         op = READ;
-        if ((iso_level == ISOLATION_IMPLICIT || iso_level == ISOLATION_SNAPSHOT) &&
+        if (!pause_writes && (iso_level == ISOLATION_IMPLICIT || iso_level == ISOLATION_SNAPSHOT) &&
           (tinfo->ignore_prepare == false)) {
             i = mmrand(&tinfo->data_rnd, 1, 100);
             if (i < TV(OPS_PCT_DELETE)) {
@@ -1299,7 +1331,7 @@ rollback_retry:
          */
         max_rows = TV(RUNS_ROWS);
         if (table->type != ROW && !table->mirror)
-            WT_ACQUIRE_READ_WITH_BARRIER(max_rows, table->rows_current);
+            max_rows = __wt_atomic_load_uint32_acquire(&table->rows_current);
         tinfo->keyno = mmrand(&tinfo->data_rnd, 1, (u_int)max_rows);
         if (TV(OPS_PARETO)) {
             tinfo->keyno = testutil_pareto(tinfo->keyno, (u_int)max_rows, TV(OPS_PARETO_SKEW));
@@ -1396,18 +1428,14 @@ rollback_retry:
             val_gen(table, &tinfo->data_rnd, tinfo->new_value, tinfo->keyno);
 
         /* If modify, build a modify change vector. */
-        if (op == MODIFY) {
-            if (replay_stale_read_ts(tinfo))
-                goto rollback;
-
+        if (op == MODIFY)
             modify_build(tinfo);
-        }
 
         ret = 0;
         skip1 = skip2 = NULL;
         if (op == MODIFY && table->mirror) {
             tinfo->table = g.base_mirror;
-            ret = table_op(tinfo, intxn, iso_level, op);
+            ret = table_op(tinfo, intxn, iso_level, op, pause_writes);
             testutil_assert(ret == 0 || ret == WT_ROLLBACK);
 
             /*
@@ -1428,7 +1456,7 @@ rollback_retry:
         }
         if (ret == 0 && table != skip1) {
             tinfo->table = table;
-            ret = table_op(tinfo, intxn, iso_level, op);
+            ret = table_op(tinfo, intxn, iso_level, op, pause_writes);
             testutil_assert(ret == 0 || ret == WT_ROLLBACK);
             if (GV(RUNS_PREDICTABLE_REPLAY) && ret == WT_ROLLBACK)
                 goto rollback;
@@ -1449,7 +1477,7 @@ rollback_retry:
             for (i = 1; i <= ntables; ++i)
                 if (tables[i] != skip1 && tables[i] != skip2 && tables[i]->mirror) {
                     tinfo->table = tables[i];
-                    ret = table_op(tinfo, intxn, iso_level, op);
+                    ret = table_op(tinfo, intxn, iso_level, op, pause_writes);
                     testutil_assert(ret == 0 || ret == WT_ROLLBACK);
                     if (GV(RUNS_PREDICTABLE_REPLAY) && ret == WT_ROLLBACK)
                         goto rollback;
@@ -1502,8 +1530,19 @@ skip_operation:
             ret = snap_repeat_txn(tinfo);
             testutil_assertfmt(
               ret == 0 || ret == WT_ROLLBACK || ret == WT_CACHE_FULL, "operation failed: %d", ret);
-            if (ret == WT_ROLLBACK || ret == WT_CACHE_FULL)
+            if (ret == WT_ROLLBACK || ret == WT_CACHE_FULL) {
+                /*
+                 * A thread can hit WT_ROLLBACK/WT_CACHE_FULL here indefinitely under sustained
+                 * cache pressure, retrying the same repeat-read forever without ever reaching the
+                 * quit check at the top of the loop. Bail out immediately if we're quitting, and
+                 * fail fast rather than spin quietly until the test's own timeout fires.
+                 */
+                if (tinfo->quit)
+                    goto loop_exit;
+                testutil_assert(++snap_retries < WT_THOUSAND);
                 goto rollback;
+            }
+            snap_retries = 0;
         }
 
         /*
@@ -1664,7 +1703,7 @@ apply_bounds(WT_CURSOR *cursor, TABLE *table, WT_RAND_STATE *rnd)
 
     /* Set up the default key buffer. */
     key_gen_init(&key);
-    WT_ACQUIRE_READ_WITH_BARRIER(max_rows, table->rows_current);
+    max_rows = __wt_atomic_load_uint32_acquire(&table->rows_current);
 
     /*
      * Generate a random lower key and apply to the lower bound or upper bound depending on the
@@ -1758,7 +1797,7 @@ wts_read_scan(TABLE *table, void *args)
     wt_wrap_open_cursor(session, table->uri, NULL, &cursor);
 
     /* Scan the first 50 rows for tiny, debugging runs, then scan a random subset of records. */
-    WT_ACQUIRE_READ_WITH_BARRIER(max_rows, table->rows_current);
+    max_rows = __wt_atomic_load_uint32_acquire(&table->rows_current);
     for (keyno = 0; keyno < max_rows;) {
         if (++keyno > 50)
             keyno += mmrand(rnd, 1, WT_THOUSAND);
@@ -2177,7 +2216,7 @@ col_insert_resolve(TABLE *table, void *arg)
      * Process the existing records and advance the last row count until we can't go further.
      */
     do {
-        WT_ACQUIRE_READ_WITH_BARRIER(max_rows, table->rows_current);
+        max_rows = __wt_atomic_load_uint32_acquire(&table->rows_current);
         for (i = 0, p = cip->insert_list; i < WT_ELEMENTS(cip->insert_list); ++i, ++p) {
             /*
              * A thread may have allocated a record number that is now less than or equal to the
@@ -2265,8 +2304,22 @@ row_remove(TINFO *tinfo, bool positioned)
 {
     WT_CURSOR *cursor;
     WT_DECL_RET;
+    bool blind_remove;
 
     cursor = tinfo->cursor;
+
+    /*
+     * FIXME-WT-18043: Restore overwrite=true here once format can replay only leader-confirmed
+     * deletes on the follower.
+     *
+     * An unpositioned overwrite=true remove on a disagg follower asserts the caller already knows
+     * the key exists, so it never fails with WT_NOTFOUND -- correct only when the leader already
+     * confirmed the key before replicating the delete. This thread issues fresh, random removes of
+     * its own instead of replaying leader-confirmed ones, so drop overwrite for the call.
+     */
+    blind_remove = !positioned && g.disagg_storage_config && !g.disagg_leader;
+    if (blind_remove)
+        testutil_check(cursor->reconfigure(cursor, "overwrite=false"));
 
     if (!positioned) {
         key_gen(tinfo->table, tinfo->key, tinfo->keyno);
@@ -2286,6 +2339,9 @@ row_remove(TINFO *tinfo, bool positioned)
      */
     ret = cursor->remove(cursor);
 
+    if (blind_remove)
+        testutil_check(cursor->reconfigure(cursor, "overwrite=true"));
+
     if (ret != 0 && ret != WT_NOTFOUND)
         return (ret);
 
@@ -2304,14 +2360,27 @@ col_remove(TINFO *tinfo, bool positioned)
 {
     WT_CURSOR *cursor;
     WT_DECL_RET;
+    bool blind_remove;
 
     cursor = tinfo->cursor;
+
+    /*
+     * FIXME-WT-18043: Restore overwrite=true here once format can replay only leader-confirmed
+     * deletes on the follower. See row_remove for the rationale behind temporarily dropping
+     * overwrite here.
+     */
+    blind_remove = !positioned && g.disagg_storage_config && !g.disagg_leader;
+    if (blind_remove)
+        testutil_check(cursor->reconfigure(cursor, "overwrite=false"));
 
     if (!positioned)
         cursor->set_key(cursor, tinfo->keyno);
 
     /* See row_remove for the rationale behind calling cursor->remove() directly. */
     ret = cursor->remove(cursor);
+
+    if (blind_remove)
+        testutil_check(cursor->reconfigure(cursor, "overwrite=true"));
 
     if (ret != 0 && ret != WT_NOTFOUND)
         return (ret);

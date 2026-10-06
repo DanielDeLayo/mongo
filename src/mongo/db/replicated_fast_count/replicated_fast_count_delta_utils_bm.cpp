@@ -12,6 +12,7 @@
 #include "mongo/db/replicated_fast_count/durable_size_metadata_gen.h"
 #include "mongo/db/replicated_fast_count/replicated_fast_count_streaming_oplog_delta_accumulator.h"
 #include "mongo/db/replicated_fast_count/replicated_fast_size_count.h"
+#include "mongo/db/storage/ident.h"
 #include "mongo/db/storage/record_data.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/util/time_support.h"
@@ -31,7 +32,7 @@ namespace replicated_fast_count {
 namespace {
 
 // Minimal SeekableRecordCursor backed by an in-memory vector<BSONObj>. Ignores
-// the seek bound and yields every record in order; aggregateSizeCountDeltasInOplog
+// the seek bound and yields every record in order; aggregateReplicatedMetadataDeltasInOplog
 // only needs forward iteration after a seek and never inspects the RecordIds.
 class InMemoryOplogCursor : public SeekableRecordCursor {
 public:
@@ -69,10 +70,6 @@ private:
 
 NamespaceString userNss(int collIdx) {
     return NamespaceString::createNamespaceString_forTest("test.coll" + std::to_string(collIdx));
-}
-
-NamespaceString fastCountStoreNss() {
-    return NamespaceString::makeGlobalConfigCollection(NamespaceString::kReplicatedFastCountStore);
 }
 
 repl::OplogEntrySizeMetadata makeSingleOpSizeMetadata(int32_t sz) {
@@ -278,7 +275,7 @@ constexpr int64_t kApplyOpsInnerSweepStart = 1LL << 4;
 constexpr int64_t kApplyOpsInnerSweepEnd = 1LL << 10;
 
 // Synthetic "transactional" applyOps. We do not set the prepare/commit fields because
-// extractSizeCountDeltasForApplyOps drives off `o.applyOps` only.
+// extractReplicatedMetadataDeltasForApplyOps drives off `o.applyOps` only.
 std::vector<BSONObj> genTransactionalApplyOps(int numApplyOpsEntries, int innerOpsPerEntry) {
     std::vector<BSONObj> out;
     out.reserve(numApplyOpsEntries);
@@ -321,15 +318,18 @@ std::vector<BSONObj> genNoiseHeavy(int n) {
 std::vector<BSONObj> genFastCountStoreWrites(int n) {
     std::vector<BSONObj> out;
     out.reserve(n);
-    const auto storeNss = fastCountStoreNss();
-    const UUID storeUuid = UUID::gen();
+    const UUID uuid = UUID::gen();
     for (int i = 1; i <= n; ++i) {
-        out.push_back(makeCrudEntry(i,
-                                    repl::OpTypeEnum::kInsert,
-                                    storeNss,
-                                    storeUuid,
-                                    /*sz=*/0,
-                                    /*payloadSize=*/0));
+        BSONObjBuilder b;
+        b.append("op", "ci");
+        b.append("ns", NamespaceString::kAdminCommandNamespace.ns_forTest());
+        uuid.appendToBuilder(&b, "ui");
+        b.append("ts", Timestamp(i, 1));
+        b.append("v", repl::DurableOplogEntry::kOplogVersion);
+        b.append("wall", Date_t::fromMillisSinceEpoch(0));
+        b.append("o", BSONObj());
+        b.append("container", ident::kFastCountMetadataStore);
+        out.push_back(b.obj());
     }
     return out;
 }
@@ -366,7 +366,7 @@ void runScan(benchmark::State& state, const std::vector<BSONObj>& entries) {
     const auto oplogUuid = UUID::gen();
     for (auto _ : state) {
         InMemoryOplogCursor cursor(&entries);
-        auto result = aggregateSizeCountDeltasInOplog(cursor, Timestamp(0, 0), oplogUuid);
+        auto result = aggregateReplicatedMetadataDeltasInOplog(cursor, Timestamp(0, 0), oplogUuid);
         benchmark::DoNotOptimize(result);
         benchmark::ClobberMemory();
     }
@@ -400,7 +400,7 @@ void BM_Scan_TransactionalApplyOps(benchmark::State& state) {
     const auto oplogUuid = UUID::gen();
     for (auto _ : state) {
         InMemoryOplogCursor cursor(&entries);
-        auto result = aggregateSizeCountDeltasInOplog(cursor, Timestamp(0, 0), oplogUuid);
+        auto result = aggregateReplicatedMetadataDeltasInOplog(cursor, Timestamp(0, 0), oplogUuid);
         benchmark::DoNotOptimize(result);
         benchmark::ClobberMemory();
     }

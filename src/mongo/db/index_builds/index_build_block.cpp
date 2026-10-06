@@ -11,11 +11,13 @@
 #include "mongo/db/client.h"
 #include "mongo/db/collection_index_usage_tracker.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index_builds/primary_driven/enabled.h"
 #include "mongo/db/index_key_validate.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/collection_index_usage_tracker_decoration.h"
 #include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/query/plan_cache/join_plan_cache.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/shard_role/shard_catalog/collection.h"
@@ -24,7 +26,6 @@
 #include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
 #include "mongo/db/shard_role/transaction_resources.h"
 #include "mongo/db/storage/recovery_unit.h"
-#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/ttl/ttl_collection_cache.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
@@ -100,11 +101,29 @@ Status IndexBuildBlock::initForResume(OperationContext* opCtx,
             return status;
     }
 
-    _indexBuildInterceptor =
-        std::make_shared<IndexBuildInterceptor>(opCtx,
-                                                indexBuildInfo,
-                                                LazyRecordStore::CreateMode::openExisting,
-                                                writableEntry->descriptor()->unique());
+    // Pending interceptors are keyed by the ident the write path reads off the catalog entry.
+    tassert(13491002,
+            "resumed index build's ident does not match its catalog entry",
+            writableEntry->getIdent() == indexBuildInfo.indexIdent);
+
+    // Adopt the pending interceptor a step-up created for this build rather than starting a second
+    // one over the same tables. It is released on commit, so a rollback leaves it where the write
+    // path can still find it.
+    _indexBuildInterceptor = index_builds::getPendingInterceptors(opCtx->getServiceContext())
+                                 .find(indexBuildInfo.indexIdent);
+    if (_indexBuildInterceptor) {
+        shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+            [svcCtx = opCtx->getServiceContext(), indexIdent = indexBuildInfo.indexIdent](
+                OperationContext*, boost::optional<Timestamp>) {
+                index_builds::getPendingInterceptors(svcCtx).erase(indexIdent);
+            });
+    } else {
+        _indexBuildInterceptor =
+            std::make_shared<IndexBuildInterceptor>(opCtx,
+                                                    indexBuildInfo,
+                                                    LazyRecordStore::CreateMode::openExisting,
+                                                    writableEntry->descriptor()->unique());
+    }
     writableEntry->setIndexBuildInterceptor(_indexBuildInterceptor);
 
     _completeInit(opCtx, collection);
@@ -147,11 +166,8 @@ Status IndexBuildBlock::init(OperationContext* opCtx,
         // Primary-driven index builds use replicated tables rather than temporary local tables, so
         // they need to be created at a consistent timestamp on all nodes. Currently this is done by
         // creating them eagerly rather than as needed.
-        // TODO(SERVER-110289): Use utility function instead of checking fcvSnapshot.
-        const auto fcvSnapshot = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
-        auto isPrimaryDrivenIndexBuild = fcvSnapshot.isVersionInitialized() &&
-            feature_flags::gFeatureFlagPrimaryDrivenIndexBuilds.isEnabled(
-                VersionContext::getDecoration(opCtx), fcvSnapshot);
+        auto isPrimaryDrivenIndexBuild = index_builds::primary_driven::enabled(
+            opCtx, serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
         auto mode = isPrimaryDrivenIndexBuild ? LazyRecordStore::CreateMode::immediate
                                               : LazyRecordStore::CreateMode::deferred;
 
@@ -301,6 +317,7 @@ Status IndexBuildBlock::buildEmptyIndex(OperationContext* opCtx,
     if (feature_flags::gFeatureFlagPathArrayness.isEnabled()) {
         CollectionQueryInfo::get(collection).rebuildPathArrayness(opCtx, collection);
     }
+    join_ordering::bumpCollectionVersionForDDL(collection);
 
     return Status::OK();
 }

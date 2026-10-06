@@ -13,7 +13,6 @@
 #include <boost/filesystem/path.hpp>
 #include <boost/move/utility_core.hpp>
 #include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "boost/system/detail/error_code.hpp"
 #include <fmt/format.h>
 
 #ifndef _WIN32
@@ -60,6 +59,7 @@
 #if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
 #include <unistd.h>
 #endif
+// IWYU pragma: no_include "boost/system/detail/error_code.hpp"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -1596,6 +1596,9 @@ private:
     const std::string _configName;
 };
 
+// In secure compilation mode the option is not registered at all, so there is nothing left to
+// exercise here: the parser rejects it before any of the validation below can run.
+#ifndef MONGO_CONFIG_EXT_SIG_SECURE
 class ExtensionsSignaturePubKeyPathOptionTest : public ParseAndSetupStringPathParameterOptionTest {
 public:
     ExtensionsSignaturePubKeyPathOptionTest()
@@ -1628,6 +1631,8 @@ TEST_F(ExtensionsSignaturePubKeyPathOptionTest, NonexistentFile) {
                                     ConfigSource::kCommandLine,
                                     {ErrorCodes::BadValue, "the provided file does not exist"});
 }
+
+#endif  // not MONGO_CONFIG_EXT_SIG_SECURE
 
 class ExtensionsConfigPathOptionTest : public ParseAndSetupStringPathParameterOptionTest {
 public:

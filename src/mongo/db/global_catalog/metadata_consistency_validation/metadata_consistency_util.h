@@ -3,25 +3,28 @@
 
 #pragma once
 
+#include "mongo/base/status.h"
 #include "mongo/db/global_catalog/metadata_consistency_validation/metadata_consistency_types_gen.h"
 #include "mongo/db/global_catalog/type_collection.h"
-#include "mongo/db/global_catalog/type_database_gen.h"
 #include "mongo/db/global_catalog/type_tags.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/client_cursor/cursor_response_gen.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/shard_role/shard_catalog/collection.h"
 #include "mongo/db/sharding_environment/shard_id.h"
 #include "mongo/util/modules.h"
+#include "mongo/util/time_support.h"
 
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
 
 namespace mongo {
-namespace metadata_consistency_util {
+namespace [[MONGO_MOD_PARENT_PRIVATE]] metadata_consistency_util {
 
 /**
  * The replica set status of this node.
@@ -50,6 +53,38 @@ MetadataInconsistencyItem makeInconsistency(
         details.toBSON()};
     item.setSeverity(severity);
     return item;
+}
+
+void logSnapshotUnavailableRetry(std::string_view checkName, size_t attempt, const Status& status);
+
+/**
+ * Retries `check` if it fails with SnapshotUnavailable, which may be transiently returned if the
+ * targeted node has not yet set a committed snapshot.
+ * TODO(SERVER-132541): consider removing this retry loop once repl. waits for a committed snapshot.
+ */
+template <typename Callable>
+auto snapshotUnavailableRetry(OperationContext* opCtx,
+                              std::string_view checkName,
+                              Callable&& check) {
+    if (repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime().has_value()) {
+        // If the caller already picked the snapshot (checkMetadataConsistency on secondaries),
+        // do not retry since all retries are expected to fail similarly. The caller must handle it.
+        return check();
+    }
+
+    static constexpr size_t kMaxAttempts = 30;
+    Backoff backoff{Milliseconds{250}, Milliseconds::max()};
+    for (size_t attempt = 1;; ++attempt) {
+        try {
+            return check();
+        } catch (const ExceptionFor<ErrorCodes::SnapshotUnavailable>& ex) {
+            if (attempt >= kMaxAttempts) {
+                throw;
+            }
+            logSnapshotUnavailableRetry(checkName, attempt, ex.toStatus());
+            opCtx->sleepFor(backoff.nextSleep());
+        }
+    }
 }
 
 /**
@@ -90,6 +125,7 @@ std::vector<MetadataInconsistencyItem> checkCollectionMetadataConsistency(
     const std::vector<CollectionPtr>& localCatalogCollections,
     bool checkRangeDeletionIndexes,
     bool optionalCheckIndexes,
+    int64_t strictChunkChecksThreshold,
     RSNodeMode rsMode = RSNodeMode::kPrimary,
     const stdx::unordered_set<NamespaceString>& collectionsUnderCs = {});
 
@@ -147,18 +183,6 @@ std::vector<MetadataInconsistencyItem> checkCollectionShardingMetadataConsistenc
     OperationContext* opCtx, const CollectionType& collection);
 
 /**
- * Checks for inconsistencies in the database's metadata between the global catalog and the
- * shard catalog.
- *
- * The list of inconsistencies is returned as a vector of MetadataInconsistencies objects. If
- * there is no inconsistency, it returns an empty vector.
- */
-std::vector<MetadataInconsistencyItem> checkDatabaseMetadataConsistency(
-    OperationContext* opCtx,
-    const DatabaseType& dbInGlobalCatalog,
-    RSNodeMode rsMode = RSNodeMode::kPrimary);
-
-/**
  * Checks that this shard's config database shard catalog collections match the current FCV
  * (e.g. on FCV 9.0+, the legacy config.cache.* collections should not exist).
  */
@@ -188,6 +212,7 @@ runCheckMetadataConsistencyOnParticipant(OperationContext* opCtx,
                                          const ShardId& primaryShardId,
                                          bool checkRangeDeletionIndexes,
                                          bool checkIndexes,
+                                         int64_t strictChunkChecksThreshold,
                                          RSNodeMode rsMode);
 
 }  // namespace metadata_consistency_util

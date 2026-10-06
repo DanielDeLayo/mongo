@@ -772,6 +772,14 @@ private:
         };
     }
 
+    // Single chokepoint for producing BinData results from $convert. Every conversion that
+    // assembles a BinData payload must go through here so the result is structurally valid.
+    static Value makeBinData(const void* data, int len, BinDataType binDataType) {
+        BSONBinData binData{data, len, binDataType};
+        convert_utils::uassertValidUserConstructedBinData(binData);
+        return Value(binData);
+    }
+
     static Value parseStringToBinData(ExpressionContext* const expCtx,
                                       Value inputValue,
                                       FormatArg format,
@@ -779,31 +787,27 @@ private:
         auto input = inputValue.getStringData();
         auto binDataType = computeBinDataType(subtypeValue);
 
+        std::string decoded;
         try {
             uassert(4341116,
                     "Only the 'uuid' format is allowed with the UUID subtype",
                     (format == BinDataFormat::kUuid) == (binDataType == BinDataType::newUUID));
 
             switch (format) {
-                case BinDataFormat::kBase64: {
-                    auto decoded = base64::decode(input);
-                    return Value(BSONBinData(decoded.data(), decoded.size(), binDataType));
-                }
-                case BinDataFormat::kBase64Url: {
-                    auto decoded = base64url::decode(input);
-                    return Value(BSONBinData(decoded.data(), decoded.size(), binDataType));
-                }
-                case BinDataFormat::kHex: {
-                    auto decoded = hexblob::decode(input);
-                    return Value(BSONBinData(decoded.data(), decoded.size(), binDataType));
-                }
-                case BinDataFormat::kUtf8: {
+                case BinDataFormat::kBase64:
+                    decoded = base64::decode(input);
+                    break;
+                case BinDataFormat::kBase64Url:
+                    decoded = base64url::decode(input);
+                    break;
+                case BinDataFormat::kHex:
+                    decoded = hexblob::decode(input);
+                    break;
+                case BinDataFormat::kUtf8:
                     uassert(
                         4341119, str::stream() << "Invalid UTF-8: " << input, isValidUTF8(input));
-
-                    auto decoded = std::string{input};
-                    return Value(BSONBinData(decoded.data(), decoded.size(), binDataType));
-                }
+                    decoded = std::string{input};
+                    break;
                 case BinDataFormat::kUuid: {
                     auto uuid = uassertStatusOK(UUID::parse(input));
                     return Value(uuid);
@@ -817,6 +821,8 @@ private:
                       str::stream() << "Failed to parse BinData '" << inputValue.getString()
                                     << "' in $convert with no onError value: " << ex.reason());
         }
+
+        return makeBinData(decoded.data(), static_cast<int>(decoded.size()), binDataType);
     }
 
     static Value performConvertToTrue(ExpressionContext* const expCtx, Value inputValue) {
@@ -891,7 +897,7 @@ private:
                 "Conversions between different BinData subtypes are not supported",
                 binData.type == computeBinDataType(subtypeValue));
 
-        return Value(BSONBinData{binData.data, binData.length, binData.type});
+        return makeBinData(binData.data, binData.length, binData.type);
     }
 
     using dType = convert_utils::dType;
@@ -977,12 +983,6 @@ private:
                                               Value inputValue,
                                               ByteOrderArg byteOrder,
                                               SubtypeArg subtypeValue) {
-        if (!feature_flags::gFeatureFlagConvertBinDataVectors.isEnabled(
-                expCtx->versionContextForFeatureFlagCheck(),
-                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
-            uasserted(10506607, "$convert from BinData vector to BSON array is not enabled");
-        }
-
         auto binData = inputValue.getBinData();
         uassert(ErrorCodes::ConversionFailure,
                 "Conversion from binData to array is only supported for bindata with the vector "
@@ -997,16 +997,13 @@ private:
                                               Value inputValue,
                                               ByteOrderArg byteOrder,
                                               SubtypeArg subtypeValue) {
-        if (!feature_flags::gFeatureFlagConvertBinDataVectors.isEnabled(
-                expCtx->versionContextForFeatureFlagCheck(),
-                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
-            uasserted(10506608, "$convert from BSON array to BinData vector is not enabled");
-        }
+        // Validate the requested subtype even though we always produce a Vector below.
+        computeBinDataType(subtypeValue, true /* allowVector */);
 
         uassert(ErrorCodes::ConversionFailure,
                 "Converting array to BinData requires array",
                 inputValue.isArray());
-        auto arr = inputValue.getArray();
+        const auto& arr = inputValue.getArray();
         // Scan the array to pick a dtype value.
         // PackedBit can be used if all values are 0 or 1.
         dType currentType = dType::PACKED_BIT;
@@ -1055,7 +1052,11 @@ private:
                     // Note that casting to a float here truncates the double and may lose
                     // precision.
                     auto value = writeNumberAccordingToEndianness<float>(
-                        static_cast<float>(obj.coerceToDouble()), byteOrder, subtypeValue);
+                        static_cast<float>(obj.coerceToDouble()),
+                        byteOrder,
+                        // The subtype doesn't matter here. We pass in BinDataGeneral to skip
+                        // validation. The actual Vector BinData is built and validated below.
+                        BinDataType::BinDataGeneral);
                     auto binData = value.getBinData();
                     byteArray.resize(byteArray.size() + sizeof(float));
                     std::memcpy(byteArray.data() + byteArray.size() - sizeof(float),
@@ -1071,10 +1072,10 @@ private:
                     "Mismatched padding after serializing array to binData vector",
                     actualPadding == padding);
         }
-        auto thisBinData = BSONBinData(byteArray.data(), byteArray.size(), BinDataType::Vector);
         // Note that the Value internals copy the data inside of the binData vector into a new
         // std::string_view so we do not have to worry about ownership semantics here.
-        return Value(std::move(thisBinData));
+        return makeBinData(
+            byteArray.data(), static_cast<int>(byteArray.size()), BinDataType::Vector);
     }
 
     template <class ReturnType, class SizeClass>
@@ -1142,8 +1143,7 @@ private:
     template <class ValueType>
     static Value writeNumberAccordingToEndianness(ValueType inputValue,
                                                   ConvertByteOrderType byteOrder,
-                                                  SubtypeArg subtypeValue) {
-        auto binDataType = computeBinDataType(subtypeValue);
+                                                  BinDataType binDataType) {
         std::array<char, sizeof(ValueType)> valBytes;
         DataView dataView(valBytes.data());
         switch (byteOrder) {
@@ -1156,7 +1156,9 @@ private:
             default:
                 MONGO_UNREACHABLE_TASSERT(9130005);
         }
-        return Value(BSONBinData{valBytes.data(), static_cast<int>(valBytes.size()), binDataType});
+        // sizeof(ValueType) is a compile-time constant (4 or 8 for numeric types) and never equals
+        // 16, so makeBinData always rejects bdtUUID, newUUID and MD5Type on numeric inputs.
+        return makeBinData(valBytes.data(), static_cast<int>(valBytes.size()), binDataType);
     }
 
     static Value performConvertIntToBinData(ExpressionContext* const expCtx,
@@ -1164,7 +1166,7 @@ private:
                                             ByteOrderArg byteOrder,
                                             SubtypeArg subtypeValue) {
         return writeNumberAccordingToEndianness<int32_t>(
-            inputValue.getInt(), byteOrder, subtypeValue);
+            inputValue.getInt(), byteOrder, computeBinDataType(subtypeValue));
     }
 
     static Value performConvertLongToBinData(ExpressionContext* const expCtx,
@@ -1172,7 +1174,7 @@ private:
                                              ByteOrderArg byteOrder,
                                              SubtypeArg subtypeValue) {
         return writeNumberAccordingToEndianness<int64_t>(
-            inputValue.getLong(), byteOrder, subtypeValue);
+            inputValue.getLong(), byteOrder, computeBinDataType(subtypeValue));
     }
 
     static Value performConvertDoubleToBinData(ExpressionContext* const expCtx,
@@ -1180,7 +1182,7 @@ private:
                                                ByteOrderArg byteOrder,
                                                SubtypeArg subtypeValue) {
         return writeNumberAccordingToEndianness<double>(
-            inputValue.getDouble(), byteOrder, subtypeValue);
+            inputValue.getDouble(), byteOrder, computeBinDataType(subtypeValue));
     }
 
     static Value performConvertObjectToBinData(ExpressionContext* const expCtx,
@@ -1195,16 +1197,10 @@ private:
 
         auto bsonObj = inputValue.getDocument().toBson();
         auto binDataType = computeBinDataType(subtypeValue);
-        return Value(BSONBinData(bsonObj.objdata(), bsonObj.objsize(), binDataType));
+        return makeBinData(bsonObj.objdata(), bsonObj.objsize(), binDataType);
     }
 
-    static bool isValidUserDefinedBinDataType(int typeCode) {
-        static const auto smallestUserDefinedType = BinDataType::bdtCustom;
-        static const auto largestUserDefinedType = static_cast<BinDataType>(255);
-        return (smallestUserDefinedType <= typeCode) && (typeCode <= largestUserDefinedType);
-    }
-
-    static BinDataType computeBinDataType(Value subtypeValue) {
+    static BinDataType computeBinDataType(Value subtypeValue, bool allowVector = false) {
         if (subtypeValue.numeric()) {
             uassert(4341106,
                     "In $convert, numeric 'subtype' argument is not an integer",
@@ -1215,10 +1211,44 @@ private:
                     str::stream() << "In $convert, numeric value for 'subtype' does not correspond "
                                      "to a BinData type: "
                                   << typeCode,
-                    // Allowed ranges are 0-8 (pre-defined types) and 128-255 (user-defined types).
-                    isValidBinDataType(typeCode) || isValidUserDefinedBinDataType(typeCode));
+                    isValidBinDataType(typeCode) ||
+                        convert_utils::isValidUserDefinedBinDataType(typeCode));
 
-            return static_cast<BinDataType>(typeCode);
+            // User-defined subtypes are always allowed.
+            if (convert_utils::isValidUserDefinedBinDataType(typeCode)) {
+                return static_cast<BinDataType>(typeCode);
+            }
+
+            switch (static_cast<BinDataType>(typeCode)) {
+                // Allowed conversion targets.
+                case BinDataType::BinDataGeneral:
+                case BinDataType::Function:
+                case BinDataType::bdtUUID:
+                case BinDataType::newUUID:
+                case BinDataType::MD5Type:
+                case BinDataType::Sensitive:
+                    return static_cast<BinDataType>(typeCode);
+                case BinDataType::Vector:
+                    // 'onError' needs to apply to invalid conversions to Vector. Hence we throw a
+                    // ConversionFailure.
+                    uassert(ErrorCodes::ConversionFailure,
+                            "$convert to BinData subtype Vector (9) is only allowed when "
+                            "converting from an array",
+                            allowVector);
+                    return BinDataType::Vector;
+                // Conversions to any other subtype are not allowed.
+                case BinDataType::ByteArrayDeprecated:
+                    uasserted(13016800,
+                              "$convert to BinData subtype ByteArrayDeprecated (2) is not allowed");
+                case BinDataType::Encrypt:
+                    uasserted(13016801, "$convert to BinData subtype Encrypt (6) is not allowed");
+                case BinDataType::Column:
+                    uasserted(12910300, "$convert to BinData subtype Column (7) is not allowed");
+                default:
+                    uasserted(12978503,
+                              str::stream() << "$convert to BinData subtype " << typeCode
+                                            << " is not allowed");
+            }
         }
 
         uasserted(

@@ -1,15 +1,8 @@
 /**
  * Verifies extension rewrite-rule optimizations still fire (and stay correct) when the extension
- * stage runs inside a $unionWith/$lookup subpipeline, across these placements:
- * Every placement runs the full rule set, across both $unionWith and $lookup:
- *   - no view              : both the outer query and the operator target plain collections.
- *   - sub-view             : the operator targets a view that supplies the extension stage.
- *   - top view             : the query runs on a top-level view; the operator subpipeline holds the
- *                            extension.
- *   - both                 : top-level view + a sub-view supplying the extension.
- *   - plain view           : the operator targets a non-extension view; the extension is in the
- *                            subpipeline.
- *   - plain view + top view: the above, with the query also running on a top-level view.
+ * stage runs inside a $unionWith/$lookup subpipeline. Every placement in PLACEMENTS below runs the
+ * full rule set against both operators, varying whether the extension arrives via a view prefix or
+ * the subpipeline head and whether the outer query itself runs on a view.
  *
  * @tags: [
  *   featureFlagExtensionsAPI,
@@ -100,14 +93,13 @@ const RULES = [
     {
         name: "pipeline bounds ($limit)",
         coll: vssColl,
-        // $limit covers all of vssColl so the result is deterministic (an unsorted $limit smaller
-        // than the collection picks an arbitrary subset that differs between the direct and wrapped
-        // runs).
+        // $limit covers all of vssColl so the result is deterministic; a smaller unsorted $limit
+        // would pick different subsets in the direct and wrapped runs.
         ext: desugarFalse,
         sub: [{$limit: 3}],
         opt: (e, op) => {
             const lim = subSpec(e, op, "$testVectorSearch")?.limit;
-            // Flag on: host skips setExtractedLimitVal_deprecated(), so the extension reports the
+            // The host skips setExtractedLimitVal_deprecated(), so the extension reports the
             // discrete max under pipelineBoundsLimit rather than extractedLimit.
             assert.eq(lim?.pipelineBoundsLimit, 3, "pipelineBoundsLimit", {e});
             assert.eq(lim?.minBoundsType, "discrete", "minBoundsType", {e});
@@ -175,13 +167,7 @@ describe("extension optimizations in $unionWith/$lookup subpipelines", function 
 
     afterEach(dropViews);
 
-    // Each placement says where the extension is delivered and how the kFirst $readNDocuments
-    // family behaves there:
-    //   ok        - runs normally (the operator's `from` is a plain collection).
-    //   lookupGap - $produceIds is logically first, but $lookup-on-a-view inserts a foreign source
-    //               ahead of it, so it fails under $lookup on all topologies ($unionWith is fine).
-    //   reject    - a non-extension view's pipeline precedes the kFirst source, so it is correctly
-    //               rejected with 40602 on both operators.
+    // Each placement describes where the extension is delivered and how the source stage behaves.
     // extInView: the view supplies the extension (so only the interacting stages form the
     // subpipeline). topDef: the outer view's definition, present when the query runs on a view.
     const PLACEMENTS = [
@@ -197,7 +183,7 @@ describe("extension optimizations in $unionWith/$lookup subpipelines", function 
         },
         {
             desc: "across sub-view boundary",
-            kFirst: "lookupGap",
+            kFirst: "ok",
             extInView: true,
             setup: (rule) => ({
                 outer: rule.coll.getName(),
@@ -220,7 +206,7 @@ describe("extension optimizations in $unionWith/$lookup subpipelines", function 
         },
         {
             desc: "with views at top level and sub-view",
-            kFirst: "lookupGap",
+            kFirst: "ok",
             extInView: true,
             setup: (rule) => {
                 const topDef = [{$addFields: {__t: 1}}];
@@ -261,10 +247,6 @@ describe("extension optimizations in $unionWith/$lookup subpipelines", function 
             for (const placement of PLACEMENTS) {
                 for (const rule of RULES) {
                     const kFirst = rule.coll === produceColl;
-                    // The kFirst source inside a $lookup-on-a-view is a known gap (see above); skip.
-                    if (kFirst && placement.kFirst === "lookupGap" && op.name === "$lookup") {
-                        continue;
-                    }
                     it(`${rule.name} ${placement.desc}`, function () {
                         const {outer, target, topDef} = placement.setup(rule);
                         const sub = placement.extInView ? rule.sub : [rule.ext, ...rule.sub];

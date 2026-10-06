@@ -374,7 +374,7 @@ error_codes:
     }
   - {code: 144, name: IncompatibleCatalogManager}
   - {code: 145, name: PooledConnectionsDropped}
-  - {code: 146, name: ExceededMemoryLimit, categories: [ValidationError]}
+  - {code: 146, name: ExceededMemoryLimit}
   - {code: 147, name: ZLibError}
   - {
       code: 148,
@@ -1140,12 +1140,10 @@ error_codes:
       name: StreamProcessorPrivateNetworkingError,
       categories: [StreamProcessorRetryableError],
     }
-  - {
-      code: 479,
-      name: IFRFlagRetry,
-      categories: [RetriableError],
-      extra: IFRFlagRetryInfo,
-    }
+  # Not tagged RetriableError: IFRFlagRetry is retryable only by the query-layer handlers, which
+  # disable the offending feature flag before re-running. It must never be retried verbatim (with the
+  # same command) at the network layer, so it deliberately carries no RetriableError category.
+  - {code: 479, name: IFRFlagRetry, extra: IFRFlagRetryInfo}
   # TODO SERVER-131201: make UnrecognizedIFRFlagInfo non-optional once all wire-compatible versions
   # send it (extraIsOptional avoids transforming the error on a newer receiver during the
   # multiversion window when a peer emits UnrecognizedIFRFlag without the extra info).
@@ -1298,14 +1296,12 @@ error_codes:
       categories: [IndexKeyExtractionError],
     }
 
-  # Retry with backoff only; zero-delay retry re-enters the limit and creates a positive
-  # feedback loop. See `internalQueryWriteConflictRetryLimitMax` for the configuration knob.
-  - {
-      code: 512,
-      name: WriteConflictRetryLimitExceeded,
-      categories: [SystemOverloadedError, RetriableError],
-    }
-
+  # Removed in v9.1
+  # - {
+  #     code: 512,
+  #     name: WriteConflictRetryLimitExceeded,
+  #     categories: [SystemOverloadedError, RetriableError],
+  #   }
   # A retryable user error from the stream processor's target Atlas cluster.
   - {
       code: 513,
@@ -1313,6 +1309,16 @@ error_codes:
       categories: [StreamProcessorUserError, StreamProcessorRetryableError],
     }
   - {code: 514, name: LightweightStepdownConflict}
+  - {
+      code: 515,
+      name: ConnectionClosedByPeer,
+      categories: [NetworkError, RetriableError],
+    }
+  - {
+      code: 516,
+      name: ConnectionEstablishmentTimeout,
+      categories: [NetworkError, RetriableError],
+    }
 
   # Extensions API errors that flag an error due to the extension itself.
   # Extension has a malformed vtable.
@@ -1321,6 +1327,46 @@ error_codes:
   - {code: 518, name: ExtensionSerializationError, categories: [ExtensionError]}
   # Any other extension logical error.
   - {code: 519, name: ExtensionError, categories: [ExtensionError]}
+
+  # TODO (SERVER-98118): remove once 9.0 becomes last LTS.
+  - {
+      code: 520,
+      name: DDLCoordinatorMustRetryDueToFCVTransition,
+      categories: [InternalOnly],
+    }
+  - {
+      code: 521,
+      name: QueryMemoryLimitExceeded,
+      categories: [SystemOverloadedError, RetriableError],
+    }
+
+  - {code: 522, name: RetryBackoff}
+
+  - {code: 523, name: InvalidBSONFromJavaScript, categories: [ValidationError]}
+
+  - {code: 524, name: CommitPendingNamespaceOrUUID, categories: [InternalOnly]}
+
+  # Used for defensive BSON checks, and should only be used inside BSONObj and BSONElement.
+  # Detection of invalid BSON at other layers should use other error codes, such as
+  # ErrorCodes::InvalidBSON or ErrorCodes::NonConformantBSON.
+  - {code: 525, name: BSONInternalError, categories: [CloseConnectionError]}
+
+  - {
+      code: 526,
+      name: StreamProcessorPreviewConnectTimeout,
+      categories: [StreamProcessorUserError, StreamProcessorRetryableError],
+    }
+
+  - {
+      code: 527,
+      name: StreamProcessorMaterializeError,
+      categories: [StreamProcessorUserError],
+    }
+
+  # A KMIP server rejected a request for a reason that could succeed on a retry.
+  # Uncategorized because RetryableKMIPService does the retrying, and what escapes it
+  # should not be retried again.
+  - {code: 528, name: KMIPRetryableError}
 
   # ^^^^
   # Add new codes, sequentially numbered, above.

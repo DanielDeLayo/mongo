@@ -347,10 +347,10 @@ structs:
                 optional: true
                 stability: "internal"
             # Indicates whether write-based commands should be allowed even if the server is blocking
-            # user writes as part of replica set write blocking mode.
+            # user writes as part of replica set writes blocking.
             # Authorization: This field can only be set if the client possesses action type `internal`
-            # or `bypassReplicaSetWriteBlocking` on the `cluster` resource.
-            mayBypassReplicaSetWriteBlocking:
+            # or `bypassReplicaSetWritesBlocking` on the `cluster` resource.
+            mayBypassReplicaSetWritesBlocking:
                 type: bool
                 forward_to_shards: false
                 optional: true
@@ -380,16 +380,6 @@ structs:
             # `startOrContinueTransaction: true` on the request it is sending to the targeted shard.
             startOrContinueTransaction:
                 type: bool
-                forward_to_shards: true
-                optional: true
-                stability: "internal"
-            # OpenTelemetry trace context used for tracking this operation across a replica set or
-            # a sharded cluster for debugging purposes. The propagation of trace contexts is only
-            # supported on mongods, mongoses and legacy shell compiled with ENABLE_OTEL_BUILD set.
-            # Currently, this is only set for testing binaries.
-            $traceCtx:
-                type: object_owned
-                cpp_name: "traceCtx"
                 forward_to_shards: true
                 optional: true
                 stability: "internal"
@@ -434,6 +424,15 @@ structs:
                 validator: {gte: 0}
                 # Manually appended by the egress metadata hook from an OperationContext decoration,
                 # not present in the original command BSON.
+                forward_to_shards: false
+                optional: true
+                stability: "internal"
+            # Set by the router to indicate that the transaction was initiated by the server itself
+            # (an internal transaction) rather than explicitly by a user. This lets the shard
+            # participant attribute its transaction lifecycle counters and metrics as internal vs.
+            # external.
+            isServerInitiatedTransaction:
+                type: bool
                 forward_to_shards: false
                 optional: true
                 stability: "internal"

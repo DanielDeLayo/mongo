@@ -3,13 +3,6 @@
 
 #include "mongo/db/global_catalog/chunk_manager.h"
 
-#include <absl/container/node_hash_map.h>
-#include <absl/meta/type_traits.h>
-#include <boost/move/utility_core.hpp>
-#include <boost/none.hpp>
-#include <boost/optional.hpp>
-#include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
@@ -29,6 +22,14 @@
 #include <iterator>
 #include <string_view>
 #include <tuple>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -1231,46 +1232,6 @@ ShardEndpoint::ShardEndpoint(const ShardId& shardName,
 bool ShardEndpoint::operator==(const ShardEndpoint& other) const {
     return shardName == other.shardName && databaseVersion == other.databaseVersion &&
         shardVersion == other.shardVersion;
-}
-
-bool EndpointComp::operator()(const ShardEndpoint* endpointA,
-                              const ShardEndpoint* endpointB) const {
-    const int shardNameDiff = endpointA->shardName.compare(endpointB->shardName);
-    if (shardNameDiff)
-        return shardNameDiff < 0;
-
-    if (endpointA->shardVersion && endpointB->shardVersion) {
-        const int epochDiff = endpointA->shardVersion->placementVersion().epoch().compare(
-            endpointB->shardVersion->placementVersion().epoch());
-        if (epochDiff)
-            return epochDiff < 0;
-
-        const int shardVersionDiff = endpointA->shardVersion->placementVersion().toLong() -
-            endpointB->shardVersion->placementVersion().toLong();
-        if (shardVersionDiff)
-            return shardVersionDiff < 0;
-    } else if (!endpointA->shardVersion && !endpointB->shardVersion) {
-        // TODO (SERVER-51070): Can only happen if the destination is the config server
-        return false;
-    } else {
-        // TODO (SERVER-51070): Can only happen if the destination is the config server
-        return !endpointA->shardVersion && endpointB->shardVersion;
-    }
-
-    if (endpointA->databaseVersion && endpointB->databaseVersion) {
-        if (auto uuidDiff =
-                endpointA->databaseVersion->getUuid() <=> endpointB->databaseVersion->getUuid();
-            uuidDiff != 0)
-            return uuidDiff < 0;
-
-        return endpointA->databaseVersion->getLastMod() < endpointB->databaseVersion->getLastMod();
-    } else if (!endpointA->databaseVersion && !endpointB->databaseVersion) {
-        return false;
-    } else {
-        return !endpointA->databaseVersion && endpointB->databaseVersion;
-    }
-
-    MONGO_UNREACHABLE_TASSERT(10083536);
 }
 
 Chunk getChunkForMaxBound(const ChunkManager& cm, const BSONObj& max) {

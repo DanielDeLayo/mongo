@@ -21,6 +21,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
 #include <algorithm>
@@ -499,6 +500,22 @@ TEST_F(PipelineDependencyGraphTest, LookupWithAbsorbedUnwindArrayIndexIsNotArray
     });
 }
 
+TEST_F(PipelineDependencyGraphTest, CanPathBeArrayUnwindArrayIndexIsNotSubpipeline) {
+    setOptimizedPipeline(R"([
+        {$lookup: {
+            from: "coll_b",
+            as: "docs",
+            pipeline: [{$set: {b_ssn: 2}}]
+        }},
+        {$unwind: {path: "$docs", includeArrayIndex: "docsIdx"}}
+    ])");
+
+    runTest([&] {
+        ASSERT_TRUE(graph->canPathBeArray(nullptr, "docsIdx.b_ssn"));
+        ASSERT_FALSE(graph->canPathBeArray(nullptr, "docs.b_ssn"));
+    });
+}
+
 TEST_F(PipelineDependencyGraphTest, SubPipelineCanPathBeArrayUnknownSubField) {
     setOptimizedPipeline(R"([
         {$lookup: {
@@ -535,6 +552,22 @@ TEST_F(PipelineDependencyGraphTest, SubPipelineGetDeclaringStageThenMatch) {
         auto subDeclaringStage = subGraph->getPrevModifyingStage(nullptr, "b_ssn");
         ASSERT_EQUALS(result.srcStages.back(), subDeclaringStage);
         ASSERT_TRUE(result.fromSubpipeline);
+    });
+}
+
+TEST_F(PipelineDependencyGraphTest, SubPipelineUnwindArrayIndexNotFromSubpipeline) {
+    setOptimizedPipeline(
+        "[{$lookup: {from: 'coll_b', localField: 'x', foreignField: 'y', as: 'e', "
+        "            pipeline: [{$set: {b_ssn: 2}}]}}, "
+        " {$unwind: {path: '$e', includeArrayIndex: 'idx'}}]");
+    runTest([&] {
+        auto idxResult =
+            graph->getPrevModifyingStageIncludingSubpipelines_forTest(nullptr, "idx.b_ssn");
+        ASSERT_FALSE(idxResult.fromSubpipeline);
+
+        auto embeddedResult =
+            graph->getPrevModifyingStageIncludingSubpipelines_forTest(nullptr, "e.b_ssn");
+        ASSERT_TRUE(embeddedResult.fromSubpipeline);
     });
 }
 
@@ -1903,6 +1936,48 @@ TEST_F(PipelineDependencyGraphTest, TruncateWithSwappedStages) {
 
     // Must grow to size 5, not truncate because of stale B.
     ASSERT_DOES_NOT_THROW(graph->resize(container.end()));
+}
+
+using PipelineDependencyGraphDeathTest = PipelineDependencyGraphTest;
+
+DEATH_TEST_REGEX_F(PipelineDependencyGraphDeathTest,
+                   PipelineEndOnPartialGraphThrows,
+                   "Tripwire assertion.*13118101") {
+    setPipeline(
+        "[{$set: {a: 1}},"
+        " {$set: {a: 2}}]");
+    auto& container = pipeline->getSources();
+    graph = std::make_unique<DependencyGraph>(container, std::next(container.begin()));
+
+    ASSERT_THROWS_CODE(graph->getPrevModifyingStage(nullptr, "a"), AssertionException, 13118101);
+}
+
+DEATH_TEST_REGEX_F(PipelineDependencyGraphDeathTest,
+                   PipelineEndOnPartialGraphAfterResizeThrows,
+                   "Tripwire assertion.*13118101") {
+    setPipeline(
+        "[{$set: {a: 1}},"
+        " {$set: {a: 2}}]");
+    auto& container = pipeline->getSources();
+    ASSERT_DOES_NOT_THROW(graph->getPrevModifyingStage(nullptr, "a"));
+
+    graph->resize(std::next(container.begin()));
+    ASSERT_THROWS_CODE(graph->getPrevModifyingStage(nullptr, "a"), AssertionException, 13118101);
+}
+
+DEATH_TEST_REGEX_F(PipelineDependencyGraphDeathTest,
+                   PipelineEndOnEmptyGraphThrows,
+                   "Tripwire assertion.*13118101") {
+    setPipeline("[{$set: {a: 1}}]");
+    auto& container = pipeline->getSources();
+    graph = std::make_unique<DependencyGraph>(container, container.begin());
+
+    ASSERT_THROWS_CODE(graph->getPrevModifyingStage(nullptr, "a"), AssertionException, 13118101);
+}
+
+TEST_F(PipelineDependencyGraphTest, PipelineEndOnEmptyPipelineWorks) {
+    setPipeline("[]");
+    ASSERT_DOES_NOT_THROW(graph->getPrevModifyingStage(nullptr, "a"));
 }
 
 TEST_F(PipelineDependencyGraphTest, ArrayLeafSiblingRedeclared) {
@@ -3405,6 +3480,22 @@ TEST_F(PipelineDependencyGraphTest, ResolveFieldOriginSubpipelineCrossing) {
                      FieldOriginKind::kOther,
                      stages[0].get(),
                      nullptr);
+    });
+}
+
+TEST_F(PipelineDependencyGraphTest, ResolveFieldOriginUnwindArrayIndexIsNotSubpipeline) {
+    setOptimizedPipeline(
+        "[{$lookup: {from: 'coll_b', localField: 'x', foreignField: 'y', as: 'e'}}, "
+        " {$unwind: {path: '$e', includeArrayIndex: 'idx'}}]");
+    runTest([&] {
+        assertOrigin(graph->resolveFieldOrigin(nullptr, "idx.y"),
+                     FieldOriginKind::kOther,
+                     stages[0].get(),
+                     nullptr);
+        assertOrigin(graph->resolveFieldOrigin(nullptr, "e.y"),
+                     FieldOriginKind::kSubpipeline,
+                     stages[0].get(),
+                     "y");
     });
 }
 

@@ -477,7 +477,8 @@ bool ReplicationCoordinatorNoOp::getWriteConcernMajorityShouldJournal() {
     MONGO_UNREACHABLE;
 }
 
-Status ReplicationCoordinatorNoOp::processHeartbeatV1(const ReplSetHeartbeatArgsV1&,
+Status ReplicationCoordinatorNoOp::processHeartbeatV1(OperationContext*,
+                                                      const ReplSetHeartbeatArgsV1&,
                                                       ReplSetHeartbeatResponse*) {
     MONGO_UNREACHABLE;
 }
@@ -507,7 +508,9 @@ void ReplicationCoordinatorNoOp::clearCommittedSnapshot() {
     MONGO_UNREACHABLE;
 }
 
-Status ReplicationCoordinatorNoOp::stepUpIfEligible(OperationContext* opCtx, bool skipDryRun) {
+Status ReplicationCoordinatorNoOp::stepUpIfEligible(OperationContext* opCtx,
+                                                    bool skipDryRun,
+                                                    boost::optional<Date_t>) {
     MONGO_UNREACHABLE;
 }
 

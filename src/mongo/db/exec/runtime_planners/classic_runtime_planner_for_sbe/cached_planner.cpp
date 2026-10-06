@@ -8,6 +8,7 @@
 #include "mongo/db/query/bind_input_params.h"
 #include "mongo/db/query/plan_cache/plan_cache_key_factory.h"
 #include "mongo/db/query/plan_executor_factory.h"
+#include "mongo/db/query/plan_ranking/plan_selection_strategy.h"
 #include "mongo/db/query/planner_analysis.h"
 #include "mongo/db/query/query_knobs/query_knob_configuration.h"
 #include "mongo/db/query/replanning_required_info.h"
@@ -26,7 +27,8 @@ namespace {
 class ValidCandidatePlanner : public PlannerBase {
 public:
     ValidCandidatePlanner(PlannerDataForSBE plannerData, sbe::plan_ranker::CandidatePlan candidate)
-        : PlannerBase(std::move(plannerData)), _candidate(std::move(candidate)) {}
+        : PlannerBase(std::move(plannerData), PlanSelectionStrategy::kCachedPlan),
+          _candidate(std::move(candidate)) {}
 
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeExecutor(
         std::unique_ptr<CanonicalQuery> canonicalQuery) override {
@@ -45,7 +47,9 @@ public:
                                            std::move(nss),
                                            extractSbeYieldPolicy(),
                                            std::move(remoteCursors),
-                                           std::move(remoteExplains));
+                                           std::move(remoteExplains),
+                                           boost::none /* cachedPlanHash */,
+                                           planSelectionStrategy());
     }
 
 
@@ -64,7 +68,8 @@ public:
                                                      .sbeYieldPolicy = extractSbeYieldPolicy()}},
             .plannerParams = extractPlannerParams(),
             .cachedPlanHash = cachedPlanHash(),
-            .engineSelection = EngineChoice::kSbe};
+            .engineSelection = EngineChoice::kSbe,
+            .planSelectionStrategy = planSelectionStrategy()};
     }
 
 private:
@@ -110,12 +115,13 @@ sbe::plan_ranker::CandidatePlan collectExecutionStatsForCachedPlan(
     const size_t maxTrialResultsFromPlanningRoot =
         plannerData.cq->cqPipeline().empty() ? 0 : maxNumResults;
 
-    sbe::plan_ranker::CandidatePlan candidate{std::move(solution),
-                                              std::move(root),
-                                              sbe::plan_ranker::CandidatePlanData{std::move(data)},
-                                              false /* exitedEarly*/,
-                                              Status::OK(),
-                                              true /*isCachedPlan*/};
+    sbe::plan_ranker::CandidatePlan candidate{
+        .solution = std::move(solution),
+        .root = std::move(root),
+        .data = sbe::plan_ranker::CandidatePlanData{std::move(data)},
+        .exitedEarly = false,
+        .status = Status::OK(),
+        .fromPlanCache = true};
     ON_BLOCK_EXIT([rootPtr = candidate.root.get()] { rootPtr->detachFromTrialRunTracker(); });
 
     // Callback for the tracker when it exceeds any of the tracked metrics. If the tracker exceeds
@@ -184,7 +190,10 @@ std::unique_ptr<PlannerInterface> replan(
                     "query"_attr = redact(plannerData.cq->toStringShort()),
                     "shouldCache"_attr = (shouldCache ? "yes" : "no"));
         return std::make_unique<SingleSolutionPassthroughPlanner>(
-            std::move(plannerData), std::move(solutions[0]), std::move(replanReason));
+            std::move(plannerData),
+            std::move(solutions[0]),
+            PlanSelectionStrategy::kSinglePlan,
+            std::move(replanReason));
     }
 
     // Multiple solutions. Resort to multiplanning.
@@ -197,7 +206,8 @@ std::unique_ptr<PlannerInterface> replan(
                                           std::move(solutions),
                                           shouldCache,
                                           incrementReplannedPlanIsCachedPlanCounterCb,
-                                          std::move(replanReason));
+                                          std::move(replanReason),
+                                          PlanSelectionStrategy::kMultiPlanner);
 }
 
 std::unique_ptr<PlannerInterface> attemptToUsePlan(

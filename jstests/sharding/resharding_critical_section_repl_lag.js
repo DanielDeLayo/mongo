@@ -120,4 +120,5 @@ moveCollThread.join();
 jsTest.log("Re-enable replication on the remaining secondaries on both the donor and recipient");
 restartServerReplication(st.rs0.getSecondaries());
 restartServerReplication(st.rs1.getSecondaries());
+
 st.stop();

@@ -23,7 +23,7 @@ boost::intrusive_ptr<exec::agg::Stage> documentSourceOutToStageFn(
     tassert(10561501, "expected 'DocumentSourceOut' type", ds);
 
     return make_intrusive<exec::agg::OutStage>(
-        ds->kStageName, ds->getExpCtx(), ds->getOutputNs(), ds->_timeseries, ds->getMergeShardId());
+        ds->kStageName, ds->getExpCtx(), ds->getOutputNs(), ds->_timeseries);
 }
 
 namespace exec {
@@ -225,8 +225,9 @@ void OutStage::createTemporaryCollection() {
             return ShardId(fpTarget.getData()["shardId"].String());
         } else {
             // If the output collection exists, we should create the temp collection on the shard
-            // that owns the output collection.
-            return _mergeShardId;
+            // that owns the output collection. Otherwise, it's created on the DB primary shard.
+            return pExpCtx->getMongoProcessInterface()->determineSpecificMergeShard(
+                pExpCtx->getOperationContext(), _outputNs);
         }
     }();
 
@@ -431,18 +432,11 @@ void OutStage::initialize() {
                         _commonStats.stageTypeStr),
             !_originalOutCollInfo || _originalOutCollInfo->options["capped"].eoo());
 
-    uassert(7406100,
-            "$out to time-series collections is only supported on FCV greater than or equal to 7.1",
-            feature_flags::gFeatureFlagAggOutTimeseries.isEnabled() || !_timeseries);
-
     createTemporaryCollection();
 }
 
 void OutStage::finalize() {
     DocumentSourceWriteBlock writeBlock(pExpCtx->getOperationContext());
-    uassert(7406101,
-            "$out to time-series collections is only supported on FCV greater than or equal to 7.1",
-            feature_flags::gFeatureFlagAggOutTimeseries.isEnabled() || !_timeseries);
 
     // Rename the temporary collection to the namespace the user requested, and drop the target
     // collection if $out is writing to a collection that exists.

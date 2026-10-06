@@ -442,6 +442,7 @@ BucketSpec::SplitPredicates BucketSpec::getPushdownPredicates(
             // to the buckets before unpacking. So we can use default values
             // for the rest of the arguments.
         };
+        bucketSpec.setUsesExtendedRange(expCtx->getRequiresTimeseriesExtendedRangeSupport());
         auto bucketPredicate =
             createPredicatesOnBucketLevelField(residualPred.get(),
                                                bucketSpec,

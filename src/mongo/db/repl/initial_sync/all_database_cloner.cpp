@@ -2,10 +2,8 @@
 // SPDX-License-Identifier: SSPL-1.0
 
 
-#include <boost/move/utility_core.hpp>
-#include <boost/none.hpp>
-#include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "ext/alloc_traits.h"
+#include "mongo/db/repl/initial_sync/all_database_cloner.h"
+
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
@@ -14,7 +12,6 @@
 #include "mongo/db/feature_flag.h"
 #include "mongo/db/multitenancy_gen.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/initial_sync/all_database_cloner.h"
 #include "mongo/db/repl/initial_sync/initial_syncer.h"
 #include "mongo/db/repl/member_data.h"
 #include "mongo/db/repl/member_state.h"
@@ -35,24 +32,32 @@
 #include <mutex>
 #include <string_view>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
 
 namespace mongo {
 namespace repl {
 using namespace std::literals::string_view_literals;
 
-AllDatabaseCloner::AllDatabaseCloner(InitialSyncSharedData* sharedData,
-                                     const HostAndPort& source,
-                                     DBClientConnection* client,
-                                     StorageInterface* storageInterface,
-                                     ThreadPool* dbPool,
-                                     std::shared_ptr<InitialSyncSummaryStats> summaryStats)
+AllDatabaseCloner::AllDatabaseCloner(
+    InitialSyncSharedData* sharedData,
+    const HostAndPort& source,
+    DBClientConnection* client,
+    StorageInterface* storageInterface,
+    ThreadPool* dbPool,
+    std::shared_ptr<InitialSyncSummaryStats> summaryStats,
+    std::shared_ptr<FastCountInitialSyncAggregator> fastCountAggregator)
     : InitialSyncBaseCloner(
           "AllDatabaseCloner"sv, sharedData, source, client, storageInterface, dbPool),
       _connectStage("connect", this, &AllDatabaseCloner::connectStage),
       _getInitialSyncIdStage("getInitialSyncId", this, &AllDatabaseCloner::getInitialSyncIdStage),
       _listDatabasesStage("listDatabases", this, &AllDatabaseCloner::listDatabasesStage),
-      _summaryStats(summaryStats) {}
+      _summaryStats(summaryStats),
+      _fastCountAggregator(std::move(fastCountAggregator)) {}
 
 BaseCloner::ClonerStages AllDatabaseCloner::getStages() {
     return {&_connectStage, &_getInitialSyncIdStage, &_listDatabasesStage};
@@ -245,7 +250,8 @@ void AllDatabaseCloner::postStage() {
                                                                       getClient(),
                                                                       getStorageInterface(),
                                                                       getDBPool(),
-                                                                      _summaryStats);
+                                                                      _summaryStats,
+                                                                      _fastCountAggregator);
         }
         auto dbStatus = _currentDatabaseCloner->run();
         if (dbStatus.isOK()) {

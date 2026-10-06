@@ -3,9 +3,11 @@
 
 #pragma once
 
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data_comparator.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collator_interface.h"
@@ -13,9 +15,11 @@
 #include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
 #include "mongo/db/timeseries/bucket_catalog/bucket_catalog.h"
 #include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/modules.h"
 #include "mongo/util/uuid.h"
 
+#include <cstring>
 #include <functional>
 #include <string_view>
 #include <utility>
@@ -285,4 +289,81 @@ protected:
     BSONObj _codeWScopeMeta = BSON(_metaField << BSONCodeWScope(_metaValue, BSON("x" << 1)));
     BSONObj _stringMeta = BSON(_metaField << _metaValue);
 };
+/**
+ * Predicts the OID that the next generateBucketOID call will produce, given an OID returned by
+ * the most recent call. The counter embedded in the non-timestamp portion is stored as a big-endian
+ * uint64 split across the InstanceUnique (5 bytes) and Increment (3 bytes) fields, and increments
+ * by 1 on each call.
+ */
+inline OID predictNextBucketOID(const OID& oid) {
+    uint8_t bits[8];
+    OID::InstanceUnique instance = oid.getInstanceUnique();
+    OID::Increment increment = oid.getIncrement();
+    std::memcpy(bits, instance.bytes, OID::kInstanceUniqueSize);
+    std::memcpy(bits + OID::kInstanceUniqueSize, increment.bytes, OID::kIncrementSize);
+
+    for (int i = 7; i >= 0; --i)
+        if (++bits[i] != 0)
+            break;
+
+    OID next;
+    next.setTimestamp(oid.getTimestamp());
+    OID::InstanceUnique newInstance;
+    std::memcpy(newInstance.bytes, bits, OID::kInstanceUniqueSize);
+    next.setInstanceUnique(newInstance);
+    OID::Increment newIncrement;
+    std::memcpy(newIncrement.bytes, bits + OID::kInstanceUniqueSize, OID::kIncrementSize);
+    next.setIncrement(newIncrement);
+    return next;
+}
+
+namespace bucket_catalog {
+inline StatusWith<TimeseriesWriteBatches> prepareInsertsToBuckets(
+    OperationContext* opCtx,
+    BucketCatalog& bucketCatalog,
+    const Collection* bucketsColl,
+    const TimeseriesOptions& timeseriesOptions,
+    OperationId opId,
+    const StringDataComparator* comparator,
+    uint64_t storageCacheSizeBytes,
+    bool earlyReturnOnError,
+    const CompressAndWriteBucketFunc& compressAndWriteBucketFunc,
+    const std::vector<BSONObj>& userMeasurementsBatch,
+    size_t startIndex,
+    size_t numDocsToStage,
+    const std::vector<size_t>& indices,
+    AllowQueryBasedReopening allowQueryBasedReopening,
+    std::vector<WriteStageErrorAndIndex>& errorsAndIndices) {
+    TimeseriesWriteBatches writeBatches;
+
+    try {
+        auto status = prepareInsertsToBuckets(opCtx,
+                                              bucketCatalog,
+                                              bucketsColl,
+                                              timeseriesOptions,
+                                              opId,
+                                              comparator,
+                                              storageCacheSizeBytes,
+                                              earlyReturnOnError,
+                                              compressAndWriteBucketFunc,
+                                              userMeasurementsBatch,
+                                              startIndex,
+                                              numDocsToStage,
+                                              indices,
+                                              allowQueryBasedReopening,
+                                              errorsAndIndices,
+                                              writeBatches);
+        if (!status.isOK()) {
+            // Nothing is staged when a non-OK status is returned, so there is nothing to abort.
+            return status;
+        }
+    } catch (...) {
+        abortWriteBatches(bucketCatalog, writeBatches, exceptionToStatus());
+        throw;
+    }
+
+    return std::move(writeBatches);
+}
+}  // namespace bucket_catalog
+
 }  // namespace mongo::timeseries

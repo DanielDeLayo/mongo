@@ -4,9 +4,6 @@
 
 #include "mongo/db/repl/oplog_applier_batcher.h"
 
-#include <boost/move/utility_core.hpp>
-#include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "cxxabi.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonelement.h"
@@ -36,6 +33,10 @@
 
 #include <algorithm>
 #include <mutex>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
@@ -301,6 +302,14 @@ OplogApplierBatcher::BatchAction OplogApplierBatcher::_getBatchActionForEntry(
         const auto& ns = NamespaceStringUtil::deserialize(boost::none,
                                                           cmd.firstElement().valueStringData(),
                                                           SerializationContext::stateDefault());
+        // During PIT restore, applying truncateRange oplog entries can cause enough cache pressure
+        // to stall oplog application. For that reason we want them to be processed individually so
+        // that the commit point can be moved forward in between applying truncateRange entries to
+        // relieve cache pressure.
+        if (storageGlobalParams.magicRestore) {
+            return OplogApplierBatcher::BatchAction::kProcessIndividually;
+        }
+
         if (ns.isChangeStreamPreImagesCollection()) {
             auto truncateRangeEntry = TruncateRangeOplogEntry::parse(cmd);
             const auto& maxRecordId = truncateRangeEntry.getMaxRecordId();

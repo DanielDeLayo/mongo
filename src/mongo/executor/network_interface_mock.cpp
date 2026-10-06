@@ -2,17 +2,12 @@
 // SPDX-License-Identifier: SSPL-1.0
 
 
-#include <absl/container/node_hash_map.h>
-#include <absl/meta/type_traits.h>
-#include <boost/move/utility_core.hpp>
-#include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "cxxabi.h"
-// IWYU pragma: no_include "ext/alloc_traits.h"
+#include "mongo/executor/network_interface_mock.h"
+
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status_with.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
-#include "mongo/executor/network_interface_mock.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/scopeguard.h"
@@ -24,6 +19,13 @@
 #include <iterator>
 #include <mutex>
 #include <type_traits>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
@@ -219,19 +221,26 @@ SemiFuture<void> NetworkInterfaceMock::setAlarm(const Date_t when, const Cancell
 
     lk.unlock();
 
+    // Resolve the alarm here instead of leaving it for the network thread to clean up. The network
+    // thread only advances when a test drives it, so a thread that cancels an alarm and then waits
+    // on it would block forever if the promise were resolved by runReadyNetworkOperations().
     token.onCancel().unsafeToInlineFuture().getAsync([this, id](Status status) {
         if (!status.isOK()) {
             return;
         }
 
-        std::lock_guard lk(_mutex);
-
+        std::unique_lock lk(_mutex);
         auto it = _alarmsById.find(id);
         if (it == _alarmsById.end()) {
             return;
         }
 
-        _canceledAlarms.insert(id);
+        auto alarm = std::move(it->second->second);
+        _alarms.erase(it->second);
+        _alarmsById.erase(it);
+
+        lk.unlock();
+        alarm.cancel();
     });
 
     return std::move(future).semi();
@@ -694,30 +703,9 @@ void NetworkInterfaceMock::_runReadyNetworkOperations_inlock(std::unique_lock<st
         AlarmInfo alarm = std::move(_alarms.begin()->second);
         _alarms.erase(_alarms.begin());
         _alarmsById.erase(alarm.id);
-        auto wasCanceled = _canceledAlarms.erase(alarm.id);
-
-        // If the handle isn't canceled, then run it
-        if (!wasCanceled) {
-            lk.unlock();
-            alarm.promise.emplaceValue();
-            lk.lock();
-        } else {
-            lk.unlock();
-            alarm.cancel();
-            lk.lock();
-        }
-    }
-
-    while (!_canceledAlarms.empty()) {
-        auto id = *_canceledAlarms.begin();
-        _canceledAlarms.erase(_canceledAlarms.begin());
-        auto it = _alarmsById[id];
-        AlarmInfo alarm = std::move(it->second);
-        _alarms.erase(it);
-        _alarmsById.erase(id);
 
         lk.unlock();
-        alarm.cancel();
+        alarm.promise.emplaceValue();
         lk.lock();
     }
 
@@ -762,6 +750,7 @@ void NetworkInterfaceMock::_runReadyNetworkOperations_inlock(std::unique_lock<st
             }
         }
     }
+
     invariant(_currentlyRunning == kNetworkThread);
     if (!(_waitingToRunMask & kExecutorThread)) {
         return;

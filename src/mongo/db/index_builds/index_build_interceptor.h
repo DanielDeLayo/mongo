@@ -19,12 +19,9 @@
 #include "mongo/db/storage/lazy_record_store.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/util/modules.h"
-// TODO (SERVER-126257): Remove once index build side writes cannot be torn.
-#include "mongo/util/uuid.h"
+#include "mongo/util/string_map.h"
 
 #include <cstdint>
-// TODO (SERVER-126257): Remove once index build side writes cannot be torn.
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -37,7 +34,11 @@ public:
     using RetrySkippedRecordMode = SkippedRecordTracker::RetrySkippedRecordMode;
     using DrainYieldPolicy = SideWritesTracker::DrainYieldPolicy;
 
-    enum class Op { kInsert, kDelete };
+    // Field names of the multikey state a side write record carries.
+    static constexpr std::string_view kSideWriteMultikeyFieldName = "multikey";
+    static constexpr std::string_view kSideWriteMultikeyPathsFieldName = "multikeyPaths";
+
+    enum class Op { kInsert, kDelete, kMultikey };
 
     /**
      * Indicates whether to record duplicate keys that have been inserted into the index. When set
@@ -91,6 +92,15 @@ public:
                                         const IndexCatalogEntry* indexCatalogEntry) const;
 
     /**
+     * Invoked, inside the transaction draining a batch, when that batch recovered multikey state
+     * from its records. It is handed everything this interceptor knows so far. The records that
+     * carried that state are deleted by the same transaction, so a caller that needs it to outlive
+     * this node has to persist it here; pass an empty function to drop it instead.
+     */
+    using OnMultikeyPathsRecoveredFn =
+        std::function<Status(OperationContext*, const MultikeyPaths&)>;
+
+    /**
      * Drain the writes from the side writes table/tracker into the
      * index identified by `indexCatalogEntry`.
      */
@@ -98,6 +108,7 @@ public:
                                 const CollectionPtr& coll,
                                 const IndexCatalogEntry* indexCatalogEntry,
                                 const InsertDeleteOptions& options,
+                                const OnMultikeyPathsRecoveredFn& onMultikeyPathsRecovered,
                                 TrackDuplicates trackDups,
                                 DrainYieldPolicy drainYieldPolicy);
 
@@ -128,6 +139,7 @@ public:
         OperationContext* opCtx,
         const CollectionPtr& collection,
         const IndexCatalogEntry* indexCatalogEntry,
+        const OnMultikeyPathsRecoveredFn& onMultikeyPathsRecovered,
         RetrySkippedRecordMode mode = RetrySkippedRecordMode::kKeyGenerationAndInsertion);
 
     /**
@@ -147,6 +159,11 @@ public:
      * that were tracked during the build.
      */
     boost::optional<MultikeyPaths> getMultikeyPaths() const;
+
+    /**
+     * Records multikey paths recovered from a side write that this node's drain applied.
+     */
+    void recordDrainedMultikeyPaths(const MultikeyPaths& multikeyPaths);
 
     /**
      * Creates a ContainerSpiller from the _sorterTable.
@@ -184,6 +201,15 @@ private:
 
     bool _checkAllWritesApplied(OperationContext* opCtx, bool fatal) const;
 
+    /**
+     * Merges 'multikeyPaths' into '_multikeyPaths'
+     */
+    void _mergeMultikeyPaths(const MultikeyPaths& multikeyPaths);
+
+    // Set when a drained record hands multikey state back, cleared once that state has been
+    // reported to the drain's OnMultikeyPathsRecoveredFn.
+    bool _multikeyPathsRecovered = false;
+
     // This temporary record store records all the index keys that we encounter upon collection
     // scan. We will use the _sorterTable for primary-driven index builds to replicate sorting and
     // inserting the sorted index keys into each node's index table.
@@ -207,12 +233,38 @@ private:
     boost::optional<MultikeyPaths> _multikeyPaths;
 };
 
-// Hook invoked when a primary-driven index build  is redoing a write that produced a "tearable side
-// write" (a write whose oplog representation spans multiple applyOps entries).
-//
-// TODO (SERVER-126257): Remove once index build side writes cannot be torn.
-using OnTearableSideWriteRedoFn =
-    std::function<void(OperationContext*, const UUID& collectionUUID)>;
-void setOnTearableSideWriteRedoHook(ServiceContext* svcCtx, OnTearableSideWriteRedoFn hook);
-const OnTearableSideWriteRedoFn& getOnTearableSideWriteRedoHook(ServiceContext* svcCtx);
+namespace index_builds {
+
+/**
+ * Interceptors created before the index builds that will own them exist, keyed by index ident.
+ *
+ * A step-up creates these for the builds it is about to resume, so writes accepted before those
+ * builds set themselves up are recorded. An entry is only meaningful while this node is primary
+ * and the build it belongs to has yet to adopt it.
+ *
+ * A build adopts its entry while setting up, which erases it. Anything not adopted is cleared
+ * when the step-up task that created it ends, by which point no build will.
+ */
+class PendingInterceptors {
+public:
+    /** Returns the pending interceptor for 'indexIdent', or null. */
+    std::shared_ptr<IndexBuildInterceptor> find(std::string_view indexIdent) const;
+
+    bool contains(std::string_view indexIdent) const;
+
+    void add(std::string_view indexIdent, std::shared_ptr<IndexBuildInterceptor> interceptor);
+
+    void erase(std::string_view indexIdent);
+
+    void clear();
+
+private:
+    mutable std::mutex _mutex;
+    StringMap<std::shared_ptr<IndexBuildInterceptor>> _interceptors;
+};
+
+PendingInterceptors& getPendingInterceptors(ServiceContext* svcCtx);
+
+}  // namespace index_builds
+
 }  // namespace mongo

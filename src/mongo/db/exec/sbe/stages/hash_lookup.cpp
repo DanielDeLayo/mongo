@@ -3,8 +3,6 @@
 
 #include "mongo/db/exec/sbe/stages/hash_lookup.h"
 
-
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/exec/sbe/expressions/compile_ctx.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
@@ -13,6 +11,7 @@
 #include "mongo/db/query/stage_memory_limit_knobs/knobs.h"
 
 #include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 namespace mongo::sbe {
 using namespace std::literals::string_view_literals;
@@ -179,8 +178,7 @@ void HashLookupStage::open(bool reOpen) {
     outerChild()->open(reOpen);
 }  // HashLookupStage::open
 
-template <typename Container>
-void HashLookupStage::accumulateFromValueIndices(const Container* bufferIndices) {
+void HashLookupStage::accumulateFromValueIndices(const RecordIndexCollection* bufferIndices) {
     for (const size_t bufferIdx : *bufferIndices) {
         boost::optional<value::TagValueView> innerMatch = _hashTable.getValueAtIndex(bufferIdx);
         tassert(10801300, "Expected non-empty innerMatch", innerMatch);
@@ -198,11 +196,11 @@ PlanState HashLookupStage::getNext() {
     if (state == PlanState::ADVANCED) {
         // We just got this outer doc, so reset the $lookup "as" result array accumulator to nothing
         // and the hash table iterator to the outer key.
-        _lookupStageOutput.reset(0, false, value::TypeTags::Nothing, 0);
+        _lookupStageOutput.reset(0, value::TagValueView::nothing());
         _hashTable.htIter.reset(_inOuterMatchAccessor->getViewOfValue());
 
         // Accumulate all the matching inner docs for the outer key(s).
-        accumulateFromValueIndicesVariant(_hashTable.htIter.getAllMatchingIndices());
+        accumulateFromValueIndices(_hashTable.htIter.getAllMatchingIndices());
     }
     return trackPlanState(state);
 }  // HashLookupStage::getNext

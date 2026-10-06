@@ -470,6 +470,206 @@ TEST(DocumentSize, ApproximateSizeDuringBuildIsUpdated) {
     ASSERT_EQ(beforeFreezeSize, frozenSize);
 }
 
+/**
+ * Returns the comma-separated field names of 'document' in iteration order, without ever
+ * dereferencing a value. For a document whose cache starts out empty, this leaves it empty.
+ */
+std::string fieldNamesNoCaching(const Document& document) {
+    std::string out;
+    for (FieldIterator it(document); it.more(); it.advance()) {
+        if (!out.empty())
+            out += ',';
+        out += it.fieldName();
+    }
+    return out;
+}
+
+/**
+ * Returns the comma-separated field names of 'document' in iteration order, dereferencing every
+ * value and thereby pulling each field into the cache as iteration proceeds.
+ */
+std::string fieldNamesWithCaching(const Document& document) {
+    std::string out;
+    for (FieldIterator it(document); it.more();) {
+        auto field = it.next();
+        if (!out.empty())
+            out += ',';
+        out += field.first;
+    }
+    return out;
+}
+
+TEST(DocumentStorageModifiedFlag, CachingAFieldDoesNotMarkStorageModified) {
+    // 'DocumentStorage::computeSize()' and 'Document::empty()' both take a fast path when the
+    // storage is unmodified, relying on an unmodified storage's cache holding nothing but mirrors
+    // of fields that are still present in the backing BSON. Bringing a field into the cache must
+    // therefore leave the flag alone.
+    Document document = fromBson(BSON("a" << 1 << "sub" << BSON("b" << 2)));
+    ASSERT_FALSE(document.isModified());
+
+    ASSERT_EQUALS(1, document["a"].getInt());
+    ASSERT_FALSE(document.isModified());
+
+    ASSERT_EQUALS(2, document["sub"]["b"].getInt());
+    ASSERT_FALSE(document.isModified());
+
+    document.loadIntoCache();
+    ASSERT_FALSE(document.isModified());
+    ASSERT_EQUALS(2ULL, document.computeSize());
+}
+
+TEST(DocumentStorageModifiedFlag, AddingAFieldMarksStorageModified) {
+    // The other half of the invariant above: an inserted field must mark the storage modified, so
+    // that the fast paths do not miss it. 'appendField()' relies on returning through the non-const
+    // 'getField(Position)' overload to set the flag.
+    MutableDocument md;
+    md.addField("a", Value(1));
+    ASSERT_TRUE(md.peek().isModified());
+
+    MutableDocument fromExisting(fromBson(BSON("a" << 1)));
+    ASSERT_FALSE(fromExisting.peek().isModified());
+    fromExisting.addField("b", Value(2));
+    ASSERT_TRUE(fromExisting.peek().isModified());
+}
+
+TEST(DocumentFieldCount, UnmodifiedDocumentCountsBsonFields) {
+    Document document = fromBson(BSON("a" << 1 << "b" << 2 << "c" << 3));
+    ASSERT_FALSE(document.isModified());
+    ASSERT_EQUALS(3ULL, document.computeSize());
+
+    // Caching a field must not change the count.
+    ASSERT_EQUALS(2, document["b"].getInt());
+    ASSERT_EQUALS(3ULL, document.computeSize());
+}
+
+TEST(DocumentFieldCount, UnmodifiedDocumentDoesNotCountMetadataFields) {
+    Document document = Document::fromBsonWithMetaData(
+        BSON("a" << 1 << Document::metaFieldTextScore << 10.0 << "b" << 2));
+    ASSERT_FALSE(document.isModified());
+    ASSERT_EQUALS(2ULL, document.computeSize());
+    ASSERT_EQUALS(10.0, document.metadata().getTextScore());
+}
+
+TEST(DocumentFieldCount, ModifiedDocumentCountsInsertedAndRemovedFields) {
+    MutableDocument md(fromBson(BSON("a" << 1 << "b" << 2 << "c" << 3)));
+    md.addField("d", Value(4));
+    md.remove("b");
+    Document document = md.freeze();
+
+    ASSERT_TRUE(document.isModified());
+    ASSERT_EQUALS(3ULL, document.computeSize());
+    ASSERT_EQUALS("a,c,d", fieldNamesNoCaching(document));
+}
+
+TEST(DocumentFieldCount, ModifiedDocumentWithMetadataDoesNotCountMetadataFields) {
+    MutableDocument md(Document::fromBsonWithMetaData(
+        BSON("a" << 1 << Document::metaFieldTextScore << 10.0 << "b" << 2)));
+    md.addField("c", Value(3));
+    Document document = md.freeze();
+
+    ASSERT_TRUE(document.isModified());
+    ASSERT_EQUALS(3ULL, document.computeSize());
+    ASSERT_EQUALS("a,b,c", fieldNamesNoCaching(document));
+}
+
+TEST(DocumentIteration, EmptyCacheIterationVisitsAllBsonFields) {
+    Document document = fromBson(BSON("a" << 1 << "b" << 2 << "c" << 3));
+    ASSERT_EQUALS("a,b,c", fieldNamesNoCaching(document));
+
+    // The names above came straight from the backing BSON, so nothing was brought into the cache.
+    ASSERT_FALSE(document.isModified());
+    ASSERT_EQUALS(3ULL, document.computeSize());
+}
+
+TEST(DocumentIteration, CachePopulatedMidIterationStillVisitsAllFields) {
+    Document document = fromBson(BSON("a" << 1 << "b" << 2 << "c" << 3));
+
+    // Dereferencing each value pulls it into the cache, so the cache is empty when the first field
+    // is visited and non-empty for the rest. Iterating again sees a fully populated cache. All
+    // three combinations must agree.
+    ASSERT_EQUALS("a,b,c", fieldNamesWithCaching(document));
+    ASSERT_EQUALS("a,b,c", fieldNamesWithCaching(document));
+    ASSERT_EQUALS("a,b,c", fieldNamesNoCaching(document));
+}
+
+TEST(DocumentIteration, PartiallyPopulatedCacheVisitsAllFields) {
+    Document document = fromBson(BSON("a" << 1 << "b" << 2 << "c" << 3));
+
+    // Cache exactly one field, so the cache is non-empty from the very start of iteration but most
+    // lookups still miss.
+    ASSERT_EQUALS(2, document["b"].getInt());
+    ASSERT_EQUALS("a,b,c", fieldNamesNoCaching(document));
+    ASSERT_EQUALS("a,b,c", fieldNamesWithCaching(document));
+}
+
+TEST(DocumentIteration, SkipsRemovedFields) {
+    MutableDocument md(fromBson(BSON("a" << 1 << "b" << 2 << "c" << 3)));
+    md.remove("b");
+    Document document = md.freeze();
+
+    ASSERT_EQUALS("a,c", fieldNamesNoCaching(document));
+    ASSERT_EQUALS("a,c", fieldNamesWithCaching(document));
+    ASSERT_EQUALS(2ULL, document.computeSize());
+}
+
+TEST(DocumentIteration, SkipsMetadataFields) {
+    Document document = Document::fromBsonWithMetaData(
+        BSON("a" << 1 << Document::metaFieldTextScore << 10.0 << "b" << 2));
+
+    ASSERT_EQUALS("a,b", fieldNamesNoCaching(document));
+    ASSERT_EQUALS("a,b", fieldNamesWithCaching(document));
+}
+
+TEST(DocumentIteration, VisitsInsertedFieldsAfterBsonFields) {
+    MutableDocument md(fromBson(BSON("a" << 1 << "b" << 2)));
+    md.addField("z", Value(3));
+    Document document = md.freeze();
+
+    ASSERT_EQUALS("a,b,z", fieldNamesNoCaching(document));
+    ASSERT_EQUALS("a,b,z", fieldNamesWithCaching(document));
+    ASSERT_EQUALS(3ULL, document.computeSize());
+}
+
+TEST(DocumentEmpty, DefaultConstructedIsEmpty) {
+    ASSERT_TRUE(Document().empty());
+}
+
+TEST(DocumentEmpty, EmptyMutableDocumentIsEmpty) {
+    ASSERT_TRUE(MutableDocument().freeze().empty());
+}
+
+TEST(DocumentEmpty, EmptyBsonIsEmpty) {
+    ASSERT_TRUE(fromBson(BSONObj()).empty());
+}
+
+TEST(DocumentEmpty, NonEmptyBsonIsNotEmpty) {
+    Document document = fromBson(BSON("a" << 1));
+    ASSERT_FALSE(document.empty());
+
+    // Caching the field must not change the answer.
+    ASSERT_EQUALS(1, document["a"].getInt());
+    ASSERT_FALSE(document.empty());
+}
+
+TEST(DocumentEmpty, MetadataOnlyBsonIsEmpty) {
+    // Metadata fields are hidden from iteration, so this document has no user-visible fields even
+    // though its backing BSON is not empty. This is why 'empty()' cannot consult the backing BSON
+    // when the BSON carries metadata.
+    Document document = Document::fromBsonWithMetaData(BSON(Document::metaFieldTextScore << 10.0));
+    ASSERT_TRUE(document.empty());
+    ASSERT_EQUALS(0ULL, document.computeSize());
+    ASSERT_EQUALS(10.0, document.metadata().getTextScore());
+}
+
+TEST(DocumentEmpty, DocumentWithAllFieldsRemovedIsEmpty) {
+    MutableDocument md(fromBson(BSON("a" << 1)));
+    md.remove("a");
+    Document document = md.freeze();
+
+    ASSERT_TRUE(document.empty());
+    ASSERT_EQUALS(0ULL, document.computeSize());
+}
+
 TEST(ShredDocument, OutputHasNoBackingBSON) {
     BSONObj bson =
         BSON("a" << 1 << "subObj" << BSON("a" << 1) << "subArray" << BSON_ARRAY(BSON("a" << 1)));
@@ -488,6 +688,20 @@ TEST(ShredDocument, OutputHasNoBackingBSON) {
     // Accessing a field shouldn't change the size since all fields are already cached.
     shredded["a"];
     ASSERT_EQ(shredded.getCurrentApproximateSize(), shreddedSize);
+
+    // shred() recurses through arrays, so an object reached through 'subArray' is cache-only too.
+    // Measure on the nested document rather than on 'shredded': Document::getApproximateSize()
+    // memoizes into '_snapshottedSize', so a delta taken on the outer document would not observe
+    // a nested cache being populated. getCurrentApproximateSize() recomputes.
+    Document nestedInArray = shredded["subArray"].getArray()[0].getDocument();
+    auto nestedInArraySize = nestedInArray.getCurrentApproximateSize();
+    nestedInArray["a"];
+    ASSERT_EQ(nestedInArray.getCurrentApproximateSize(), nestedInArraySize);
+
+    Document nestedInObject = shredded["subObj"].getDocument();
+    auto nestedInObjectSize = nestedInObject.getCurrentApproximateSize();
+    nestedInObject["a"];
+    ASSERT_EQ(nestedInObject.getCurrentApproximateSize(), nestedInObjectSize);
 }
 
 TEST(ShredDocument, HandlesModifiedDocuments) {
@@ -1242,8 +1456,6 @@ TEST(MetaFields, FromBsonWithMetadataHandlesEmptyFieldName) {
 }
 
 TEST(MetaFields, CopyMetadataFromCopiesAllMetadata) {
-    // Used to set 'score' metadata.
-    unittest::ServerParameterGuard featureFlagController("featureFlagRankFusionFull", true);
     Document source = Document::fromBsonWithMetaData(
         BSON("a" << 1 << "$textScore" << 9.9 << "b" << 1 << "$randVal" << 42.0 << "c" << 1
                  << "$sortKey" << BSON("x" << 1) << "d" << 1 << "$dis" << 3.2 << "e" << 1 << "$pt"
@@ -1600,8 +1812,6 @@ TEST_F(SerializationTest, MetaSerializationSearchHighlightsNonArray) {
 }
 
 TEST(MetaFields, ToAndFromBson) {
-    // Used to set 'score' metadata.
-    unittest::ServerParameterGuard featureFlagController("featureFlagRankFusionFull", true);
     MutableDocument docBuilder;
     docBuilder.metadata().setTextScore(10.0);
     docBuilder.metadata().setRandVal(20.0);

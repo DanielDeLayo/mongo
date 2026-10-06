@@ -4,23 +4,20 @@
 #pragma once
 
 #include "mongo/db/global_catalog/ddl/sharding_coordinator.h"
+#include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
+#include "mongo/db/sharding_environment/sharding_feature_flags_gen.h"
 #include "mongo/db/sharding_environment/sharding_statistics.h"
+#include "mongo/db/topology/sharding_state.h"
+#include "mongo/db/versioning_protocol/shard_version_factory.h"
 
 #include <string_view>
 
 namespace mongo {
 
-class [[MONGO_MOD_PRIVATE]] ChunkOperationShardingCoordinatorMixin {
-protected:
-    virtual ~ChunkOperationShardingCoordinatorMixin() = default;
-    void _checkSetAllowChunkOperations(OperationContext* opCtx, const NamespaceString& nss);
-};
-
 template <typename StateDoc>
 class [[MONGO_MOD_UNFORTUNATELY_OPEN]] ChunkOperationShardingCoordinator
     : public RecoverableShardingCoordinator,
-      protected RecoverableTypedDocMixin<ChunkOperationShardingCoordinator<StateDoc>, StateDoc>,
-      protected ChunkOperationShardingCoordinatorMixin {
+      protected RecoverableTypedDocMixin<ChunkOperationShardingCoordinator<StateDoc>, StateDoc> {
 
     friend RecoverableTypedDocMixin<ChunkOperationShardingCoordinator<StateDoc>, StateDoc>;
 
@@ -74,6 +71,40 @@ protected:
         } else {
             stats.registerCommitted(chunkOperationMetricType());
         }
+    }
+
+    /**
+     * Checks whether the critical section is acquired for the coordinator's namespace, throwing
+     * StaleConfig in case it is taken.
+     * TODO (SERVER-133881): remove this function once chunk operations can acquire the critical
+     * section without risking a conflict.
+     */
+    void _checkCriticalSection() {
+        if (getDoc().getGenericPhase() != CoordinatorGenericPhase::kUnset) {
+            return;
+        }
+        auto opCtxHolder = this->makeOperationContext();
+        auto* opCtx = opCtxHolder.get();
+
+        // With gCreateRenameNewSetAllowChunkOperationsBehavior enabled, there are no known ways in
+        // which the critical section could be taken, as no DDL coordinator holds the CS on a
+        // namespace with `allowChunkOperations: true`. In that case, this function becomes a no-op.
+        if (feature_flags::gCreateRenameNewSetAllowChunkOperationsBehavior.isEnabled(
+                VersionContext::getDecoration(opCtx),
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+            return;
+        }
+
+        const auto scopedCsr = CollectionShardingRuntime::acquireShared(opCtx, nss());
+
+        uassert(StaleConfigInfo(
+                    nss(),
+                    ShardVersionFactory::make(ChunkVersion::IGNORED()) /* receivedVersion */,
+                    boost::none /* wantedVersion */,
+                    ShardingState::get(opCtx)->shardId()),
+                str::stream() << "The critical section for " << nss().toStringForErrorMsg()
+                              << " is taken",
+                !scopedCsr->getCriticalSectionSignal(ShardingMigrationCriticalSection::kWrite));
     }
 
     /**

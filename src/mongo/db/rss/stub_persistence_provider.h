@@ -48,9 +48,7 @@ public:
     }
 
     bool mustUsePrimaryDrivenIndexBuilds() const override {
-        uasserted(
-            mongo::ErrorCodes::NotImplemented,
-            "StubPersistenceProvider::mustUsePrimaryDrivenIndexBuilds() method not implemented");
+        return false;
     }
 
     bool mustUseContainerWrites() const override {
@@ -77,6 +75,18 @@ public:
     bool shouldUseReplicatedFastCount() const override {
         uasserted(mongo::ErrorCodes::NotImplemented,
                   "StubPersistenceProvider::shouldUseReplicatedFastCount() method not implemented");
+    }
+
+    bool shouldUseContinuousInternodeValidation() const override {
+        uasserted(mongo::ErrorCodes::NotImplemented,
+                  "StubPersistenceProvider::shouldUseContinuousInternodeValidation() method not "
+                  "implemented");
+    }
+
+    bool relaxContainerOplogConstraints() const override {
+        uasserted(mongo::ErrorCodes::NotImplemented,
+                  "StubPersistenceProvider::relaxContainerOplogConstraints() method not "
+                  "implemented");
     }
 
     bool shouldUseOplogWritesForFlowControlSampling() const override {
@@ -124,6 +134,11 @@ public:
                   "method not implemented");
     }
 
+    bool supportsVersionCursor() const override {
+        uasserted(mongo::ErrorCodes::NotImplemented,
+                  "StubPersistenceProvider::supportsVersionCursor() method not implemented");
+    }
+
     bool supportsTableLogging() const override {
         uasserted(mongo::ErrorCodes::NotImplemented,
                   "StubPersistenceProvider::supportsTableLogging() method not implemented");
@@ -158,6 +173,11 @@ public:
                   "StubPersistenceProvider::supportsOplogSampling() method not implemented");
     }
 
+    bool supportsOplogScanning() const override {
+        uasserted(mongo::ErrorCodes::NotImplemented,
+                  "StubPersistenceProvider::supportsOplogScanning() method not implemented");
+    }
+
     bool supportsWriteConcernOptions(
         const WriteConcernOptions& writeConcernOptions) const override {
         uasserted(mongo::ErrorCodes::NotImplemented,
@@ -184,6 +204,11 @@ public:
         uasserted(
             mongo::ErrorCodes::NotImplemented,
             "StubPersistenceProvider::getWTMemoryPageMaxForOplogStrValue() method not implemented");
+    }
+
+    double getMinOplogSizeMB() const override {
+        uasserted(mongo::ErrorCodes::NotImplemented,
+                  "StubPersistenceProvider::getMinOplogSizeMB() method not implemented");
     }
 
     bool supportsCompaction() const override {
@@ -256,12 +281,28 @@ public:
             "StubPersistenceProvider::supportsLegacyReplSetCommands() method not implemented");
     }
 
+    bool supportsDBHashExternalCall() const override {
+        uasserted(mongo::ErrorCodes::NotImplemented,
+                  "StubPersistenceProvider::supportsDBHashExternalCall() method not implemented");
+    }
+
     /**
      * Unlike the rest of this stub, this method returns a FixedIntervalPolicy rather than
      * uasserting, so that existing Stub-based test providers work without each needing an override.
      */
     std::unique_ptr<CheckpointSchedulePolicy> makeCheckpointSchedulePolicy() const override {
         return createFixedIntervalPolicy();
+    }
+
+    bool supportsApplyOpsCommand() const override {
+        uasserted(mongo::ErrorCodes::NotImplemented,
+                  "StubPersistenceProvider::supportsApplyOpsCommand() method not implemented");
+    }
+
+    bool supportsGetDiagnosticDataExternalCall() const override {
+        uasserted(mongo::ErrorCodes::NotImplemented,
+                  "StubPersistenceProvider::supportsGetDiagnosticDataExternalCall() method not "
+                  "implemented");
     }
 };
 

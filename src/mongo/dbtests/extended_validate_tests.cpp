@@ -138,7 +138,7 @@ public:
             ValidationOptions{collection_validation::ValidateMode::kCollectionHash,
                               collection_validation::RepairMode::kNone,
                               /*logDiagnostics=*/true},
-            &results1));
+            results1));
         ASSERT_TRUE(results1.isValid()) << "Validation failed when it should've worked.";
 
         ASSERT_OK(collection_validation::validate(
@@ -147,7 +147,7 @@ public:
             ValidationOptions{collection_validation::ValidateMode::kCollectionHash,
                               collection_validation::RepairMode::kNone,
                               /*logDiagnostics=*/true},
-            &results2));
+            results2));
         ASSERT_TRUE(results2.isValid()) << "Validation failed when it should've worked.";
 
         // Ensure that the hashes match up.
@@ -156,6 +156,9 @@ public:
         } else {
             ASSERT_NE(results1.getCollectionHash(), results2.getCollectionHash());
         }
+
+        EXPECT_FALSE(results1.getXxh3CollectionHash().has_value());
+        EXPECT_FALSE(results2.getXxh3CollectionHash().has_value());
 
         dumpOnErrorGuard.dismiss();
     }

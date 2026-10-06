@@ -196,6 +196,7 @@ rules:
             "streams_kafka_9",
             "streams_kafka_10",
             "streams_kafka_11",
+            "streams_kafka_12",
             "streams_kafka_gwproxy",
             "streams_kafka_benchmark",
             "streams_https",
@@ -219,6 +220,7 @@ rules:
             "streams_aspio_iceberg_4",
             "streams_aspio_iceberg_large",
             "streams_aspio_iceberg_5",
+            "streams_aspio_iceberg_azure",
             "streams_aspio_utilities",
             "streams_externaljs",
             "streams_aspio_pubsub",
@@ -234,6 +236,19 @@ rules:
             "streams_sanitizer_7",
             "streams_sanitizer_8",
             "streams_sanitizer_9",
+            "streams_kafka_0_sanitizer",
+            "streams_kafka_1_sanitizer",
+            "streams_kafka_2_sanitizer",
+            "streams_kafka_3_sanitizer",
+            "streams_kafka_4_sanitizer",
+            "streams_kafka_5_sanitizer",
+            "streams_kafka_6_sanitizer",
+            "streams_kafka_7_sanitizer",
+            "streams_kafka_8_sanitizer",
+            "streams_kafka_9_sanitizer",
+            "streams_kafka_10_sanitizer",
+            "streams_kafka_11_sanitizer",
+            "streams_kafka_12_sanitizer",
             "streams_https_sanitizer",
             "streams_lambda_sanitizer",
             "streams_kinesis_sanitizer",
@@ -261,4 +276,17 @@ rules:
             "selinux_rhel9_org",
             "selinux_rhel8_enterprise",
             "ssl_linear_macos",
+            # product_limits is explicitly scheduled (weekly cron) on selected variants.
+            "product_limits",
+            # The mongot_extension_platform_matrix tasks run nightly on the enterprise Linux
+            # variants to cover the real mongot-extension on every supported Linux flavor, but the
+            # suites are still marked experimental.
+            # TODO: drop the experimental tag from these tasks and remove these exceptions.
+            "with_mongot_extension_fully_enabled_single_node",
+            "with_mongot_extension_fully_enabled_single_shard",
+            "with_mongot_extension_fully_enabled_sharded_collections",
+            "with_mongot_extension_fully_enabled_sharded_cluster",
+            "concurrency_with_mongot_extension_single_node",
+            "concurrency_with_mongot_extension_mongos",
+            "concurrency_with_mongot_extension_sharded_collections",
           ]

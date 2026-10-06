@@ -22,6 +22,7 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_explainer.h"
 #include "mongo/db/query/plan_explainer_sbe.h"
+#include "mongo/db/query/plan_ranking/plan_selection_strategy.h"
 #include "mongo/db/query/plan_yield_policy_sbe.h"
 #include "mongo/db/query/restore_context.h"
 #include "mongo/db/query/sbe_plan_ranker.h"
@@ -47,6 +48,13 @@ public:
         template <typename BSONTraits = BSONObj::DefaultSizeTrait>
         BSONObj appendToBson(BSONObj doc) const;
         Document appendToDocument(Document doc) const;
+
+        // Whether or not any metadata accessor are initialized.
+        bool anyAccessorsInitialized() const {
+            return metadataSearchScore || metadataSearchHighlights || metadataSearchDetails ||
+                metadataSearchSortValues || metadataSearchSequenceToken || sortKey;
+        }
+
         // Only for $search queries, holds the metadata returned from mongot.
         sbe::value::SlotAccessor* metadataSearchScore{nullptr};
         sbe::value::SlotAccessor* metadataSearchHighlights{nullptr};
@@ -73,7 +81,8 @@ public:
                     bool usedJoinOpt = false,
                     cost_based_ranker::EstimateMap estimates = {},
                     std::vector<JoinOptPlan> rejectedJoinPlans = {},
-                    boost::optional<PlanExplainerData> maybeExplainData = boost::none);
+                    boost::optional<PlanExplainerData> maybeExplainData = boost::none,
+                    boost::optional<PlanSelectionStrategy> planSelectionStrategy = boost::none);
 
     CanonicalQuery* getCanonicalQuery() const override {
         return _cq.get();
@@ -214,13 +223,8 @@ private:
     // the scan from. '_seekRecordId' is the RecordId value, initialized from the slot at runtime.
     boost::optional<sbe::value::SlotId> _resumeRecordIdSlot;
 
-    // Only for clustered collection scans, holds the minimum record ID of the scan, if applicable.
-    boost::optional<sbe::value::SlotId> _minRecordIdSlot;
-
-    // Only for clustered collection scans, holds the maximum record ID of the scan, if applicable.
-    boost::optional<sbe::value::SlotId> _maxRecordIdSlot;
-
     MetaDataAccessor _metadataAccessors;
+    bool _useMetadataAccessors{false};
 
     // NOTE: '_stash' stores documents as BSON. Currently, one of the '_stash' is usages is to store
     // documents received from the plan during multiplanning. This means that the documents

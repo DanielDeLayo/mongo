@@ -93,7 +93,6 @@ public:
     Status dropIdent(RecoveryUnit& ru,
                      std::string_view ident,
                      bool identHasSizeInfo,
-                     const StorageEngine::DropIdentCallback& onDrop,
                      boost::optional<uint64_t> schemaEpoch,
                      bool waitForLocks) override {
         return Status::OK();
@@ -191,6 +190,11 @@ public:
 
     void unpinOldestTimestamp(const std::string& requestingServiceName) override {}
 
+    boost::optional<uint64_t> getStableSchemaEpoch() override {
+        return boost::none;
+    }
+    void setStableSchemaEpoch(uint64_t schemaEpoch) override {}
+
     bool underCachePressure(int concurrentOpOuts) override {
         return false;
     }
@@ -218,33 +222,10 @@ public:
 
     void dump() const override {}
 
-    Status insertIntoIdent(RecoveryUnit& ru,
-                           std::string_view ident,
-                           IdentKey key,
-                           std::span<const char> value,
-                           BlindWritePolicy policy) override {
-        return Status::OK();
-    }
-
-    Status updateInIdent(RecoveryUnit& ru,
-                         std::string_view ident,
-                         IdentKey key,
-                         std::span<const char> value,
-                         BlindWritePolicy policy) override {
-        return Status::OK();
-    }
-
-    StatusWith<UniqueBuffer> getFromIdent(RecoveryUnit& ru,
-                                          std::string_view ident,
-                                          IdentKey key) override {
-        return Status::OK();
-    }
-
-    Status deleteFromIdent(RecoveryUnit& ru,
-                           std::string_view ident,
-                           IdentKey key,
-                           BlindWritePolicy policy) override {
-        return Status::OK();
+    std::unique_ptr<KVEngineDirectCrudCursor> getDirectCursor(RecoveryUnit& ru,
+                                                              std::string_view ident,
+                                                              BlindWritePolicy policy) override {
+        return nullptr;
     }
 
     // This sets the results of the backup cursor for unit tests.

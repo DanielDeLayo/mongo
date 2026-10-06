@@ -423,26 +423,10 @@ public:
     }
 
     void tearDown() override {
-        // Fail-fast any mock-network command issued during teardown so nothing parks on the
-        // mock network and deadlocks the executor-pool drain.
-        FailPointEnableBlock failSchedule("networkInterfaceMockFailToSchedule");
-
-        // Interrupt any in-flight donor/recipient state machines started by a test so they exit
-        // their AsyncTry retry loops.
         _primaryOnlyServiceRegistry->onStepDown();
-
         WaitForMajorityService::get(getServiceContext()).shutDown();
-
-        // Drain the executor pool (and its mock network) so any pending network responses are
-        // delivered and the state machines' cleanup callbacks can complete.
         shutdownExecutorPool();
-
-        // Final shutdown of the registry: joins the per-service executors and waits for instance
-        // completion. Must run after shutdownExecutorPool() because instance cleanup may queue
-        // work on the executors above.
         _primaryOnlyServiceRegistry->onShutdown();
-
-        Grid::get(operationContext())->clearForUnitTests();
 
         ShardServerTestFixtureWithCatalogCacheMock::tearDown();
     }
@@ -789,8 +773,6 @@ TEST_F(ReshardingDonorRecipientCommonTest, CreateDonorServiceInstance) {
                                                  ReshardingDonorDocument>(opCtx, kReshardingUUID);
 
     ASSERT(donorStateMachine != boost::none);
-
-    donorStateMachine.value()->interrupt({ErrorCodes::InternalError, "Shut down for test"});
 }
 
 TEST_F(ReshardingDonorRecipientCommonTest, CreateRecipientServiceInstance) {
@@ -816,8 +798,6 @@ TEST_F(ReshardingDonorRecipientCommonTest, CreateRecipientServiceInstance) {
                                                                               kReshardingUUID);
 
     ASSERT(recipientStateMachine != boost::none);
-
-    recipientStateMachine.value()->interrupt({ErrorCodes::InternalError, "Shut down for test"});
 }
 
 TEST_F(ReshardingDonorRecipientCommonTest,
@@ -937,6 +917,8 @@ TEST_F(ReshardingDonorRecipientCommonTest,
 
 TEST_F(ReshardingDonorRecipientCommonTest,
        ProcessRecipientFieldsWhenShardOwnsChunks_StoreOplogFetcherProgress) {
+    GTEST_SKIP() << "Test doesn't support FCV 9.1. Remove/review (TODO: SERVER-132935)";
+
     // Not set featureFlagReshardingStoreOplogFetcherProgress to verify that it defaults to true.
 
     testProcessRecipientFields(kThisShard.getShardId() /* shardThatChunkExistsOn*/,
@@ -948,6 +930,8 @@ TEST_F(ReshardingDonorRecipientCommonTest,
 
 TEST_F(ReshardingDonorRecipientCommonTest,
        ProcessRecipientFieldsWhenShardOwnsChunks_NotStoreOplogFetcherProgress) {
+    GTEST_SKIP() << "Test doesn't support FCV 9.1. Remove/review (TODO: SERVER-132935)";
+
     unittest::ServerParameterGuard storeOplogFetcherProgressFeatureFlagController(
         "featureFlagReshardingStoreOplogFetcherProgress", false);
 
@@ -969,6 +953,8 @@ TEST_F(ReshardingDonorRecipientCommonTest,
 TEST_F(
     ReshardingDonorRecipientCommonTest,
     ProcessRecipientFieldsWhenShardDoesNotOwnAnyChunks_PrimaryShard_NotSkipCloningAndApplyIfApplicable) {
+    GTEST_SKIP() << "Test doesn't support FCV 9.1. Remove/review (TODO: SERVER-132935)";
+
     unittest::ServerParameterGuard skipCloningAndApplyingFeatureFlagController(
         "featureFlagReshardingSkipCloningAndApplyingIfApplicable", false);
     unittest::ServerParameterGuard skipCloningFeatureFlagController(
@@ -983,6 +969,8 @@ TEST_F(
 
 TEST_F(ReshardingDonorRecipientCommonTest,
        ProcessRecipientFieldsWhenShardDoesNotOwnAnyChunks_PrimaryShard_SkipCloningIfApplicable) {
+    GTEST_SKIP() << "Test doesn't support FCV 9.1. Remove/review (TODO: SERVER-132935)";
+
     unittest::ServerParameterGuard skipCloningAndApplyingFeatureFlagController(
         "featureFlagReshardingSkipCloningAndApplyingIfApplicable", false);
     unittest::ServerParameterGuard skipCloningFeatureFlagController(
@@ -997,6 +985,8 @@ TEST_F(ReshardingDonorRecipientCommonTest,
 
 TEST_F(ReshardingDonorRecipientCommonTest,
        ProcessRecipientFieldsWhenShardDoesNotOwnAnyChunks_PrimaryShard_NotSkipCloningIfApplicable) {
+    GTEST_SKIP() << "Test doesn't support FCV 9.1. Remove/review (TODO: SERVER-132935)";
+
     unittest::ServerParameterGuard skipCloningAndApplyingFeatureFlagController(
         "featureFlagReshardingSkipCloningAndApplyingIfApplicable", false);
     unittest::ServerParameterGuard skipCloningFeatureFlagController(
@@ -1011,6 +1001,8 @@ TEST_F(ReshardingDonorRecipientCommonTest,
 
 TEST_F(ReshardingDonorRecipientCommonTest,
        ProcessRecipientFieldsPerformVerificationUnspecified_FeatureFlagEnabled) {
+    GTEST_SKIP() << "Test doesn't support FCV 9.1. Remove/review (TODO: SERVER-132935)";
+
     unittest::ServerParameterGuard verificationFeatureFlagController(
         "featureFlagReshardingVerification", true);
     boost::optional<bool> performVerification = boost::none;
@@ -1024,6 +1016,8 @@ TEST_F(ReshardingDonorRecipientCommonTest,
 
 TEST_F(ReshardingDonorRecipientCommonTest,
        ProcessRecipientFieldsPerformVerificationUnspecified_FeatureFlagDisabled) {
+    GTEST_SKIP() << "Test doesn't support FCV 9.1. Remove/review (TODO: SERVER-132935)";
+
     unittest::ServerParameterGuard verificationFeatureFlagController(
         "featureFlagReshardingVerification", false);
     auto performVerification = boost::none;
@@ -1036,6 +1030,8 @@ TEST_F(ReshardingDonorRecipientCommonTest,
 }
 
 TEST_F(ReshardingDonorRecipientCommonTest, ProcessRecipientFieldsNotPerformVerification) {
+    GTEST_SKIP() << "Test doesn't support FCV 9.1. Remove/review (TODO: SERVER-132935)";
+
     bool performVerification = false;
 
     testProcessRecipientFields(
@@ -1186,6 +1182,8 @@ TEST_F(ReshardingDonorRecipientCommonInternalsTest, ClearReshardingFilteringMeta
 }
 
 TEST_F(ReshardingDonorRecipientCommonTest, ProcessRecipientFieldsForCloningNoRefresh) {
+    GTEST_SKIP() << "Test doesn't support FCV 9.1. Remove/review (TODO: SERVER-132935)";
+
     testProcessRecipientFields(kThisShard.getShardId() /* shardThatChunkExistsOn*/,
                                kThisShard.getShardId() /* primaryShard */,
                                boost::none /* performVerification */,
@@ -1246,7 +1244,6 @@ TEST_F(ReshardingDonorRecipientCommonTest,
         opCtx, NamespaceString::kRecipientReshardingOperationsNamespace, reshardingUUID);
 
     ASSERT(recoveredStateMachine != boost::none);
-    recoveredStateMachine.value()->interrupt({ErrorCodes::InternalError, "Shut down for test"});
 }
 
 TEST_F(ReshardingDonorRecipientCommonTest,

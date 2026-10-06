@@ -4,19 +4,26 @@
  *
  * Data-driven: `testQueries` lists the queries as plain command documents, and
  * `verbosityExpectations` maps each verbosity to the explain version it reports and the highest
- * explain section it should produce. Sections are inclusive along the legacy ladder
+ * explain section it should produce. The legacy sections are inclusive,
  * queryPlanner ⊂ executionStats ⊂ allPlansExecution: a verbosity that reaches a section includes
  * that section and every section before it, and none after. The test runs every query under every
  * verbosity.
  *
- * Current skeleton mapping (SERVER-130403; the real V3 output format is SERVER-130529). Each V3
- * mode reports "explainVersion: '3'" but reuses the nearest legacy verbosity's output:
- *   planSummary, plannerChoice -> queryPlanner
- *   plannerStats               -> allPlansExecution
- *   execStats                  -> executionStats   (execStats == legacy executionStats by definition)
+ * Each V3 mode reports "explainVersion: '3'". On the find path, plannerChoice and
+ * plannerStats/execStats all render the real V3 queryPlanner (a "plans" array), differing only in
+ * which statistics the plans carry: plannerChoice carries none, plannerStats adds the ranking
+ * statistics without executing the query, and execStats adds exactly the retained legacy
+ * kExecStats section (never an allPlansExecution array - that content lives in
+ * queryPlanner.plans[]). planSummary remains legacy-delegated (-> queryPlanner) until
+ * SERVER-133235.
  */
-import {before, describe, it} from "jstests/libs/mochalite.js";
-import {getQueryPlanner} from "jstests/libs/query/analyze_plan.js";
+import {after, before, describe, it} from "jstests/libs/mochalite.js";
+import {
+    getAggPlanStage,
+    getQueryPlanner,
+    isV3QueryPlanner,
+    normalizeRunVarying,
+} from "jstests/libs/query/analyze_plan.js";
 
 const collName = jsTestName();
 
@@ -40,15 +47,7 @@ const testQueries = [
         },
     },
     {
-        // A $unionWith followed by a $match: the trailing $match is duplicated across the union in
-        // DocumentSourceUnionWith::optimizeAt(), whose explain bookkeeping (_pushedDownStages) is
-        // gated on an ordinal comparison of the ExpressionContext verbosity
-        // (document_source_union_with.cpp, "getExplain() >= kExecStats"). Since the V3 modes sort
-        // >= kExecStats, that branch runs even for the planner-only modes planSummary/plannerChoice.
-        // This case guards that the planner-only modes still emit no execution content (the ordinal
-        // comparison must not leak execution sections into V3 planner-only output).
-        // TODO SERVER-130810 / SERVER-130812 once the aggregate path threads the real V3 verbosity
-        // and the ordinal comparisons are replaced with semantic predicates.
+        // A $unionWith followed by a $match: the trailing $match is duplicated across the union.
         name: "agg-unionWith",
         command: {
             aggregate: collName,
@@ -68,7 +67,9 @@ const verbosityExpectations = {
     // V3 modes.
     planSummary: {version: V3, topSection: "queryPlanner"},
     plannerChoice: {version: V3, topSection: "queryPlanner"},
-    plannerStats: {version: V3, topSection: "allPlansExecution"},
+    // No execution sections at all: the trial statistics live in queryPlanner.plans[] and neither
+    // the query nor the pipeline is executed.
+    plannerStats: {version: V3, topSection: "queryPlanner"},
     execStats: {version: V3, topSection: "executionStats"},
     // Legacy modes, for regression coverage.
     queryPlanner: {version: LEGACY, topSection: "queryPlanner"},
@@ -143,4 +144,291 @@ describe("explain V3 verbosity modes", function () {
             });
         }
     }
+});
+
+// The stats-rich V3 modes' output shape on the find path, run once per execution engine (the shape x
+// ranker matrix lives in explain_plans_array.js and the executionStats parity in
+// explain_exec_stats_parity.js).
+for (const engine of ["forceClassicEngine", "trySbeEngine"]) {
+    describe(`V3 stats-rich output shape (find path, ${engine})`, function () {
+        const findCommand = {find: collName, filter: {a: 2}};
+        let savedFrameworkControl;
+
+        before(function () {
+            savedFrameworkControl = assert.commandWorked(
+                db.adminCommand({getParameter: 1, internalQueryFrameworkControl: 1}),
+            ).internalQueryFrameworkControl;
+            assert.commandWorked(
+                db.adminCommand({setParameter: 1, internalQueryFrameworkControl: engine}),
+            );
+
+            const coll = db[collName];
+            coll.drop();
+            assert.commandWorked(
+                coll.insert([
+                    {a: 1, b: 1},
+                    {a: 2, b: 2},
+                    {a: 2, b: 3},
+                ]),
+            );
+            assert.commandWorked(coll.createIndex({a: 1}));
+        });
+
+        after(function () {
+            assert.commandWorked(
+                db.adminCommand({
+                    setParameter: 1,
+                    internalQueryFrameworkControl: savedFrameworkControl,
+                }),
+            );
+        });
+
+        it("plannerChoice renders plans[] and no execution sections", function () {
+            const explain = assert.commandWorked(
+                db.runCommand({explain: findCommand, verbosity: "plannerChoice"}),
+            );
+            const queryPlanner = explain.queryPlanner;
+            assert(Array.isArray(queryPlanner.plans), "missing queryPlanner.plans", {explain});
+            assert(!queryPlanner.hasOwnProperty("winningPlan"), "unexpected winningPlan", {
+                explain,
+            });
+            assert(!queryPlanner.hasOwnProperty("rejectedPlans"), "unexpected rejectedPlans", {
+                explain,
+            });
+            assert(!explain.hasOwnProperty("executionStats"), "unexpected executionStats", {
+                explain,
+            });
+        });
+
+        it("plannerStats renders plans[] and no legacy keys or execution sections", function () {
+            const explain = assert.commandWorked(
+                db.runCommand({explain: findCommand, verbosity: "plannerStats"}),
+            );
+            const queryPlanner = explain.queryPlanner;
+            assert(Array.isArray(queryPlanner.plans), "missing queryPlanner.plans", {explain});
+            assert(!queryPlanner.hasOwnProperty("winningPlan"), "unexpected winningPlan", {
+                explain,
+            });
+            assert(!queryPlanner.hasOwnProperty("rejectedPlans"), "unexpected rejectedPlans", {
+                explain,
+            });
+            assert(!explain.hasOwnProperty("executionStats"), "unexpected executionStats", {
+                explain,
+            });
+        });
+
+        it("execStats adds exactly the retained executionStats section", function () {
+            const plannerStats = assert.commandWorked(
+                db.runCommand({explain: findCommand, verbosity: "plannerStats"}),
+            );
+            const execStats = assert.commandWorked(
+                db.runCommand({explain: findCommand, verbosity: "execStats"}),
+            );
+
+            // The queryPlanner section is identical across the two modes (modulo run-varying values).
+            assert.docEq(
+                normalizeRunVarying(plannerStats.queryPlanner),
+                normalizeRunVarying(execStats.queryPlanner),
+                "queryPlanner must be identical between plannerStats and execStats",
+            );
+
+            // execStats adds exactly the retained legacy section: winner executed, never an
+            // allPlansExecution array (its content lives in queryPlanner.plans[]).
+            assert(execStats.hasOwnProperty("executionStats"), "missing executionStats", {
+                execStats,
+            });
+            assert.eq(execStats.executionStats.executionSuccess, true, {execStats});
+            assert(
+                !execStats.executionStats.hasOwnProperty("allPlansExecution"),
+                "unexpected allPlansExecution",
+                {execStats},
+            );
+        });
+    });
+}
+
+describe("V3 for aggregation pipelines", function () {
+    // $_internalInhibitOptimization keeps this a classic DocumentSource pipeline.
+    const aggCommand = {
+        aggregate: collName,
+        pipeline: [
+            {$match: {a: {$lt: 2}}},
+            {$_internalInhibitOptimization: {}},
+            {$group: {_id: "$a", c: {$sum: 1}}},
+        ],
+        cursor: {},
+    };
+    let savedFrameworkControl;
+
+    before(function () {
+        savedFrameworkControl = assert.commandWorked(
+            db.adminCommand({getParameter: 1, internalQueryFrameworkControl: 1}),
+        ).internalQueryFrameworkControl;
+        // TODO SERVER-132033 remove once SBE-eligible plans are supported in V3.
+        assert.commandWorked(
+            db.adminCommand({setParameter: 1, internalQueryFrameworkControl: "forceClassicEngine"}),
+        );
+
+        const coll = db[collName];
+        coll.drop();
+        assert.commandWorked(
+            coll.insert([
+                {a: 1, b: 1},
+                {a: 2, b: 2},
+                {a: 2, b: 3},
+            ]),
+        );
+        assert.commandWorked(coll.createIndex({a: 1}));
+    });
+
+    after(function () {
+        assert.commandWorked(
+            db.adminCommand({
+                setParameter: 1,
+                internalQueryFrameworkControl: savedFrameworkControl,
+            }),
+        );
+    });
+
+    for (const verbosity of ["plannerChoice", "plannerStats", "execStats"]) {
+        it(`${verbosity} renders the V3 plans[] under $cursor`, function () {
+            const explain = assert.commandWorked(db.runCommand({explain: aggCommand, verbosity}));
+            assert.eq(explain.explainVersion, "3", "unexpected explainVersion", {explain});
+
+            const queryPlanner = getQueryPlanner(explain);
+            assert(isV3QueryPlanner(queryPlanner), "expected the V3 queryPlanner shape", {explain});
+            assert(Array.isArray(queryPlanner.plans), "missing queryPlanner.plans", {explain});
+            assert(!queryPlanner.hasOwnProperty("rejectedPlans"), "unexpected rejectedPlans", {
+                explain,
+            });
+
+            const leaf = getAggPlanStage(explain, "IXSCAN") || getAggPlanStage(explain, "COLLSCAN");
+            assert(leaf, "expected the query layer's access stage to be reachable", {explain});
+        });
+    }
+
+    it("plannerChoice and plannerStats do not execute the pipeline", function () {
+        for (const verbosity of ["plannerChoice", "plannerStats"]) {
+            const explain = assert.commandWorked(db.runCommand({explain: aggCommand, verbosity}));
+            assert(
+                !sectionsContainer(explain).hasOwnProperty("executionStats"),
+                `unexpected executionStats at ${verbosity}`,
+                {explain},
+            );
+            for (const stage of explain.stages) {
+                assert(
+                    !stage.hasOwnProperty("nReturned"),
+                    `unexpected per-stage execution stats at ${verbosity}`,
+                    {explain},
+                );
+            }
+        }
+    });
+
+    it("execStats adds the executionStats section under $cursor", function () {
+        const explain = assert.commandWorked(
+            db.runCommand({explain: aggCommand, verbosity: "execStats"}),
+        );
+        const executionStats = sectionsContainer(explain).executionStats;
+        assert(executionStats, "missing executionStats", {explain});
+        assert.eq(executionStats.executionSuccess, true, {explain});
+        assert(
+            !executionStats.hasOwnProperty("allPlansExecution"),
+            "unexpected allPlansExecution",
+            {explain},
+        );
+    });
+});
+
+describe("V3 for aggregation pipelines", function () {
+    // $_internalInhibitOptimization keeps this a classic DocumentSource pipeline.
+    const aggCommand = {
+        aggregate: collName,
+        pipeline: [
+            {$match: {a: {$lt: 2}}},
+            {$_internalInhibitOptimization: {}},
+            {$group: {_id: "$a", c: {$sum: 1}}},
+        ],
+        cursor: {},
+    };
+    let savedFrameworkControl;
+
+    before(function () {
+        savedFrameworkControl = assert.commandWorked(
+            db.adminCommand({getParameter: 1, internalQueryFrameworkControl: 1}),
+        ).internalQueryFrameworkControl;
+        // TODO SERVER-132033 remove once SBE-eligible plans are supported in V3.
+        assert.commandWorked(
+            db.adminCommand({setParameter: 1, internalQueryFrameworkControl: "forceClassicEngine"}),
+        );
+
+        const coll = db[collName];
+        coll.drop();
+        assert.commandWorked(
+            coll.insert([
+                {a: 1, b: 1},
+                {a: 2, b: 2},
+                {a: 2, b: 3},
+            ]),
+        );
+        assert.commandWorked(coll.createIndex({a: 1}));
+    });
+
+    after(function () {
+        assert.commandWorked(
+            db.adminCommand({
+                setParameter: 1,
+                internalQueryFrameworkControl: savedFrameworkControl,
+            }),
+        );
+    });
+
+    for (const verbosity of ["plannerChoice", "plannerStats", "execStats"]) {
+        it(`${verbosity} renders the V3 plans[] under $cursor`, function () {
+            const explain = assert.commandWorked(db.runCommand({explain: aggCommand, verbosity}));
+            assert.eq(explain.explainVersion, "3", "unexpected explainVersion", {explain});
+
+            const queryPlanner = getQueryPlanner(explain);
+            assert(isV3QueryPlanner(queryPlanner), "expected the V3 queryPlanner shape", {explain});
+            assert(Array.isArray(queryPlanner.plans), "missing queryPlanner.plans", {explain});
+            assert(!queryPlanner.hasOwnProperty("rejectedPlans"), "unexpected rejectedPlans", {
+                explain,
+            });
+
+            const leaf = getAggPlanStage(explain, "IXSCAN") || getAggPlanStage(explain, "COLLSCAN");
+            assert(leaf, "expected the query layer's access stage to be reachable", {explain});
+        });
+    }
+
+    it("plannerChoice and plannerStats do not execute the pipeline", function () {
+        for (const verbosity of ["plannerChoice", "plannerStats"]) {
+            const explain = assert.commandWorked(db.runCommand({explain: aggCommand, verbosity}));
+            assert(
+                !sectionsContainer(explain).hasOwnProperty("executionStats"),
+                `unexpected executionStats at ${verbosity}`,
+                {explain},
+            );
+            for (const stage of explain.stages) {
+                assert(
+                    !stage.hasOwnProperty("nReturned"),
+                    `unexpected per-stage execution stats at ${verbosity}`,
+                    {explain},
+                );
+            }
+        }
+    });
+
+    it("execStats adds the executionStats section under $cursor", function () {
+        const explain = assert.commandWorked(
+            db.runCommand({explain: aggCommand, verbosity: "execStats"}),
+        );
+        const executionStats = sectionsContainer(explain).executionStats;
+        assert(executionStats, "missing executionStats", {explain});
+        assert.eq(executionStats.executionSuccess, true, {explain});
+        assert(
+            !executionStats.hasOwnProperty("allPlansExecution"),
+            "unexpected allPlansExecution",
+            {explain},
+        );
+    });
 });

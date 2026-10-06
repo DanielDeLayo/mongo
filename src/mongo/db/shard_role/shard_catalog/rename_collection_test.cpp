@@ -114,7 +114,7 @@ public:
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
                    const std::vector<RecordId>& recordIds,
-                   std::vector<bool> fromMigrate,
+                   const std::vector<bool>& fromMigrate,
                    bool defaultFromMigrate,
                    OpStateAccumulator* opAccumulator = nullptr) override;
 
@@ -239,7 +239,7 @@ void OpObserverMock::onInserts(OperationContext* opCtx,
                                std::vector<InsertStatement>::const_iterator begin,
                                std::vector<InsertStatement>::const_iterator end,
                                const std::vector<RecordId>& recordIds,
-                               std::vector<bool> fromMigrate,
+                               const std::vector<bool>& fromMigrate,
                                bool defaultFromMigrate,
                                OpStateAccumulator* opAccumulator) {
     if (onInsertsThrows) {
@@ -1056,20 +1056,94 @@ TEST_F(RenameCollectionTest,
                                                     {});
 }
 
-TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseDropsTemporaryCollectionOnException) {
+TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseCreatesTemporaryCollection) {
+    RenameCollectionOptions opts;
+    opts.newTargetCollectionUuid = UUID::gen();
     _createCollection(_opCtx.get(), _sourceNss);
     _createIndexOnEmptyCollection(_opCtx.get(), _sourceNss, "a_1");
     _insertDocument(_opCtx.get(), _sourceNss, BSON("_id" << 0));
     _opObserver->onInsertsThrows = true;
     _opObserver->oplogEntries.clear();
-    ASSERT_THROWS_CODE(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}),
+    ASSERT_THROWS_CODE(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, opts),
                        AssertionException,
                        ErrorCodes::OperationFailed);
-    std::vector<std::string> expectedOplogEntries;
-    // Empty Collections generate createIndexes oplog entry even if the node
-    // supports 2 phase index build.
-    expectedOplogEntries = {"create", "index", "drop"};
-    _checkOplogEntries(_opObserver->oplogEntries, expectedOplogEntries);
+    const auto& tmp = CollectionCatalog::get(_opCtx.get())
+                          ->lookupNSSByUUID(_opCtx.get(), *opts.newTargetCollectionUuid);
+    ASSERT(tmp);
+    ASSERT_TRUE(_isTempCollection(_opCtx.get(), *tmp));
+}
+
+TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseRetryCleansUpOldTemporaryCollection) {
+    RenameCollectionOptions opts;
+    opts.newTargetCollectionUuid = UUID::gen();
+    _createCollection(_opCtx.get(), _sourceNss);
+    _createIndexOnEmptyCollection(_opCtx.get(), _sourceNss, "a_1");
+    _insertDocument(_opCtx.get(), _sourceNss, BSON("_id" << 0));
+    _opObserver->onInsertsThrows = true;
+    _opObserver->oplogEntries.clear();
+    ASSERT_THROWS_CODE(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, opts),
+                       AssertionException,
+                       ErrorCodes::OperationFailed);
+    _opObserver->onInsertsThrows = false;
+    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, opts));
+}
+
+TEST_F(RenameCollectionTest,
+       RenameCollectionAcrossDatabaseRetryAfterRenameSucceedsButBeforeSourceDrop) {
+    RenameCollectionOptions opts;
+    opts.newTargetCollectionUuid = UUID::gen();
+    opts.dropTarget = true;
+    _createCollection(_opCtx.get(), _sourceNss);
+    _createIndexOnEmptyCollection(_opCtx.get(), _sourceNss, "a_1");
+    _insertDocument(_opCtx.get(), _sourceNss, BSON("_id" << 0));
+    {
+        FailPointEnableBlock failPoint("failRenameAfterFinalizeButBeforeSourceDrop");
+        ASSERT_THROWS_CODE(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, opts),
+                           AssertionException,
+                           ErrorCodes::BadValue);
+    }
+    ASSERT_TRUE(_collectionExists(_opCtx.get(), _sourceNss));
+    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, opts));
+    ASSERT_FALSE(_collectionExists(_opCtx.get(), _sourceNss));
+    auto destOptions = _getCollectionOptions(_opCtx.get(), _targetNssDifferentDb);
+    ASSERT_EQUALS(destOptions.uuid, *opts.newTargetCollectionUuid);
+}
+
+TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseFailsAfterFinalizeAndSourceDrop) {
+    RenameCollectionOptions opts;
+    opts.newTargetCollectionUuid = UUID::gen();
+    opts.dropTarget = true;
+    _createCollection(_opCtx.get(), _sourceNss);
+    _createIndexOnEmptyCollection(_opCtx.get(), _sourceNss, "a_1");
+    _insertDocument(_opCtx.get(), _sourceNss, BSON("_id" << 0));
+    {
+        FailPointEnableBlock failPoint("failRenameAfterFinalizeAndAfterSourceDrop");
+        ASSERT_THROWS_CODE(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, opts),
+                           AssertionException,
+                           13180500);
+    }
+
+    ASSERT_FALSE(_collectionExists(_opCtx.get(), _sourceNss));
+    auto destOptions = _getCollectionOptions(_opCtx.get(), _targetNssDifferentDb);
+    ASSERT_EQUALS(destOptions.uuid, *opts.newTargetCollectionUuid);
+
+    // Can't attempt a retry here as we don't get any benefit - renameCollection will fail with
+    // source namespace not found
+}
+
+TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseRetryAfterRenameSucceeds) {
+    RenameCollectionOptions opts;
+    opts.newTargetCollectionUuid = UUID::gen();
+    _createCollection(_opCtx.get(), _sourceNss);
+    _createIndexOnEmptyCollection(_opCtx.get(), _sourceNss, "a_1");
+    _insertDocument(_opCtx.get(), _sourceNss, BSON("_id" << 0));
+    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, opts));
+    ASSERT_THROWS_CODE(
+        uassertStatusOK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, opts)),
+        AssertionException,
+        ErrorCodes::NamespaceNotFound);
+    auto destOptions = _getCollectionOptions(_opCtx.get(), _targetNssDifferentDb);
+    ASSERT_EQUALS(destOptions.uuid, *opts.newTargetCollectionUuid);
 }
 
 TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabasesWithoutLocks) {

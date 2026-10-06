@@ -237,12 +237,8 @@ bool BackfillCoordinator::shouldBackfill(const boost::intrusive_ptr<ExpressionCo
         return false;
     }
 
-    // We shouldn't attempt the backfill if it's not enabled.
-    const bool isPQSBackfillEnabled = (!internalQuerySettingsDisableBackfill.load()) &&
-        feature_flags::gFeatureFlagPQSBackfill.isEnabledUseLatestFCVWhenUninitialized(
-            VersionContext::getDecoration(expCtx->getOperationContext()),
-            serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
-    if (!isPQSBackfillEnabled) {
+    // We shouldn't attempt the backfill if it's disabled via the server parameter.
+    if (internalQuerySettingsDisableBackfill.load()) {
         return false;
     }
 
@@ -357,10 +353,9 @@ ExecutorFuture<void> BackfillCoordinator::execute(
         getGlobalServiceContext()->getService()->makeClient("QuerySettingsBackfillManager");
     auto opCtxHolder = client->makeOperationContext();
     auto* opCtx = opCtxHolder.get();
-    const boost::optional<TenantId> tenantId = boost::none;
     auto&& service = QuerySettingsService::get(opCtx);
     auto [queryShapeConfigurations, clusterParameterTime] =
-        service.getAllQueryShapeConfigurations(tenantId);
+        service.getAllQueryShapeConfigurations();
 
     // Construct the query shape representative query array. Avoid copying over an entry if the
     // corresponding query shape configuration was removed in the meantime.
@@ -392,7 +387,6 @@ ExecutorFuture<void> BackfillCoordinator::execute(
                opCtx, std::move(representativeQueries), std::move(executor))
         .then([this,
                clusterParameterTime,
-               tenantId,
                client = std::move(client),
                opCtxHolder = std::move(opCtxHolder),
                nRepresentativeQueries](std::vector<QueryShapeHash> hashes) {
@@ -407,7 +401,7 @@ ExecutorFuture<void> BackfillCoordinator::execute(
                         "Succesfully inserted the backfilled representative queries",
                         "hashes"_attr = hashes,
                         "representativeQueriesInserted"_attr = nInsertedRepresentativeQueries);
-            _onCompletionHook(std::move(hashes), clusterParameterTime, tenantId);
+            _onCompletionHook(std::move(hashes), clusterParameterTime);
             tracker.incrementSucceededBackfills(nInsertedRepresentativeQueries);
             tracker.incrementFailedBackfills(nRepresentativeQueries -
                                              nInsertedRepresentativeQueries);

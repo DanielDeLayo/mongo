@@ -33,22 +33,15 @@ std::string_view DocumentSourceCursor::getSourceName() const {
 Value DocumentSourceCursor::serialize(const query_shape::SerializationOptions& opts) const {
     // We never parse a DocumentSourceCursor, so we only serialize for explain. Since it's never
     // part of user input, there's no need to compute its query shape.
-    if (!opts.isSerializingForExplain() || opts.isSerializingForQueryStats()) {
+    if (!opts.isSerializingForExplain() || opts.isShapifying()) {
         return Value();
     }
 
     tassert(10422502, "PlanExecutor is null", _sharedState->exec);
 
-    // TODO SERVER-130810 For a V3 explain, Explain::explainPipeline() serializes the pipeline at
-    // the legacy verbosity that V3 currently reuses, while the ExpressionContext holds the
-    // originally requested V3 verbosity, so the two intentionally differ. Skip the exact
-    // cross-check for V3 requests; it should be restored once the V3 pipeline output format is
-    // implemented.
-    const auto ctxVerbosity = getExpCtx()->getExplain();
     uassert(50660,
             "Mismatch between verbosity passed to serialize() and expression context verbosity",
-            (ctxVerbosity && ExplainOptions::isV3Verbosity(*ctxVerbosity)) ||
-                opts.verbosity == ctxVerbosity);
+            opts.verbosity == getExpCtx()->getExplain());
 
     MutableDocument out;
 

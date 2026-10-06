@@ -8,6 +8,7 @@
 #include "mongo/db/exec/sbe/sort_spec.h"
 #include "mongo/db/exec/sbe/values/block_interface.h"
 #include "mongo/db/exec/sbe/values/column_op.h"
+#include "mongo/db/exec/sbe/values/util.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/exec/sbe/vm/code_fragment.h"
 #include "mongo/db/exec/sbe/vm/vm_builtin.h"
@@ -328,6 +329,16 @@ public:
     class TopBottomArgsFromStack;
     class TopBottomArgsFromBlocks;
 
+    /**
+     * Ranks a value's position relative to a missing value in the MQL comparison order:
+     *
+     *   MinKey (0) < Nothing/missing/bsonUndefined (1) < any other value (2)
+     *
+     * 'bsonUndefined' shares its rank with Nothing because canonicalizeBSONType() maps both
+     * 'undefined' and 'eoo' to the same canonical type.
+     */
+    static int32_t mqlComparisonRank(value::TypeTags tag);
+
     static void aggDoubleDoubleSumImpl(value::Array* accumulator,
                                        value::TypeTags rhsTag,
                                        value::Value rhsValue);
@@ -456,15 +467,15 @@ private:
     value::TagValueMaybeOwned genericLog10(value::TagValueView operand);
     value::TagValueMaybeOwned genericSqrt(value::TagValueView operand);
     value::TagValueMaybeOwned genericPow(value::TagValueView base, value::TagValueView exponent);
-    value::TagValueMaybeOwned genericRoundTrunc(std::string funcName,
+    value::TagValueMaybeOwned genericRoundTrunc(std::string_view funcName,
                                                 Decimal128::RoundingMode roundingMode,
                                                 int32_t place,
                                                 value::TypeTags numTag,
                                                 value::Value numVal);
-    value::TagValueMaybeOwned scalarRoundTrunc(std::string funcName,
+    value::TagValueMaybeOwned scalarRoundTrunc(std::string_view funcName,
                                                Decimal128::RoundingMode roundingMode,
                                                ArityType arity);
-    value::TagValueMaybeOwned blockRoundTrunc(std::string funcName,
+    value::TagValueMaybeOwned blockRoundTrunc(std::string_view funcName,
                                               Decimal128::RoundingMode roundingMode,
                                               ArityType arity);
     value::TagValueOwned genericNot(value::TypeTags tag, value::Value value);
@@ -610,8 +621,7 @@ private:
     value::TagValueMaybeOwned genericISOWeek(value::TagValueView date, value::TagValueView tz);
     value::TagValueMaybeOwned genericNewKeyString(ArityType arity,
                                                   CollatorInterface* collator = nullptr);
-    value::TagValueMaybeOwned dateTrunc(value::TypeTags dateTag,
-                                        value::Value dateValue,
+    value::TagValueMaybeOwned dateTrunc(value::TagValueView date,
                                         TimeUnit unit,
                                         int64_t binSize,
                                         TimeZone timezone,
@@ -668,6 +678,7 @@ private:
     value::TagValueMaybeOwned builtinAddToArray(ArityType arity);
     value::TagValueMaybeOwned builtinAddToArrayCapped(ArityType arity);
     value::TagValueMaybeOwned builtinMergeObjects(ArityType arity);
+    value::TagValueMaybeOwned builtinMergeObjectsForExpr(ArityType arity);
     value::TagValueMaybeOwned builtinAddToSet(ArityType arity);
     value::TagValueMaybeOwned builtinCollAddToSet(ArityType arity);
     value::TagValueMaybeOwned isMemberImpl(value::TagValueView expr,
@@ -696,6 +707,35 @@ private:
 
     value::TagValueMaybeOwned builtinConvertSimpleSumToDoubleDoubleSum(ArityType arity);
     value::TagValueMaybeOwned builtinDoubleDoubleSum(ArityType arity);
+
+    /**
+     * Invokes 'processOne(tag, val)' on the stack arguments in the range [startIdx, endIdx), where
+     * a range holding a single array is processed element-wise, while a single non-array value or
+     * multiple values are each processed directly.
+     */
+    template <typename ProcessOne>
+    void processStackRange(ArityType startIdx, ArityType endIdx, const ProcessOne& processOne) {
+        if (endIdx - startIdx == 1) {
+            auto arg = viewFromStack(startIdx);
+            if (value::isArray(arg.tag)) {
+                value::arrayForEach(arg.tag, arg.value, [&](value::TypeTags tag, value::Value val) {
+                    processOne(tag, val);
+                });
+            } else {
+                processOne(arg.tag, arg.value);
+            }
+        } else {
+            for (ArityType idx = startIdx; idx < endIdx; ++idx) {
+                auto arg = viewFromStack(idx);
+                processOne(arg.tag, arg.value);
+            }
+        }
+    }
+
+    value::TagValueMaybeOwned builtinDoubleDoubleSumFromAcc(ArityType arity);
+    template <AccumulatorMinMaxN::MinMaxSense S>
+    value::TagValueMaybeOwned builtinMinMaxNFromAcc(ArityType arity);
+    value::TagValueMaybeOwned builtinAvgFromAcc(ArityType arity);
     // The template parameter is false for a regular DoubleDouble summation and true if merging
     // partially computed DoubleDouble sums.
     template <bool merging>
@@ -708,6 +748,8 @@ private:
     // standard devations.
     template <bool merging>
     value::TagValueMaybeOwned builtinAggStdDev(ArityType arity);
+    template <bool isSamp>
+    value::TagValueMaybeOwned builtinStdDevFromAcc(ArityType arity);
 
     value::TagValueMaybeOwned builtinStdDevPopFinalize(ArityType arity);
     value::TagValueMaybeOwned builtinStdDevSampFinalize(ArityType arity);
@@ -843,7 +885,7 @@ private:
      */
     value::TagValueMaybeOwned builtinCollArrayToSet(ArityType arity);
 
-    static MultiAccState getMultiAccState(value::TypeTags stateTag, value::Value stateVal);
+    static MultiAccState getMultiAccState(value::TagValueView state);
 
     value::TagValueMaybeOwned builtinAggFirstNNeedsMoreInput(ArityType arity);
     value::TagValueMaybeOwned builtinAggFirstN(ArityType arity);
@@ -931,10 +973,7 @@ private:
     value::TagValueMaybeOwned builtinAggRemovableConcatArraysRemove(ArityType arity);
     value::TagValueMaybeOwned builtinAggRemovableConcatArraysFinalize(ArityType arity);
     template <int quantity>
-    void aggRemovableStdDevImpl(value::TypeTags stateTag,
-                                value::Value stateVal,
-                                value::TypeTags inputTag,
-                                value::Value inputVal);
+    void aggRemovableStdDevImpl(value::TagValueView state, value::TagValueView input);
     value::TagValueMaybeOwned builtinAggRemovableStdDevAdd(ArityType arity);
     value::TagValueMaybeOwned builtinAggRemovableStdDevRemove(ArityType arity);
     value::TagValueMaybeOwned builtinAggRemovableStdDevFinalize(ArityType arity, bool isSamp);
@@ -978,6 +1017,7 @@ private:
 
     value::TagValueOwned builtinValueBlockExists(ArityType arity);
     value::TagValueOwned builtinValueBlockIsNullish(ArityType arity);
+    value::TagValueOwned builtinValueBlockMqlComparisonRank(ArityType arity);
     value::TagValueOwned builtinValueBlockTypeMatch(ArityType arity);
     value::TagValueOwned builtinValueBlockIsTimezone(ArityType arity);
     value::TagValueMaybeOwned builtinValueBlockFillEmpty(ArityType arity);
@@ -1188,16 +1228,6 @@ private:
     }
 
     MONGO_COMPILER_ALWAYS_INLINE_OPT
-    std::pair<value::TypeTags, value::Value> moveRawOwnedFromStack(size_t offset) {
-        auto [owned, tag, val] = moveFromStack(offset);
-        if (!owned) {
-            std::tie(tag, val) = value::copyValue(tag, val);
-        }
-
-        return {tag, val};
-    }
-
-    MONGO_COMPILER_ALWAYS_INLINE_OPT
     void setTagToNothing(size_t offset) noexcept {
         if (MONGO_likely(offset == 0)) {
             writeToMemory(_argStackTop + offsetTag, value::TypeTags::Nothing);
@@ -1327,7 +1357,7 @@ struct ByteCode::InvokeLambdaFunctor {
         bytecode.pushStack(false, tag, val);
         bytecode.runLambdaInternal(code, lamPos);
         // Move the result off the stack, make sure it's owned, and return it.
-        auto result = bytecode.moveRawOwnedFromStack(0);
+        auto result = bytecode.moveOwnedFromStack(0).releaseToRaw();
         bytecode.popStack();
         return result;
     }
@@ -1390,12 +1420,9 @@ public:
 
 protected:
     template <TopBottomSense Sense>
-    static int32_t compare(value::TypeTags leftElemTag,
-                           value::Value leftElemVal,
-                           value::TypeTags rightElemTag,
-                           value::Value rightElemVal) {
+    static int32_t compare(value::TagValueView leftElem, value::TagValueView rightElem) {
         auto [cmpTag, cmpVal] =
-            value::compareValue(leftElemTag, leftElemVal, rightElemTag, rightElemVal);
+            value::compareValue(leftElem.tag, leftElem.value, rightElem.tag, rightElem.value);
 
         if (cmpTag == value::TypeTags::NumberInt32) {
             int32_t cmp = value::bitcastTo<int32_t>(cmpVal);

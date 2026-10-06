@@ -3,13 +3,6 @@
 
 #include "mongo/db/views/view_catalog_helpers.h"
 
-#include <absl/container/node_hash_map.h>
-#include <absl/container/node_hash_set.h>
-#include <boost/move/utility_core.hpp>
-#include <boost/none.hpp>
-#include <boost/optional/optional.hpp>
-#include <boost/smart_ptr/intrusive_ptr.hpp>
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/db/basic_types_gen.h"
@@ -47,6 +40,14 @@
 #include <utility>
 #include <vector>
 
+#include <absl/container/node_hash_map.h>
+#include <absl/container/node_hash_set.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+
 namespace mongo {
 namespace view_catalog_helpers {
 
@@ -67,8 +68,14 @@ LiteParsedPipeline liteParseAndValidateWithIfrRetry(const OperationContext* opCt
         },
         kDefaultMaxRetries,
         [&](const ExceptionFor<ErrorCodes::IFRFlagRetry>& ex) {
-            auto* flag = IncrementalRolloutFeatureFlag::findByName(
-                ex.extraInfo<IFRFlagRetryInfo>()->getDisabledFlagName());
+            auto retryInfo = ex.extraInfo<IFRFlagRetryInfo>();
+            tassert(13322500, "IFR retry is missing its IFRFlagRetryInfo", retryInfo);
+            std::string_view disabledFlagName = retryInfo->getDisabledFlagName();
+            auto* flag = IncrementalRolloutFeatureFlag::findByName(disabledFlagName);
+            tassert(13322501,
+                    str::stream() << "IFR retry referenced an unknown feature flag: "
+                                  << disabledFlagName,
+                    flag);
             ifrContext->disableFlag(*flag);
         });
 }

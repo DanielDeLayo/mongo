@@ -123,6 +123,7 @@ public:
     WRAPPED_WT_SESSION_METHOD(log_flush)
     WRAPPED_WT_SESSION_METHOD(open_cursor)
     WRAPPED_WT_SESSION_METHOD(prepare_transaction)
+    WRAPPED_WT_SESSION_METHOD(publish)
     WRAPPED_WT_SESSION_METHOD(query_timestamp)
     WRAPPED_WT_SESSION_METHOD(reset)
     WRAPPED_WT_SESSION_METHOD(reconfigure)
@@ -131,8 +132,19 @@ public:
     WRAPPED_WT_SESSION_METHOD(timestamp_transaction_uint)
     WRAPPED_WT_SESSION_METHOD(transaction_pinned_range)
     WRAPPED_WT_SESSION_METHOD(truncate)
-    WRAPPED_WT_SESSION_METHOD(verify)
 #undef WRAPPED_WT_SESSION_METHOD
+
+    /**
+     * Perform a WiredTiger-level verification of a table.
+     *
+     * The config string specifies optional extra arguments made to the verify call, nullptr and
+     * empty strings are both permitted. These extra arguments will override any arguments that
+     * this wrapper adds internally.
+     *
+     * TODO SERVER-131939: Once we stop unconditionally skipping the extra HS key verification,
+     * remove this custom wrapper and go back to using the macro.
+     */
+    int verify(const char* uri, const char* config);
 
     /**
      * Gets a cursor on the table id 'id' with optional configuration, 'config'.
@@ -152,12 +164,12 @@ public:
      * This will never return a cursor from the cursor cache, and these cursors should *never* be
      * released into the cache by calling releaseCursor(). Use closeCursor() instead.
      */
-    WT_CURSOR* getNewCursor(std::string_view uri, const char* config);
+    WT_CURSOR* getNewCursor(const std::string& uri, const char* config);
 
     /**
      * Wrapper for getNewCursor() without a config string.
      */
-    WT_CURSOR* getNewCursor(std::string_view uri) {
+    WT_CURSOR* getNewCursor(const std::string& uri) {
         return getNewCursor(uri, nullptr);
     }
 
@@ -279,7 +291,7 @@ private:
     typedef std::list<CachedCursor> CursorCache;
 
     void _openCursor(WT_SESSION* session,
-                     std::string_view uri,
+                     const std::string& uri,
                      const char* config,
                      WT_CURSOR** cursorOut);
 

@@ -198,21 +198,32 @@ export function checkSbeTransformStagesEnabled(theDB) {
 }
 
 /**
+ * Check if featureFlagSbeAccumulatorExpressions is enabled in the cluster.
+ *
+ * Quits test if there is no primary node and we are running in a mixed configuration.
+ */
+export function checkSbeAccumulatorExpressionsEnabled(theDB) {
+    if (theDB !== null) {
+        return discoverNodesAndCheck(theDB, (conn) => {
+            return FeatureFlagUtil.isPresentAndEnabled(conn, "SbeAccumulatorExpressions");
+        });
+    } else {
+        // If we don't have a database available, we can only look at the TestData to see what
+        // parameters resmoke was given.
+        return (
+            TestData.setParameters.featureFlagSbeAccumulatorExpressions &&
+            TestData.setParameters.featureFlagSbeAccumulatorExpressions === "true"
+        );
+    }
+}
+
+/**
  * Check if featureFlagSbeFull is enabled in the cluster.
  *
  * Quits test if there is no primary node and we are running in a mixed configuration.
  */
 export function checkSbeFullFeatureFlagEnabled(theDB) {
     return checkSbeStatus(theDB) === kFeatureFlagSbeFullEnabled;
-}
-
-/**
- * Check if the SBE plan cache is enabled. The SBE plan cache is currently not in use;
- * queries always use the classic plan cache.
- * TODO SERVER-128637
- */
-export function sbePlanCacheEnabled(_theDB) {
-    return false;
 }
 
 /**

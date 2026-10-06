@@ -287,7 +287,9 @@ public:
 
     void prepareReplMetadata(const GenericArguments&, const OpTime&, BSONObjBuilder*) const final;
 
-    Status processHeartbeatV1(const ReplSetHeartbeatArgsV1&, ReplSetHeartbeatResponse*) final;
+    Status processHeartbeatV1(OperationContext*,
+                              const ReplSetHeartbeatArgsV1&,
+                              ReplSetHeartbeatResponse*) final;
 
     bool getWriteConcernMajorityShouldJournal() final;
 
@@ -309,7 +311,10 @@ public:
 
     Status waitForPrimaryMajorityReadsAvailable(OperationContext* opCtx) const final;
 
-    Status stepUpIfEligible(OperationContext* opCtx, bool skipDryRun) final;
+    Status stepUpIfEligible(
+        OperationContext* opCtx,
+        bool skipDryRun,
+        boost::optional<Date_t> priorPrimaryStopAcceptingWritesTime = boost::none) final;
 
     Status abortCatchupIfNeeded(PrimaryCatchUpConclusionReason reason) final;
 

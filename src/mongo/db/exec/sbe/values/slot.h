@@ -42,7 +42,7 @@ public:
      */
     inline TagValueOwned getCopyOfValue() const {
         auto [tag, val] = getViewOfValue();
-        return sbe::value::copyValue(tag, val);
+        return TagValueOwned::fromRaw(sbe::value::copyValue(tag, val));
     }
 
     /**
@@ -114,7 +114,7 @@ public:
      * Returns a copy of the value.
      */
     TagValueOwned copyOrMoveValue() override {
-        return copyValue(_tag, _val);
+        return TagValueOwned::fromRaw(copyValue(_tag, _val));
     }
 
     void reset() {
@@ -141,8 +141,6 @@ private:
  */
 class OwnedValueAccessor final : public AssignableSlotAccessor {
 public:
-    using AssignableSlotAccessor::reset;
-
     OwnedValueAccessor() = default;
 
     OwnedValueAccessor(const OwnedValueAccessor& other) {
@@ -167,7 +165,9 @@ public:
     }
 
     ~OwnedValueAccessor() override {
-        release();
+        if (_owned) {
+            releaseValue(_tag, _val);
+        }
     }
 
     // Copy and swap idiom for a single copy/move assignment operator.
@@ -195,26 +195,48 @@ public:
         SlotAccessorHelper::dassertValidSlotValue(_tag, _val);
         if (_owned) {
             _owned = false;
-            return {_tag, _val};
+            return TagValueOwned::fromRaw(_tag, _val);
         } else {
-            return copyValue(_tag, _val);
+            return TagValueOwned::fromRaw(copyValue(_tag, _val));
         }
     }
 
+    /*
+     * Note that 'OwnedValueAccessor' _shadows_ the 'reset()' methods instead of inheriting them.
+     * Whereas the parent 'AssignableSlotAccessor' implementations delegate their operation to the
+     * virtual 'reset_raw()' method, these implementations delegate to a non-virtual method
+     * implementing the same logic that 'reset_raw()' does.
+     *
+     * This trick allows calls to 'reset()' through a variable, pointer, or reference with
+     * 'OwnedValueAccessor' type to always skip virtual dispatch, which measurably speeds up
+     * workloads. However, it precludes any class from inheriting this class and overriding its
+     * 'reset_raw()' method. Keep 'OwnedValueAccessor' as a 'final' class to ensure this requirement
+     * is met.
+     */
     void reset() {
-        reset(TypeTags::Nothing, 0);
+        reset(TagValueView::nothing());
     }
 
     void reset(TypeTags tag, Value val) {
-        reset_raw(true, tag, val);
+        resetImpl(true, tag, val);
+    }
+
+    void reset(TagValueView value) {
+        resetImpl(false, value.tag, value.value);
+    }
+
+    void reset(TagValueOwned value) {
+        auto [tag, val] = value.releaseToRaw();
+        resetImpl(true, tag, val);
+    }
+
+    void reset(TagValueMaybeOwned value) {
+        auto [owned, tag, val] = value.releaseToRaw();
+        resetImpl(owned, tag, val);
     }
 
     void reset_raw(bool owned, TypeTags tag, Value val) override {
-        release();
-
-        _tag = tag;
-        _val = val;
-        _owned = owned;
+        resetImpl(owned, tag, val);
     }
 
     void makeOwned() {
@@ -227,11 +249,14 @@ public:
     }
 
 private:
-    void release() {
+    void resetImpl(bool owned, TypeTags tag, Value val) {
         if (_owned) {
             releaseValue(_tag, _val);
-            _owned = false;
         }
+
+        _tag = tag;
+        _val = val;
+        _owned = owned;
     }
 
     bool _owned{false};
@@ -261,7 +286,7 @@ public:
     TagValueOwned copyOrMoveValue() override {
         // We can never move out values from array.
         auto [tag, val] = getViewOfValue();
-        return copyValue(tag, val);
+        return TagValueOwned::fromRaw(copyValue(tag, val));
     }
 
     bool atEnd() const {
@@ -332,7 +357,7 @@ public:
     TagValueOwned copyOrMoveValue() override {
         // We can never move out values from keys.
         auto [tag, val] = getViewOfValue();
-        return copyValue(tag, val);
+        return TagValueOwned::fromRaw(copyValue(tag, val));
     }
 
 private:
@@ -364,12 +389,12 @@ public:
             return _it->second.copyOrMoveValue(_slot);
         } else {
             auto [tag, val] = getViewOfValue();
-            return copyValue(tag, val);
+            return TagValueOwned::fromRaw(copyValue(tag, val));
         }
     }
 
     void reset_raw(bool owned, TypeTags tag, Value val) override {
-        _it->second.reset(_slot, owned, tag, val);
+        _it->second.reset(_slot, TagValueMaybeOwned::fromRaw(owned, tag, val));
     }
 
 private:
@@ -401,7 +426,7 @@ public:
     }
 
     void reset_raw(bool owned, TypeTags tag, Value val) override {
-        _container[_it].reset(_slot, owned, tag, val);
+        _container[_it].reset(_slot, TagValueMaybeOwned::fromRaw(owned, tag, val));
     }
 
 private:
@@ -431,7 +456,7 @@ public:
         return _row.copyOrMoveValue(_slot);
     }
     void reset_raw(bool owned, TypeTags tag, Value val) override {
-        _row.reset(_slot, owned, tag, val);
+        _row.reset(_slot, TagValueMaybeOwned::fromRaw(owned, tag, val));
     }
 
 private:
@@ -462,7 +487,7 @@ public:
         using PointedType = std::remove_pointer_t<T>;
         if constexpr (std::is_const_v<PointedType>) {
             auto [tag, val] = getViewOfValue();
-            return copyValue(tag, val);
+            return TagValueOwned::fromRaw(copyValue(tag, val));
         } else {
             return _ptr->copyOrMoveValue();
         }
@@ -504,23 +529,6 @@ using FrameIdGenerator = IdGenerator<FrameId>;
 using SpoolIdGenerator = IdGenerator<SpoolId>;
 
 /**
- * Given an unordered slot 'map', calls 'callback' for each slot/value pair in order of ascending
- * slot id.
- */
-template <typename T, typename C>
-void orderedSlotMapTraverse(const SlotMap<T>& map, C callback) {
-    std::set<SlotId> slots;
-    for (auto&& elem : map) {
-        slots.insert(elem.first);
-    }
-
-    for (auto slot : slots) {
-        callback(slot, map.at(slot));
-    }
-}
-
-
-/**
  * Accessor for a slot which can own the value held by that slot and provides optimized BSONObj
  * access.
  */
@@ -558,7 +566,9 @@ public:
     }
 
     ~BSONObjValueAccessor() override {
-        release();
+        if (_owned) {
+            releaseValue(_tag, _val);
+        }
     }
 
     // Copy and swap idiom for a single copy/move assignment operator.
@@ -588,9 +598,9 @@ public:
         SlotAccessorHelper::dassertValidSlotValue(_tag, _val);
         if (_owned && !_hasBsonObj) {
             _owned = false;
-            return {_tag, _val};
+            return TagValueOwned::fromRaw(_tag, _val);
         } else {
-            return copyValue(_tag, _val);
+            return TagValueOwned::fromRaw(copyValue(_tag, _val));
         }
     }
 

@@ -8,6 +8,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/index_builds/index_builds_manager.h"
+#include "mongo/db/index_builds/primary_driven/registry.h"
 #include "mongo/db/index_builds/repl_index_build_state.h"
 #include "mongo/db/index_builds/resumable_index_builds_gen.h"
 #include "mongo/db/operation_context.h"
@@ -21,8 +22,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <vector>
 
 
@@ -35,6 +38,11 @@ enum class IndexBuildOutcome {
     // stepdown) and will be resumed.
     kToBeResumed,
 };
+
+/**
+ * Serializes the IndexBuildOutcome enum.
+ */
+std::string_view toString(IndexBuildOutcome outcome);
 
 /**
  * This is a helper class used by IndexBuildsCoordinator to safely manage the data structures
@@ -85,7 +93,9 @@ public:
     void awaitNoIndexBuildInProgressForCollection(OperationContext* opCtx,
                                                   const UUID& collectionUUID);
 
-    void awaitNoBgOpInProgForDb(OperationContext* opCtx, const DatabaseName& dbName);
+    void awaitNoBgOpInProgForDb(OperationContext* opCtx,
+                                const DatabaseName& dbName,
+                                std::initializer_list<IndexBuildProtocol> protocols);
 
     /**
      * Unregisters the index build.
@@ -96,6 +106,13 @@ public:
 
     void incrementResumeSucceeded(IndexBuildPhaseEnum phase);
     void incrementResumeFailed();
+
+    void setPrimaryDrivenRegistry(index_builds::primary_driven::Registry& registry);
+
+    std::vector<UUID> buildUUIDsForCollection(const UUID& collectionUUID) const;
+    std::vector<UUID> buildUUIDsForCollection(const UUID& collectionUUID,
+                                              IndexBuildProtocol protocol) const;
+    std::vector<UUID> buildUUIDsForDb(const DatabaseName& dbName) const;
 
     /**
      * Returns a list of index builds matching the criteria 'indexBuildFilter'.
@@ -110,9 +127,9 @@ public:
     Status registerIndexBuild(std::shared_ptr<ReplIndexBuildState> replIndexBuildState);
 
     /**
-     * Get the number of in-progress index builds.
+     * Returns the number of index builds that exist on this node.
      */
-    size_t getActiveIndexBuildsCount() const;
+    size_t getIndexBuildsCount() const;
 
     /**
      * Provides passthrough access to ReplIndexBuildState for index build info.
@@ -127,6 +144,21 @@ public:
     void sleepIfNecessary_forTestOnly() const;
 
 private:
+    /**
+     * Waits until no index builds matching the criteria 'indexBuildFilter' are in progress.
+     */
+    void _awaitNoIndexBuildInProgressForFilter(OperationContext* opCtx,
+                                               IndexBuildFilterFn indexBuildFilter);
+
+    /**
+     * As '_awaitNoIndexBuildInProgressForFilter()', but also waits out the primary-driven index
+     * builds registered on this node that match 'registeredFilter'.
+     */
+    void _awaitNoIndexBuildInProgressForFilters(
+        OperationContext* opCtx,
+        IndexBuildFilterFn runningFilter,
+        std::function<bool(const index_builds::primary_driven::Registry::Entry&)> registeredFilter);
+
     /**
      * Helper function for filterIndexBuilds. This function is necessary because some callers
      * already hold the mutex before calling this function.
@@ -146,6 +178,18 @@ private:
     // Generation counter of completed index builds. Used in conjuction with the condition
     // variable to receive notifications when an index build completes.
     uint32_t _indexBuildsCompletedGen = 0;
+
+    /**
+     * Returns the UUIDs of the index builds this node is running that match 'runningFilter', plus
+     * the primary-driven index builds registered on this node that match 'registeredFilter'.
+     */
+    std::vector<UUID> _buildUUIDs(
+        const IndexBuildFilterFn& runningFilter,
+        const std::function<bool(const index_builds::primary_driven::Registry::Entry&)>&
+            registeredFilter) const;
+
+    // Null until setPrimaryDrivenRegistry is called.
+    index_builds::primary_driven::Registry* _primaryDrivenRegistry = nullptr;
 
     bool _sleepForTest = false;
 };

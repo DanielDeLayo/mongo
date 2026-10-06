@@ -1,31 +1,5 @@
-/**
- *    Copyright (C) 2026-present MongoDB, Inc.
- *
- *    This program is free software: you can redistribute it and/or modify
- *    it under the terms of the Server Side Public License, version 1,
- *    as published by MongoDB, Inc.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    Server Side Public License for more details.
- *
- *    You should have received a copy of the Server Side Public License
- *    along with this program. If not, see
- *    <http://www.mongodb.com/licensing/server-side-public-license>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the Server Side Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/repl/container_oplog_entry_serialization.h"
 
@@ -202,7 +176,7 @@ TEST(ContainerOplogEntrySerializationTest, RangeInsertForStringKeyedContainer) {
         rangeInsertStringKeyed, IDLParserContext("RangeInsertForStringKeyedContainer"));
 
     EXPECT_TRUE(parsed.getKey().isArrayKey());
-    const auto keys = parsed.getKey().getArrayKey();
+    const auto& keys = parsed.getKey().getArrayKey();
     ASSERT_EQ(keys.size(), 3u);
     EXPECT_EQ(std::string_view(keys[0].data(), keys[0].size()), "a"sv);
     EXPECT_EQ(std::string_view(keys[1].data(), keys[1].size()), "b"sv);
@@ -244,6 +218,29 @@ TEST(ContainerOplogEntrySerializationTest, ContainerKeyParseRejectsNonBinDataArr
 TEST(ContainerOplogEntrySerializationTest, ContainerValParseRejectsNonBinDataArrayElement) {
     const auto obj = BSON("v" << BSON_ARRAY(1 << 2));
     ASSERT_THROWS_CODE(ContainerVal::parse(obj["v"]), DBException, ErrorCodes::TypeMismatch);
+}
+
+TEST(ContainerOplogEntrySerializationTest, ContainerKeyIsPacked) {
+    const char k[] = "K1";
+    // Only an array holds more than one key.
+    ASSERT_TRUE(
+        ContainerKey::isPacked(BSON("k" << BSON_ARRAY(BSONBinData(k, 2, BinDataGeneral)))["k"]));
+    ASSERT_FALSE(ContainerKey::isPacked(BSON("k" << BSONBinData(k, 2, BinDataGeneral))["k"]));
+    ASSERT_FALSE(ContainerKey::isPacked(BSON("k" << int64_t{7})["k"]));
+
+    // An array of one is still the packed encoding, and an absent key is not packed.
+    ASSERT_TRUE(ContainerKey::isPacked(BSON("k" << BSONArray())["k"]));
+    ASSERT_FALSE(ContainerKey::isPacked(BSONObj()["k"]));
+}
+
+TEST(ContainerOplogEntrySerializationTest, ContainerValIsPacked) {
+    const char v[] = "V";
+    ASSERT_TRUE(
+        ContainerVal::isPacked(BSON("v" << BSON_ARRAY(BSONBinData(v, 1, BinDataGeneral)))["v"]));
+    ASSERT_FALSE(ContainerVal::isPacked(BSON("v" << BSONBinData(v, 1, BinDataGeneral))["v"]));
+
+    // An absent value is not packed, which is the common shape for a bytes-keyed range insert.
+    ASSERT_FALSE(ContainerVal::isPacked(BSONObj()["v"]));
 }
 
 }  // namespace

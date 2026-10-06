@@ -3,9 +3,6 @@
 
 #pragma once
 
-#include "mongo/db/query/query_execution_knobs_gen.h"
-#include "mongo/db/query/query_integration_knobs_gen.h"
-#include "mongo/db/query/query_optimization_knobs_gen.h"
 #include "mongo/db/sorter/file.h"
 #include "mongo/db/sorter/sorter.h"
 #include "mongo/db/sorter/sorter_file_name.h"
@@ -345,9 +342,13 @@ void SortedFileWriter<Key, Value>::writeChunk() {
     // The size is both written to and read from in platform-specific endian order. In the unlikely
     // event that data files are written and read by platforms of differing endianness, the result
     // will be a read checksum mismatch in the worst case, which callers must recover from.
+    //
+    // One writer is one logical spill: only its first chunk counts as a spill.
+    const bool isFirstChunk = _file->currentOffset() == _fileStartOffset;
     _file->write(reinterpret_cast<const char*>(&signedSize), sizeof(signedSize));
     _file->write(outBuffer, size);
-    sortCounters.incrementSortCountersPerSpilling(/*sortSpills=*/1, sizeof(signedSize) + size);
+    sortCounters.incrementSortCountersPerSpilling(/*sortSpills=*/isFirstChunk ? 1 : 0,
+                                                  sizeof(signedSize) + size);
 
     this->_buffer.reset();
 }

@@ -3,7 +3,6 @@
 
 #include "mongo/db/query/stage_builder/sbe/type_checker.h"
 
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/query/algebra/polyvalue.h"
 #include "mongo/db/query/stage_builder/sbe/abt/comparison_op.h"
@@ -11,6 +10,7 @@
 #include "mongo/util/assert_util.h"
 
 #include <vector>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 namespace mongo::stage_builder {
 
@@ -589,6 +589,11 @@ TypeSignature TypeChecker::operator()(abt::ABT& n, abt::FunctionCall& op, bool s
             if (arity == 1)
                 return evaluateTypeTest(
                     n, argTypes[0], getTypeSignature(sbe::value::TypeTags::Timestamp));
+            break;
+        case sbe::EFn::kMqlComparisonRank:
+            // Always returns an integer rank (0, 1 or 2); never Nothing, even for a Nothing input.
+            if (arity == 1)
+                return getTypeSignature(sbe::value::TypeTags::NumberInt32);
             break;
         case sbe::EFn::kDateTrunc:
             // Always mark Nothing as a possible return type, as it can be reported due to invalid

@@ -39,11 +39,6 @@ namespace mongo {
                                                             const NamespaceString& nss);
 
 /**
- * Returns true if size metadata and timestamps are persisted in containers instead of collections.
- */
-[[MONGO_MOD_PUBLIC]] bool shouldUseReplicatedFastCountContainers(OperationContext* opCtx);
-
-/**
  * Returns true if replicated fast count metadata should be emitted in listCollections output.
  */
 [[MONGO_MOD_PUBLIC]] bool isReplicatedFastCountListCollectionsEnabled(OperationContext* opCtx);

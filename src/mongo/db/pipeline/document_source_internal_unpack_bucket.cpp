@@ -3,16 +3,6 @@
 
 #include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
 
-#include <cstddef>
-#include <cstdint>
-
-#include <s2cellid.h>
-
-#include <boost/none.hpp>
-#include <boost/optional.hpp>
-#include <boost/optional/optional.hpp>
-#include <boost/smart_ptr/intrusive_ptr.hpp>
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
@@ -56,12 +46,22 @@
 #include "mongo/util/str.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <iterator>
 #include <list>
 #include <ostream>
 #include <string>
 #include <string_view>
 #include <tuple>
+
+#include <s2cellid.h>
+
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
@@ -416,8 +416,7 @@ boost::intrusive_ptr<Expression> rewriteGroupByElement(
     boost::intrusive_ptr<Expression> expr,
     const timeseries::BucketUnpacker& bucketUnpacker,
     int bucketMaxSpanSeconds,
-    bool fixedBuckets,
-    bool usesExtendedRange) {
+    bool fixedBuckets) {
     // We allow the $group stage to be rewritten if the _id field only consists of these 3 options:
     // 1. If the _id field is constant.
     // 2. If the _id field is an expression whose fieldPaths are at or under the metaField.
@@ -436,7 +435,7 @@ boost::intrusive_ptr<Expression> rewriteGroupByElement(
 
     // Option 3: Currently the only allowed field path not on the metaField is $dateTrunc on the
     // timeField if the buckets are fixed and do not use an extended range.
-    if (fixedBuckets && !usesExtendedRange &&
+    if (fixedBuckets && !bucketUnpacker.getUsesExtendedRange() &&
         bucketUnpacker.providesField(bucketUnpacker.getTimeField())) {
         return handleDateTruncRewrite(
             pExpCtx, expr, bucketUnpacker.getTimeField(), bucketMaxSpanSeconds);
@@ -580,8 +579,7 @@ boost::intrusive_ptr<Expression> rewriteGroupByField(
     const std::vector<std::string>& idFieldNames,
     const timeseries::BucketUnpacker& bucketUnpacker,
     int bucketMaxSpanSeconds,
-    bool fixedBuckets,
-    bool usesExtendedRange) {
+    bool fixedBuckets) {
     tassert(7823400,
             "idFieldNames must be empty or the same size as idFieldExpressions",
             (idFieldNames.empty() && idFieldExpressions.size() == 1) ||
@@ -590,12 +588,8 @@ boost::intrusive_ptr<Expression> rewriteGroupByField(
     std::vector<std::pair<std::string, boost::intrusive_ptr<Expression>>> fieldsAndExprs;
     const bool isIdFieldAnExpr = idFieldNames.empty();
     for (std::size_t i = 0; i < idFieldExpressions.size(); ++i) {
-        auto expr = rewriteGroupByElement(pExpCtx,
-                                          idFieldExpressions[i],
-                                          bucketUnpacker,
-                                          bucketMaxSpanSeconds,
-                                          fixedBuckets,
-                                          usesExtendedRange);
+        auto expr = rewriteGroupByElement(
+            pExpCtx, idFieldExpressions[i], bucketUnpacker, bucketMaxSpanSeconds, fixedBuckets);
         if (!expr) {
             return {};
         }
@@ -1285,8 +1279,7 @@ DocumentSourceInternalUnpackBucket::rewriteGroupStage(DocumentSourceContainer::i
                                                      idFieldNames,
                                                      _sharedState->_bucketUnpacker,
                                                      _bucketMaxSpanSeconds,
-                                                     _fixedBuckets,
-                                                     _usesExtendedRange);
+                                                     _fixedBuckets);
     if (!rewrittenIdExpression) {
         return {};
     }
@@ -1786,8 +1779,8 @@ DocumentSourceContainer::iterator DocumentSourceInternalUnpackBucket::optimizeAt
         // Unlike other rewrites for this stage, this rewrite affects a $match stage that is
         // *before* the unpack stage. So we need to apply this rewrite first, before the others,
         // which might cause us to return early.
-        if (auto prevMatch = dynamic_cast<DocumentSourceMatch*>(std::prev(itr)->get()); prevMatch &&
-            !getExpCtx()->getInRouter() && !_sharedState->_bucketUnpacker.getUsesExtendedRange()) {
+        if (auto prevMatch = dynamic_cast<DocumentSourceMatch*>(std::prev(itr)->get());
+            prevMatch && !getExpCtx()->getInRouter() && !usesExtendedRange()) {
             MatchExpression* matchExpr = prevMatch->getMatchExpression();
             bool updated = generateBucketLevelIdPredicates(matchExpr);
             if (updated) {
@@ -1795,6 +1788,34 @@ DocumentSourceContainer::iterator DocumentSourceInternalUnpackBucket::optimizeAt
                 prevMatch->rebuild(predObj);
             }
             _checkIfNeedsIdPredicates = false;
+        }
+    }
+
+    // Shard-side event filter pruning for fixed buckets.
+    // A pipeline that arrived from the router with fixedBuckets=false will have its post-unpack
+    // $match already processed: a loose $match inserted before us, and _eventFilter set inside us.
+    // After populateUnpackBucketStagesFromCollection sets fixedBuckets=true, we check here whether
+    // the event filter is made redundant by the fixed-bucket alignment guarantee. Safety checks:
+    //   1. fixedBuckets=true and !usesExtendedRange (no clamping near Date_t::min()).
+    //   2. _eventFilter is present.
+    //   3. A $match stage immediately precedes us (belt-and-suspenders: confirms the bucket-level
+    //      filter actually exists before we drop per-event evaluation).
+    //   4. createPredicatesOnBucketLevelField returns rewriteProvidesExactMatchPredicate=true
+    //      (the predicate is aligned to bucket boundaries, so the bucket filter is tight).
+    if (_fixedBuckets && !usesExtendedRange() && _sharedState->_eventFilter &&
+        itr != container->begin() &&
+        dynamic_cast<const DocumentSourceMatch*>(std::prev(itr)->get())) {
+        auto predicates = createPredicatesOnBucketLevelField(_sharedState->_eventFilter.get());
+        if (predicates.rewriteProvidesExactMatchPredicate) {
+            _sharedState->_eventFilter.reset();
+            _eventFilterBson = {};
+            _eventFilterDeps = DepsTracker{};
+            // The router (which didn't yet know fixedBuckets=true) may have already computed a
+            // wholeBucketFilter alongside the now-redundant event filter. As elsewhere in this
+            // file: if the event filter is dropped, a wholeBucketFilter is no longer needed.
+            _sharedState->_wholeBucketFilter.reset();
+            _wholeBucketFilterBson = {};
+            return itr;
         }
     }
 

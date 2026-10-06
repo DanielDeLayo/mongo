@@ -53,6 +53,10 @@ enums:
                                         independently of other applyOps entries in the chain.
                                         Used for vectored inserts which require more than one
                                         storage transaction.
+            kApplyOpsAppliedAtomically: This oplog entry is an applyOps which should be applied
+                                        atomically with the other applyOps entries in the chain.
+                                        Used for a retryable write statement, represented by one or
+                                        more applyOps entries.
         type: int
         values:
             kLegacyMultiOpType: 0
@@ -80,6 +84,8 @@ enums:
             kImportCollection: "importCollection"
             kCreateDatabaseMetadata: "createDatabaseMetadata"
             kDropDatabaseMetadata: "dropDatabaseMetadata"
+            kInvalidateAllCollectionMetadata: "invalidateAllCollectionMetadata"
+            kInvalidateAllDatabaseMetadata: "invalidateAllDatabaseMetadata"
             kInvalidateCollectionMetadata: "invalidateCollectionMetadata"
             kSetAllowChunkOperations: "setAllowChunkOperations"
             kUpdateCollectionMetadata: "updateCollectionMetadata"
@@ -230,13 +236,6 @@ structs:
                 optional: true
                 description: "Snapshot of the FCV used by the operation,
                     which ensures that feature flag checks are stable through its execution."
-            h:
-                cpp_name: docHash
-                type: safeInt64
-                optional: true
-                description:
-                    "Hash of the document affected by this operation. For inserts and updates,
-                    this is the post-image. For deletes, this is the pre-image."
 
     DropAndRenameOplogEntryO2:
         description: "The 'o2' field of a 'drop' or 'rename' oplog entry."

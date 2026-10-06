@@ -1,31 +1,5 @@
-/**
- *    Copyright (C) 2026-present MongoDB, Inc.
- *
- *    This program is free software: you can redistribute it and/or modify
- *    it under the terms of the Server Side Public License, version 1,
- *    as published by MongoDB, Inc.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    Server Side Public License for more details.
- *
- *    You should have received a copy of the Server Side Public License
- *    along with this program. If not, see
- *    <http://www.mongodb.com/licensing/server-side-public-license>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the Server Side Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/otel/metrics/instrumentation/wiredtiger_metrics.h"
 
@@ -99,13 +73,13 @@ inline const auto kCounterFields = std::to_array<CounterField>({
 });
 
 // Maps each field of the snapshot to the gauge it hydrates.
-struct GaugeField {
+struct WTGaugeField {
     std::string_view name;
     int64_t WiredTigerStatsSnapshot::* field;
     MetricName metric;
 };
 
-inline const auto kGaugeFields = std::to_array<GaugeField>({
+inline const auto kWiredTigerGaugeFields = std::to_array<WTGaugeField>({
     {"evictionEmptyScore"sv,
      &WiredTigerStatsSnapshot::evictionEmptyScore,
      MetricNames::kEvictionEmptyScore},
@@ -162,7 +136,7 @@ TEST_F(WiredTigerOtelMetricsTest, CountableWTMetrics) {
             WiredTigerStatsSnapshot snap;
             for (const auto& f : kCounterFields)
                 snap.*f.field = reading;
-            metrics.update(snap);
+            metrics.updateWiredTiger(snap);
         }
 
         for (size_t i = 0; i < kCounterFields.size(); ++i) {
@@ -191,12 +165,12 @@ TEST_F(WiredTigerOtelMetricsTest, PointInTimeWTMetrics) {
         SCOPED_TRACE(fmt::format("name={}", tc.name));
         for (int64_t reading : tc.readings) {
             WiredTigerStatsSnapshot snap;
-            for (const auto& f : kGaugeFields)
+            for (const auto& f : kWiredTigerGaugeFields)
                 snap.*f.field = reading;
-            _metrics.update(snap);
+            _metrics.updateWiredTiger(snap);
         }
 
-        for (const auto& f : kGaugeFields) {
+        for (const auto& f : kWiredTigerGaugeFields) {
             SCOPED_TRACE(fmt::format("field={}", f.name));
             EXPECT_EQ(tc.expected, _capturer.readInt64Gauge(f.metric));
         }
@@ -250,6 +224,60 @@ TEST(WiredTigerParseStatsTest, MissingFieldsDefaultToZero) {
     ASSERT_EQ(snap.maximumBytesConfigured, 0);
     ASSERT_EQ(snap.transactionCheckpointMostRecentTimeMsecs, 0);
     ASSERT_EQ(snap.connectionDataHandlesCurrentlyActive, 0);
+}
+
+TEST(TicketingSystemParseStatsTest, ParsesAllKeys) {
+    BSONObj stats = BSON("read" << BSON("available" << 20) << "write" << BSON("available" << 40));
+
+    TicketingSystemStatsSnapshot snap = parseTicketingSystemStats(stats);
+
+    ASSERT_EQ(snap.readAvailable, 20);
+    ASSERT_EQ(snap.writeAvailable, 40);
+}
+
+struct TSGaugeField {
+    std::string_view name;
+    int64_t TicketingSystemStatsSnapshot::* field;
+    MetricName metric;
+};
+
+inline const auto kTicketingSystemGaugeFields = std::to_array<TSGaugeField>({
+    {"readAvailable"sv,
+     &TicketingSystemStatsSnapshot::readAvailable,
+     MetricNames::kConcurrentTransactionsReadAvailable},
+    {"writeAvailable"sv,
+     &TicketingSystemStatsSnapshot::writeAvailable,
+     MetricNames::kConcurrentTransactionsWriteAvailable},
+});
+
+TEST_F(WiredTigerOtelMetricsTest, PointInTimeTSMetrics) {
+    struct Case {
+        std::string_view name;
+        std::vector<int64_t> readings;
+        int64_t expected;
+    };
+
+    const auto cases = std::to_array<Case>({
+        {"single_reading"sv, {1000}, 1000},
+        {"latest_reading_wins"sv, {1000, 1500}, 1500},
+        {"decrease_is_reflected"sv, {5000, 1000}, 1000},
+        {"zero"sv, {0}, 0},
+    });
+
+    for (const auto& tc : cases) {
+        SCOPED_TRACE(fmt::format("name={}", tc.name));
+        for (int64_t reading : tc.readings) {
+            TicketingSystemStatsSnapshot snap;
+            for (const auto& f : kTicketingSystemGaugeFields)
+                snap.*f.field = reading;
+            _metrics.updateTicketingSystem(snap);
+        }
+
+        for (const auto& f : kTicketingSystemGaugeFields) {
+            SCOPED_TRACE(fmt::format("field={}", f.name));
+            EXPECT_EQ(tc.expected, _capturer.readInt64Gauge(f.metric));
+        }
+    }
 }
 
 }  // namespace

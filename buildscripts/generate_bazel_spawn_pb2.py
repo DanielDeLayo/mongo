@@ -16,8 +16,8 @@ import zipfile
 from pathlib import Path
 
 MONGODB_BAZEL_FORK = "https://github.com/mongodb-forks/bazel"
-MONGODB_BAZEL_VERSION = "7.5.0-mongo_90b8a7b661"
-MONGODB_BAZEL_REF = "90b8a7b661043fc7241aecddd17d39e75c8efd23"
+MONGODB_BAZEL_VERSION = "9.2.0-mongo_00d57fc5fb"
+MONGODB_BAZEL_REF = "00d57fc5fb5cdf797427dbda2db380566135c9c0"
 SPAWN_PROTO_RELATIVE_PATH = "src/main/protobuf/spawn.proto"
 SPAWN_PROTO_RAW_URL = (
     "https://raw.githubusercontent.com/mongodb-forks/bazel/"

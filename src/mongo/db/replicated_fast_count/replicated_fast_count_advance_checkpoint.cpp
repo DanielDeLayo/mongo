@@ -6,13 +6,14 @@
 #include "mongo/db/replicated_fast_count/replicated_fast_count_delta_utils.h"
 #include "mongo/db/replicated_fast_count/replicated_fast_count_streaming_oplog_delta_accumulator.h"
 #include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/transaction_resources.h"
 
 namespace mongo::replicated_fast_count {
 namespace {
 
-SizeCountCheckpointSnapshot computeNextCheckpoint(OperationContext* opCtx,
-                                                  const SizeCountStore& sizeCountStore,
-                                                  Timestamp seekAfterTimestamp) {
+ReplicatedMetadataCheckpointSnapshot computeNextCheckpoint(OperationContext* opCtx,
+                                                           const SizeCountStore& sizeCountStore,
+                                                           Timestamp seekAfterTimestamp) {
     // Scan the oplog from `seekAfterTimestamp` and accumulate size and count deltas for every UUID
     // that has written since the last checkpoint.
     auto scanResult = [&]() -> OplogScanResult {
@@ -24,10 +25,10 @@ SizeCountCheckpointSnapshot computeNextCheckpoint(OperationContext* opCtx,
         // read up until the no holes point.
         auto oplogCursor = oplogColl->getRecordStore()->getCursor(
             opCtx, *shard_role_details::getRecoveryUnit(opCtx));
-        return aggregateSizeCountDeltasInOplog(*oplogCursor,
-                                               seekAfterTimestamp,
-                                               oplogColl->uuid(),
-                                               /*isCheckpoint=*/true);
+        return aggregateReplicatedMetadataDeltasInOplog(*oplogCursor,
+                                                        seekAfterTimestamp,
+                                                        oplogColl->uuid(),
+                                                        /*isCheckpoint=*/true);
     }();
 
     return materializeCheckpointSnapshot(
@@ -35,17 +36,18 @@ SizeCountCheckpointSnapshot computeNextCheckpoint(OperationContext* opCtx,
 }
 }  // namespace
 
-SizeCountCheckpointSnapshot materializeCheckpointSnapshot(OperationContext* opCtx,
-                                                          const SizeCountStore& sizeCountStore,
-                                                          OplogScanResult scanResult,
-                                                          Timestamp scanStartAfterTS) {
-    sizeCountStore.readAndIncrementSizeCounts(opCtx, scanResult.deltas);
+ReplicatedMetadataCheckpointSnapshot materializeCheckpointSnapshot(
+    OperationContext* opCtx,
+    const SizeCountStore& sizeCountStore,
+    OplogScanResult scanResult,
+    Timestamp scanStartAfterTS) {
+    sizeCountStore.readAndIncrementReplicatedMetadata(opCtx, scanResult.deltas);
     return {.updatedCollections = std::move(scanResult.deltas),
             .validAsOf = scanResult.lastTimestamp.value_or(scanStartAfterTS)};
 }
 
 size_t persistCheckpointSnapshot(OperationContext* opCtx,
-                                 const SizeCountCheckpointSnapshot& checkpoint,
+                                 const ReplicatedMetadataCheckpointSnapshot& checkpoint,
                                  SizeCountStore& sizeCountStore,
                                  SizeCountTimestampStore& timestampStore) {
     size_t entryWriteCount = 0;
@@ -55,8 +57,9 @@ size_t persistCheckpointSnapshot(OperationContext* opCtx,
                 sizeCountStore.insert(opCtx,
                                       uuid,
                                       SizeCountStore::Entry{.timestamp = checkpoint.validAsOf,
-                                                            .size = entry.sizeCount.size,
-                                                            .count = entry.sizeCount.count});
+                                                            .size = entry.metadata.sizeCount.size,
+                                                            .count = entry.metadata.sizeCount.count,
+                                                            .hash = entry.metadata.hash});
                 entryWriteCount++;
                 break;
             }
@@ -69,8 +72,9 @@ size_t persistCheckpointSnapshot(OperationContext* opCtx,
                 sizeCountStore.write(opCtx,
                                      uuid,
                                      SizeCountStore::Entry{.timestamp = checkpoint.validAsOf,
-                                                           .size = entry.sizeCount.size,
-                                                           .count = entry.sizeCount.count});
+                                                           .size = entry.metadata.sizeCount.size,
+                                                           .count = entry.metadata.sizeCount.count,
+                                                           .hash = entry.metadata.hash});
                 entryWriteCount++;
                 break;
             }
@@ -104,7 +108,7 @@ size_t advanceCheckpoint(OperationContext* opCtx,
         return 0;
     }
 
-    WriteUnitOfWork wuow(opCtx, WriteUnitOfWork::kGroupForPossiblyRetryableOperations);
+    WriteUnitOfWork wuow(opCtx, WriteUnitOfWork::nonAtomicGroup);
     const size_t entryWriteCount =
         persistCheckpointSnapshot(opCtx, checkpoint, sizeCountStore, timestampStore);
     wuow.commit();

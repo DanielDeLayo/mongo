@@ -15,6 +15,9 @@ structs:
         description: Specification for a $_internalSearchMongotRemote stage given in the full, explicit format.
         # Because the specification is internal only, we permit extra fields. This avoids some upgrade/downngrade
         # concerns where a router may send a command to a node with fields not known by the node.
+        # NOTE: Every field below is router-set internal and must never be accepted from an external
+        # client. When adding a field here, also add it to getInternalOnlyFieldNames() in
+        # src/mongo/db/pipeline/search/search_helper.cpp so the LiteParse-layer check rejects it.
         strict: false
         fields:
             mongotQuery:
@@ -29,7 +32,6 @@ structs:
                 description: An optional pipeline to apply to the collection being unioned.
                 optional: true
                 type: array<object>
-            # TODO SERVER-92576 We may be able to remove limit alongside docsRequested.
             limit:
                 description: A limit copied from the merging part of the pipeline.
                 optional: true
@@ -42,10 +44,6 @@ structs:
                 description: "The sort specification for this query."
                 optional: true
                 type: object
-            mongotDocsRequested:
-                description: "The number of documents that mongod requests mongot should return; mongot can choose to return more."
-                optional: true
-                type: long
             requiresSearchMetaCursor:
                 description: >-
                     Flag indicating whether or not the total user pipeline references the $$SEARCH_META variable. If false, we will

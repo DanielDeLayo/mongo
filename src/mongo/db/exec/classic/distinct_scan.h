@@ -4,6 +4,7 @@
 #pragma once
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/ordering.h"
 #include "mongo/db/exec/classic/orphan_chunk_skipper.h"
 #include "mongo/db/exec/classic/plan_stage.h"
 #include "mongo/db/exec/classic/requires_index_stage.h"
@@ -83,6 +84,9 @@ struct DistinctParams {
     // If we distinct over 'a' the position is 0.
     // If we distinct over 'b' the position is 1.
     int fieldNo{0};
+
+    // See 'DistinctNode::unwindsArrays'.
+    bool unwindsArrays{false};
 };
 
 /**
@@ -128,12 +132,17 @@ private:
     WorkingSet* _workingSet;
 
     const BSONObj _keyPattern;
+    const Ordering _ordering;
 
     const int _scanDirection = 1;
 
     const IndexBounds _bounds;
 
     const size_t _fieldNo = 0;
+
+    // When set, we surface an undefined key in the distinct field as null and make the next
+    // seek skip the null band as well. Only set for unwound multikey scans.
+    const bool _replaceUndefinedWithNull = false;
 
     // The cursor we use to navigate the tree.
     std::unique_ptr<SortedDataInterface::Cursor> _cursor;

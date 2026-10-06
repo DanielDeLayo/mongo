@@ -17,6 +17,8 @@
  * performed.
  *
  * @tags: [
+ *   # Runs mapReduce with JS map/reduce functions, which requires server-side scripting.
+ *   requires_scripting,
  *   # SERVER-56565 avoid CS stepdowns, since  an election may trigger a  refresh of stale metadata
  *   # that form part of the test setup.
  *   does_not_support_stepdowns,
@@ -157,6 +159,7 @@ let testCases = {
     checkShardingIndex: {skip: "primary only"},
     cleanupOrphaned: {skip: "primary only"},
     cleanupStructuredEncryptionData: {skip: "does not return user data"},
+    clearJoinPlanCache: {skip: "does not return user data"},
     clearJumboFlag: {skip: "primary only"},
     clearLog: {skip: "does not return user data"},
     clone: {skip: "primary only"},
@@ -265,6 +268,7 @@ let testCases = {
     getESECMKIdentifierListStatus: {skip: "does not return user data"},
     getESERotateActiveKEKStatus: {skip: "does not return user data"},
     getLog: {skip: "does not return user data"},
+    getMetricsFilteringAllowlist: {skip: "does not return user data"},
     getMore: {skip: "shard version already established"},
     getParameter: {skip: "does not return user data"},
     getQueryableEncryptionCountInfo: {skip: "primary only"},
@@ -423,6 +427,7 @@ let testCases = {
     untrackUnshardedCollection: {skip: "primary only"},
     update: {skip: "primary only"},
     updateESECMKIdentifierList: {skip: "does not return user data"},
+    updateMetricsFilteringAllowlist: {skip: "does not return user data"},
     updateRole: {skip: "primary only"},
     updateSearchIndex: {skip: "primary only"},
     updateUser: {skip: "primary only"},

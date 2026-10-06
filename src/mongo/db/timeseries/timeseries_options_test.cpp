@@ -3,7 +3,6 @@
 
 #include "mongo/db/timeseries/timeseries_options.h"
 
-#include "mongo/db/timeseries/timeseries_gen.h"
 #include "mongo/unittest/server_parameter_guard.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/time_support.h"
@@ -236,65 +235,87 @@ TEST(TimeseriesOptionsTest, CanUseFixedBucketOptimizations) {
     const auto optionsValuesNotEqual =
         createTimeseriesOptionsWithBucketMaxSpanAndRoundingSeconds(1633, 77);
 
-    // Flag off (default): always returns false regardless of options.
-    for (const auto& opts : {withFixedBucketing(optionsEqualAndNone),
-                             withFixedBucketing(optionsEqualNotNone),
-                             withFixedBucketing(optionsMaxSpanAndNone),
-                             withFixedBucketing(optionsNoneAndRounding),
-                             withFixedBucketing(optionsValuesNotEqual),
-                             optionsEqualAndNone,
-                             optionsEqualNotNone,
-                             optionsMaxSpanAndNone,
-                             optionsNoneAndRounding,
-                             optionsValuesNotEqual}) {
-        EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(opts));
+    // With feature flag off, always returns false regardless of options.
+    {
+        unittest::ServerParameterGuard flagController("featureFlagFixedBucketingOptimizations",
+                                                      false);
+        for (const auto& opts : {withFixedBucketing(optionsEqualAndNone),
+                                 withFixedBucketing(optionsEqualNotNone),
+                                 withFixedBucketing(optionsMaxSpanAndNone),
+                                 withFixedBucketing(optionsNoneAndRounding),
+                                 withFixedBucketing(optionsValuesNotEqual),
+                                 optionsEqualAndNone,
+                                 optionsEqualNotNone,
+                                 optionsMaxSpanAndNone,
+                                 optionsNoneAndRounding,
+                                 optionsValuesNotEqual}) {
+            EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(opts, false));
+        }
     }
 
-    unittest::ServerParameterGuard flagController("featureFlagFixedBucketingOptimizations", true);
-
-    // Flag on: result depends on fixedBucketing field and maxSpan == rounding.
-    EXPECT_TRUE(timeseries::canUseFixedBucketOptimizations(withFixedBucketing(optionsEqualAndNone)))
+    // With feature flag on (the default), no extended range data: result depends on fixedBucketing
+    // field and maxSpan == rounding.
+    EXPECT_TRUE(
+        timeseries::canUseFixedBucketOptimizations(withFixedBucketing(optionsEqualAndNone), false))
         << "BucketMaxSpanSeconds=none, BucketRoundingSeconds=none, "
         << "fixedBucketing=true implies buckets should be fixed.";
 
-    EXPECT_TRUE(timeseries::canUseFixedBucketOptimizations(withFixedBucketing(optionsEqualNotNone)))
+    EXPECT_TRUE(
+        timeseries::canUseFixedBucketOptimizations(withFixedBucketing(optionsEqualNotNone), false))
         << "BucketMaxSpanSeconds=value, BucketRoundingSeconds=value, "
         << "fixedBucketing=true implies buckets should be fixed.";
 
-    EXPECT_FALSE(
-        timeseries::canUseFixedBucketOptimizations(withFixedBucketing(optionsMaxSpanAndNone)))
+    EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(
+        withFixedBucketing(optionsMaxSpanAndNone), false))
         << "BucketMaxSpanSeconds=value, BucketRoundingSeconds=none, "
         << "fixedBucketing=true implies buckets should not be fixed.";
 
-    EXPECT_FALSE(
-        timeseries::canUseFixedBucketOptimizations(withFixedBucketing(optionsNoneAndRounding)))
+    EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(
+        withFixedBucketing(optionsNoneAndRounding), false))
         << "BucketMaxSpanSeconds=none, BucketRoundingSeconds=value, "
         << "fixedBucketing=true implies buckets should not be fixed.";
 
-    EXPECT_FALSE(
-        timeseries::canUseFixedBucketOptimizations(withFixedBucketing(optionsValuesNotEqual)))
+    EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(
+        withFixedBucketing(optionsValuesNotEqual), false))
         << "BucketMaxSpanSeconds=value1, BucketRoundingSeconds=value2, "
         << "fixedBucketing=true implies buckets should not be fixed.";
 
-    EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(optionsEqualAndNone))
+    EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(optionsEqualAndNone, false))
         << "BucketMaxSpanSeconds=none, BucketRoundingSeconds=none, "
         << "fixedBucketing unset implies buckets should not be fixed.";
 
-    EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(optionsEqualNotNone))
+    EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(optionsEqualNotNone, false))
         << "BucketMaxSpanSeconds=value, BucketRoundingSeconds=value, "
         << "fixedBucketing unset implies buckets should not be fixed.";
 
-    EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(optionsMaxSpanAndNone))
+    EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(optionsMaxSpanAndNone, false))
         << "BucketMaxSpanSeconds=value, BucketRoundingSeconds=none, "
         << "fixedBucketing unset implies buckets should not be fixed.";
 
-    EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(optionsNoneAndRounding))
+    EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(optionsNoneAndRounding, false))
         << "BucketMaxSpanSeconds=none, BucketRoundingSeconds=value, "
         << "fixedBucketing unset implies buckets should not be fixed.";
 
-    EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(optionsValuesNotEqual))
+    EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(optionsValuesNotEqual, false))
         << "BucketMaxSpanSeconds=value1, BucketRoundingSeconds=value2, "
         << "fixedBucketing unset implies buckets should not be fixed.";
+}
+
+TEST(TimeseriesOptionsTest, CanUseFixedBucketOptimizationsRequiresKnownExtendedRangeState) {
+    auto options = createTimeseriesOptionsWithBucketMaxSpanAndRoundingSeconds(3600, 3600);
+    options.setFixedBucketing(true);
+
+    // Otherwise-eligible options only unlock the optimization when the caller affirmatively
+    // knows there's no extended-range data. Omitting the argument, or explicitly passing
+    // boost::none or true, must conservatively disable it.
+    EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(options))
+        << "Omitting hasExtendedRangeData should conservatively disable the optimization.";
+    EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(options, boost::none))
+        << "Unknown extended-range status should conservatively disable the optimization.";
+    EXPECT_FALSE(timeseries::canUseFixedBucketOptimizations(options, true))
+        << "Known extended-range data must disable the optimization.";
+    EXPECT_TRUE(timeseries::canUseFixedBucketOptimizations(options, false))
+        << "Confirmed absence of extended-range data should allow the optimization.";
 }
 
 TEST(TimeseriesOptionsTest, OptionsAreEqualFixedBucketing) {
@@ -474,12 +495,5 @@ INSTANTIATE_TEST_SUITE_P(TimeseriesOptions,
                              InheritFixedBucketingTestParams{false, true, false},
                              InheritFixedBucketingTestParams{false, false, false},
                              InheritFixedBucketingTestParams{false, boost::none, false}));
-
-TEST(TimeseriesOptionsTest, BSONColumnMemEstimationCalculations) {
-    // The calculations for BSONColumn memory estimation in bson_validate.cpp rely on the defaults
-    // for some server parameters. If these change, we also need to recalculate and potentially
-    // adjust the memory threshold of the 'bsonMaxExpandedMemUsage' parameter.
-    EXPECT_EQ(gTimeseriesBucketMinCount, 10);
-}
 
 }  // namespace mongo

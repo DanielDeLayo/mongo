@@ -3,6 +3,10 @@
 
 #include "mongo/db/query/plan_cache/join_plan_cache.h"
 
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/query/compiler/metadata/index_entry.h"
+#include "mongo/db/query/compiler/optimizer/join/join_method.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -12,8 +16,10 @@ namespace {
 constexpr size_t kLargeBudget = size_t{1} << 30;
 
 std::unique_ptr<JoinPlanCacheEntry> makeEntry() {
-    return std::make_unique<JoinPlanCacheEntry>(
-        nullptr, join_ordering::NodeId{0}, std::vector<CollectionTag>{});
+    return std::make_unique<JoinPlanCacheEntry>(nullptr,
+                                                join_ordering::NodeId{0},
+                                                std::vector<CollectionTag>{},
+                                                std::vector<NodeFingerprint>{});
 }
 
 std::unique_ptr<CachedJoinPlan> makeComplexTree() {
@@ -80,11 +86,60 @@ TEST(JoinPlanCacheTest, RemoveNonExistingEntry) {
     ASSERT_EQ(rawPtr, cache.lookup("key").get());
 }
 
+TEST(JoinPlanCacheTest, RemoveIfMatchesRemovesTheEntryItWasGiven) {
+    JoinPlanCache cache = largeBudgetSinglePartitionCache();
+    cache.put("key", makeEntry());
+
+    auto held = cache.lookup("key");
+    ASSERT_TRUE(cache.removeIfMatches("key", held));
+    ASSERT_EQ(nullptr, cache.lookup("key"));
+}
+
+TEST(JoinPlanCacheTest, RemoveIfMatchesLeavesAnEntryReplacedSinceTheLookup) {
+    JoinPlanCache cache = largeBudgetSinglePartitionCache();
+    cache.put("key", makeEntry());
+
+    // Store pointer to the current entry.
+    auto held = cache.lookup("key");
+
+    // Replace entry in the cache.
+    auto replacement = makeEntry();
+    const JoinPlanCacheEntry* replacementRawPtr = replacement.get();
+    cache.put("key", std::move(replacement));
+
+    // Removal of entry should not occur since 'held' is stale.
+    ASSERT_FALSE(cache.removeIfMatches("key", held));
+    ASSERT_EQ(replacementRawPtr, cache.lookup("key").get());
+}
+
+TEST(JoinPlanCacheTest, RemoveIfMatchesOnNonExistingKey) {
+    JoinPlanCache cache = largeBudgetSinglePartitionCache();
+    cache.put("key", makeEntry());
+    auto held = cache.lookup("key");
+
+    ASSERT_FALSE(cache.removeIfMatches("nonexistent", held));
+    ASSERT_EQ(held.get(), cache.lookup("key").get());
+}
+
+TEST(JoinPlanCacheTest, RemoveIfMatchesComparesIdentityNotContents) {
+    JoinPlanCache cache = largeBudgetSinglePartitionCache();
+    auto entry = makeEntry();
+    const JoinPlanCacheEntry* rawPtr = entry.get();
+    cache.put("key", std::move(entry));
+
+    // A distinct entry that has the same contents as the original entry.
+    std::shared_ptr<JoinPlanCacheEntry> lookalike = makeEntry();
+    ASSERT_FALSE(cache.removeIfMatches("key", lookalike));
+    ASSERT_EQ(rawPtr, cache.lookup("key").get());
+}
+
 TEST(JoinPlanCacheTest, GetComplexEntry) {
     JoinPlanCache cache = largeBudgetSinglePartitionCache();
 
-    auto entry = std::make_unique<JoinPlanCacheEntry>(
-        makeComplexTree(), join_ordering::NodeId{0}, std::vector<CollectionTag>{});
+    auto entry = std::make_unique<JoinPlanCacheEntry>(makeComplexTree(),
+                                                      join_ordering::NodeId{0},
+                                                      std::vector<CollectionTag>{},
+                                                      std::vector<NodeFingerprint>{});
     const JoinPlanCacheEntry* rawPtr = entry.get();
     cache.put("key", std::move(entry));
 
@@ -104,7 +159,8 @@ TEST(JoinPlanCacheSizeTest, AccessPathLeafSize) {
             .solnCacheData = std::make_unique<SolutionCacheData>(SolutionCacheData{}),
         }),
         join_ordering::NodeId{0},
-        std::vector<CollectionTag>{});
+        std::vector<CollectionTag>{},
+        std::vector<NodeFingerprint>{});
 
     // A default SolutionCacheData has a null tree, so its footprint is just its own sizeof.
     const size_t expected =
@@ -114,37 +170,62 @@ TEST(JoinPlanCacheSizeTest, AccessPathLeafSize) {
 }
 
 TEST(JoinPlanCacheSizeTest, ComplexTreeLargerThanLeaf) {
-    auto complexEntry = std::make_unique<JoinPlanCacheEntry>(
-        makeComplexTree(), join_ordering::NodeId{0}, std::vector<CollectionTag>{});
+    auto complexEntry = std::make_unique<JoinPlanCacheEntry>(makeComplexTree(),
+                                                             join_ordering::NodeId{0},
+                                                             std::vector<CollectionTag>{},
+                                                             std::vector<NodeFingerprint>{});
     auto leafEntry = std::make_unique<JoinPlanCacheEntry>(
         std::make_unique<CachedJoinPlan>(CachedAccessPath{
             .nodeId = 0,
             .solnCacheData = std::make_unique<SolutionCacheData>(SolutionCacheData{}),
         }),
         join_ordering::NodeId{0},
-        std::vector<CollectionTag>{});
+        std::vector<CollectionTag>{},
+        std::vector<NodeFingerprint>{});
 
     // The complex tree contains two access-path leaves plus a join node and predicate, so it must
     // be strictly larger than a single leaf.
     ASSERT_GT(complexEntry->estimatedEntrySizeBytes, leafEntry->estimatedEntrySizeBytes);
 }
 
+TEST(JoinPlanCacheSizeTest, RelevantIndexHashesIncreaseSize) {
+    auto baseline =
+        std::make_unique<JoinPlanCacheEntry>(makeComplexTree(),
+                                             join_ordering::NodeId{0},
+                                             std::vector<CollectionTag>{},
+                                             std::vector<NodeFingerprint>{NodeFingerprint{}});
+
+    auto withHashes = std::make_unique<JoinPlanCacheEntry>(
+        makeComplexTree(),
+        join_ordering::NodeId{0},
+        std::vector<CollectionTag>{},
+        std::vector<NodeFingerprint>{NodeFingerprint{.relevantIndexHashes = {2, 3, 4}}});
+
+    ASSERT_GT(withHashes->estimatedEntrySizeBytes, baseline->estimatedEntrySizeBytes);
+}
+
 TEST(JoinPlanCacheSizeTest, LongerFieldPathIncreasesSize) {
-    auto baseline = std::make_unique<JoinPlanCacheEntry>(
-        makeComplexTree(), join_ordering::NodeId{0}, std::vector<CollectionTag>{});
+    auto baseline = std::make_unique<JoinPlanCacheEntry>(makeComplexTree(),
+                                                         join_ordering::NodeId{0},
+                                                         std::vector<CollectionTag>{},
+                                                         std::vector<NodeFingerprint>{});
 
     auto longFieldTree = makeComplexTree();
     std::get<CachedJoinNode>(longFieldTree->node).joinPredicates[0].leftField =
         FieldPath("a.very.long.dotted.field.path.that.uses.more.heap.storage");
-    auto longFieldEntry = std::make_unique<JoinPlanCacheEntry>(
-        std::move(longFieldTree), join_ordering::NodeId{0}, std::vector<CollectionTag>{});
+    auto longFieldEntry = std::make_unique<JoinPlanCacheEntry>(std::move(longFieldTree),
+                                                               join_ordering::NodeId{0},
+                                                               std::vector<CollectionTag>{},
+                                                               std::vector<NodeFingerprint>{});
 
     ASSERT_GT(longFieldEntry->estimatedEntrySizeBytes, baseline->estimatedEntrySizeBytes);
 }
 
 TEST(JoinPlanCacheSizeTest, AdditionalPredicateIncreasesSize) {
-    auto baseline = std::make_unique<JoinPlanCacheEntry>(
-        makeComplexTree(), join_ordering::NodeId{0}, std::vector<CollectionTag>{});
+    auto baseline = std::make_unique<JoinPlanCacheEntry>(makeComplexTree(),
+                                                         join_ordering::NodeId{0},
+                                                         std::vector<CollectionTag>{},
+                                                         std::vector<NodeFingerprint>{});
 
     auto extraPredTree = makeComplexTree();
     std::get<CachedJoinNode>(extraPredTree->node)
@@ -153,8 +234,10 @@ TEST(JoinPlanCacheSizeTest, AdditionalPredicateIncreasesSize) {
             .leftField = FieldPath("baz"),
             .rightField = FieldPath("qux"),
         });
-    auto extraPredEntry = std::make_unique<JoinPlanCacheEntry>(
-        std::move(extraPredTree), join_ordering::NodeId{0}, std::vector<CollectionTag>{});
+    auto extraPredEntry = std::make_unique<JoinPlanCacheEntry>(std::move(extraPredTree),
+                                                               join_ordering::NodeId{0},
+                                                               std::vector<CollectionTag>{},
+                                                               std::vector<NodeFingerprint>{});
 
     ASSERT_GT(extraPredEntry->estimatedEntrySizeBytes, baseline->estimatedEntrySizeBytes);
 }
@@ -163,21 +246,57 @@ TEST(JoinPlanCacheSizeTest, LongerInljIndexNameIncreasesSize) {
     auto shortEntry = std::make_unique<JoinPlanCacheEntry>(
         std::make_unique<CachedJoinPlan>(CachedInljNode{.nodeId = 0, .inljForeignIndexName = "ix"}),
         join_ordering::NodeId{0},
-        std::vector<CollectionTag>{});
+        std::vector<CollectionTag>{},
+        std::vector<NodeFingerprint>{});
     auto longEntry = std::make_unique<JoinPlanCacheEntry>(
         std::make_unique<CachedJoinPlan>(CachedInljNode{
             .nodeId = 0,
             .inljForeignIndexName = "a_much_longer_foreign_index_name_that_exceeds_sso"}),
         join_ordering::NodeId{0},
-        std::vector<CollectionTag>{});
+        std::vector<CollectionTag>{},
+        std::vector<NodeFingerprint>{});
 
     ASSERT_GT(longEntry->estimatedEntrySizeBytes, shortEntry->estimatedEntrySizeBytes);
 }
 
+TEST(JoinPlanCacheSizeTest, NodeFingerprintsIncreaseSize) {
+    auto baseline = std::make_unique<JoinPlanCacheEntry>(makeComplexTree(),
+                                                         join_ordering::NodeId{0},
+                                                         std::vector<CollectionTag>{},
+                                                         std::vector<NodeFingerprint>{});
+    auto fingerprinted = std::make_unique<JoinPlanCacheEntry>(
+        makeComplexTree(),
+        join_ordering::NodeId{0},
+        std::vector<CollectionTag>{},
+        std::vector<NodeFingerprint>{NodeFingerprint{.relevantIndexHashes = {1}},
+                                     NodeFingerprint{.relevantIndexHashes = {2}}});
+
+    ASSERT_GTE(fingerprinted->estimatedEntrySizeBytes - baseline->estimatedEntrySizeBytes,
+               2 * sizeof(NodeFingerprint));
+}
+
+TEST(JoinPlanCacheSizeTest, CollectionTagsIncreaseSize) {
+    auto baseline = std::make_unique<JoinPlanCacheEntry>(makeComplexTree(),
+                                                         join_ordering::NodeId{0},
+                                                         std::vector<CollectionTag>{},
+                                                         std::vector<NodeFingerprint>{});
+    auto tagged = std::make_unique<JoinPlanCacheEntry>(
+        makeComplexTree(),
+        join_ordering::NodeId{0},
+        std::vector<CollectionTag>{CollectionTag{UUID::gen(), CollectionVersionTag{}}},
+        std::vector<NodeFingerprint>{});
+
+    ASSERT_GTE(tagged->estimatedEntrySizeBytes - baseline->estimatedEntrySizeBytes,
+               sizeof(CollectionTag));
+}
+
 TEST(JoinPlanCacheSizeTest, BudgetEstimatorSumsEntryAndKey) {
     JoinPlanCacheBudgetEstimator estimator;
-    std::shared_ptr<const JoinPlanCacheEntry> entry = std::make_unique<JoinPlanCacheEntry>(
-        makeComplexTree(), join_ordering::NodeId{0}, std::vector<CollectionTag>{});
+    std::shared_ptr<JoinPlanCacheEntry> entry =
+        std::make_unique<JoinPlanCacheEntry>(makeComplexTree(),
+                                             join_ordering::NodeId{0},
+                                             std::vector<CollectionTag>{},
+                                             std::vector<NodeFingerprint>{});
 
     const JoinPlanCacheKey key = "some-encoded-shape";
     ASSERT_EQ(entry->estimatedEntrySizeBytes + key.size(), estimator(key, entry));
@@ -188,8 +307,10 @@ TEST(JoinPlanCacheSizeTest, BudgetEstimatorSumsEntryAndKey) {
 }
 
 TEST(JoinPlanCacheSizeTest, EstimateIsDeterministic) {
-    auto entry = std::make_unique<JoinPlanCacheEntry>(
-        makeComplexTree(), join_ordering::NodeId{0}, std::vector<CollectionTag>{});
+    auto entry = std::make_unique<JoinPlanCacheEntry>(makeComplexTree(),
+                                                      join_ordering::NodeId{0},
+                                                      std::vector<CollectionTag>{},
+                                                      std::vector<NodeFingerprint>{});
     ASSERT_EQ(entry->joinTree->estimateObjectSizeInBytes(),
               entry->joinTree->estimateObjectSizeInBytes());
 }
@@ -255,6 +376,51 @@ TEST(JoinPlanCacheEvictionTest, ResetToSmallerBudgetEvictsDownToFit) {
     ASSERT_EQ(cRawPtr, cache.lookup("c").get());
 }
 
+TEST(JoinPlanCacheClearTest, ClearEmptyCacheIsNoop) {
+    JoinPlanCache cache = largeBudgetSinglePartitionCache();
+    cache.clear();
+    ASSERT_EQ(0, cache.size());
+    ASSERT_TRUE(cache.serializeEntries().empty());
+}
+
+TEST(JoinPlanCacheClearTest, ClearRemovesAllEntries) {
+    // Use several partitions so that the entries are spread across more than one of them.
+    JoinPlanCache cache{kLargeBudget, 4};
+    for (const char* key : {"a", "b", "c", "d", "e"}) {
+        cache.put(key, makeEntry());
+    }
+    ASSERT_GT(cache.size(), 0);
+    ASSERT_EQ(5u, cache.serializeEntries().size());
+
+    cache.clear();
+    ASSERT_EQ(0, cache.size());
+    ASSERT_TRUE(cache.serializeEntries().empty());
+}
+
+TEST(JoinPlanCacheClearTest, LookupMissesAfterClear) {
+    JoinPlanCache cache = largeBudgetSinglePartitionCache();
+    cache.put("key", makeEntry());
+    ASSERT_NE(nullptr, cache.lookup("key"));
+
+    cache.clear();
+    ASSERT_EQ(nullptr, cache.lookup("key"));
+}
+
+TEST(JoinPlanCacheClearTest, PutWorksAfterClear) {
+    const size_t perEntryCost = trivialEntryCost(1);
+    // A budget for exactly one entry: if clear() failed to release the budget, this put() would
+    // evict rather than insert cleanly.
+    JoinPlanCache cache{perEntryCost, 1};
+    cache.put("a", makeEntry());
+    cache.clear();
+
+    auto entry = makeEntry();
+    const JoinPlanCacheEntry* rawPtr = entry.get();
+    ASSERT_EQ(0, cache.put("b", std::move(entry)));
+    ASSERT_EQ(rawPtr, cache.lookup("b").get());
+    ASSERT_EQ(perEntryCost, cache.size());
+}
+
 TEST(JoinPlanCacheEvictionTest, SizeReflectsRunningByteTotal) {
     const size_t perEntryCost = trivialEntryCost(1);
     JoinPlanCache cache{kLargeBudget, 1};
@@ -266,6 +432,92 @@ TEST(JoinPlanCacheEvictionTest, SizeReflectsRunningByteTotal) {
     ASSERT_EQ(2 * perEntryCost, cache.size());
     cache.remove("a");
     ASSERT_EQ(perEntryCost, cache.size());
+}
+
+TEST(JoinPlanCacheEvictionTest, RemoveIfMatchesReleasesTheEntryBudget) {
+    const size_t perEntryCost = trivialEntryCost(1);
+    JoinPlanCache cache{kLargeBudget, 1};
+
+    cache.put("a", makeEntry());
+    ASSERT_EQ(perEntryCost, cache.size());
+
+    // A no-op removal must not disturb the accounting either.
+    ASSERT_FALSE(cache.removeIfMatches("a", makeEntry()));
+    ASSERT_EQ(perEntryCost, cache.size());
+
+    ASSERT_TRUE(cache.removeIfMatches("a", cache.lookup("a")));
+    ASSERT_EQ(0, cache.size());
+}
+
+TEST(JoinPlanCacheStatsTest, EmptyCacheProducesNoStats) {
+    JoinPlanCache cache = largeBudgetSinglePartitionCache();
+    ASSERT_TRUE(cache.serializeEntries().empty());
+}
+
+TEST(JoinPlanCacheStatsTest, StatsHaveOneEntryPerCachedPlan) {
+    JoinPlanCache cache = largeBudgetSinglePartitionCache();
+    cache.put("keyA", makeEntry());
+    cache.put("keyB", makeEntry());
+
+    auto stats = cache.serializeEntries();
+    ASSERT_EQ(2u, stats.size());
+    for (const auto& obj : stats) {
+        ASSERT_TRUE(obj.hasField("planCacheKey"));
+        ASSERT_TRUE(obj.hasField("baseNode"));
+        ASSERT_TRUE(obj.hasField("estimatedSizeBytes"));
+        ASSERT_TRUE(obj.hasField("collections"));
+    }
+}
+
+TEST(JoinPlanCacheStatsTest, SerializesBaseNodeAndSizeAndKeyHash) {
+    auto entry = std::make_unique<JoinPlanCacheEntry>(nullptr,
+                                                      join_ordering::NodeId{7},
+                                                      std::vector<CollectionTag>{},
+                                                      std::vector<NodeFingerprint>{});
+    const auto expectedSize = static_cast<long long>(entry->estimatedEntrySizeBytes);
+
+    BSONObj obj = joinPlanCacheEntryToBSON("some-encoded-shape", *entry);
+    ASSERT_EQ(7, obj["baseNode"].numberInt());
+    ASSERT_EQ(expectedSize, obj["estimatedSizeBytes"].numberLong());
+    // The key hash is rendered as a fixed-width, zero-padded hex string.
+    ASSERT_EQ(BSONType::string, obj["planCacheKey"].type());
+    ASSERT_EQ(8, obj["planCacheKey"].str().size());
+    // A null join tree omits the plan sub-object.
+    ASSERT_FALSE(obj.hasField("plan"));
+}
+
+TEST(JoinPlanCacheStatsTest, SerializesComplexPlanTree) {
+    auto entry = std::make_unique<JoinPlanCacheEntry>(makeComplexTree(),
+                                                      join_ordering::NodeId{0},
+                                                      std::vector<CollectionTag>{},
+                                                      std::vector<NodeFingerprint>{});
+
+    BSONObj obj = joinPlanCacheEntryToBSON("key", *entry);
+    ASSERT_TRUE(obj.hasField("plan"));
+    BSONObj plan = obj["plan"].Obj();
+    ASSERT_EQ(join_ordering::joinMethodToString(join_ordering::JoinMethod::HJ),
+              plan["joinMethod"].str());
+    ASSERT_EQ(BSONType::array, plan["joinPredicates"].type());
+    ASSERT_EQ(1, plan["joinPredicates"].Array().size());
+    // Both children are serialized recursively as access-path leaves.
+    ASSERT_TRUE(plan["left"].Obj().hasField("nodeId"));
+    ASSERT_TRUE(plan["right"].Obj().hasField("nodeId"));
+}
+
+TEST(JoinPlanCacheStatsTest, SerializesCollectionTags) {
+    const auto uuid = UUID::gen();
+    std::vector<CollectionTag> tags{
+        CollectionTag{uuid, CollectionVersionTag{/*collectionVersion*/ 3, /*sampleVersion*/ 5}}};
+    auto entry = std::make_unique<JoinPlanCacheEntry>(
+        nullptr, join_ordering::NodeId{0}, std::move(tags), std::vector<NodeFingerprint>{});
+
+    BSONObj obj = joinPlanCacheEntryToBSON("key", *entry);
+    auto collections = obj["collections"].Array();
+    ASSERT_EQ(1, collections.size());
+    BSONObj tag = collections[0].Obj();
+    ASSERT_EQ(uuid, unittest::assertGet(UUID::parse(tag["uuid"])));
+    ASSERT_EQ(3, tag["collectionVersion"].numberLong());
+    ASSERT_EQ(5, tag["sampleVersion"].numberLong());
 }
 
 }  // namespace

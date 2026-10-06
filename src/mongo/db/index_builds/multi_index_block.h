@@ -19,8 +19,10 @@
 #include "mongo/db/shard_role/shard_catalog/collection.h"
 #include "mongo/db/shard_role/shard_catalog/index_catalog.h"
 #include "mongo/db/shard_role/shard_catalog/index_catalog_entry.h"
+#include "mongo/db/shard_role/shard_role.h"
 #include "mongo/db/storage/lazy_record_store.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/throttle_cursor.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/modules.h"
 #include "mongo/util/progress_meter.h"
@@ -283,13 +285,6 @@ public:
     void persistResumeState(OperationContext* opCtx, const CollectionPtr& collection);
 
     /**
-     * Writes the "tearable side write" abort sentinel.
-     *
-     * TODO (SERVER-126257): Remove once index build side writes cannot be torn.
-     */
-    void writeTearableSideWriteAbortRecord(OperationContext* opCtx) const;
-
-    /**
      * May be called at any time after construction but before a successful commit(). Suppresses
      * the default behavior on destruction of removing all traces of uncommitted index builds. May
      * delete internal tables, but this is not transactional. Writes the resumable index build
@@ -325,6 +320,13 @@ public:
      */
     void appendBuildInfo(BSONObjBuilder* builder) const;
 
+    /**
+     * Returns the phase the index build is currently in.
+     */
+    IndexBuildPhaseEnum getPhase() const {
+        return _phase;
+    }
+
 private:
     struct IndexToBuild {
         std::unique_ptr<IndexBuildBlock> block;
@@ -338,6 +340,10 @@ private:
         // The highest spilled record id. Only set during the scan phase when replicating container
         // writes.
         boost::optional<RecordId> lastSpilledRecordId;
+
+        // Multikey state this build recovered from the side writes it drained.
+        bool drainedMultikey = false;
+        MultikeyPaths drainedMultikeyPaths;
 
         // We cache index catalog entry pointer for the collection scan phase. This is necessary for
         // index build performance in the insert path.
@@ -371,10 +377,25 @@ private:
     void _writeIndexStateInfoToContainer(OperationContext* opCtx, size_t index) const;
 
     /**
+     * Writes the IndexStateInfo for the given index within the caller's transaction. Callers that
+     * are not already in one should use `_writeIndexStateInfoToContainer`.
+     */
+    void _upsertIndexStateInfo(OperationContext* opCtx, size_t index) const;
+
+    /**
      * Writes the IndexBuildMetadata and the IndexStateInfo for all indexes to the index build
      * container. No-op when not replicating container writes or not resumable.
      */
     void _writeAllStateToContainer(OperationContext* opCtx) const;
+
+    /**
+     * Folds multikey paths recovered while draining side writes or retrying skipped records into
+     * this build's state and persists them with the rest of the resume state, within the caller's
+     * transaction.
+     */
+    Status _recordRecoveredMultikeyPaths(OperationContext* opCtx,
+                                         size_t index,
+                                         const MultikeyPaths& paths);
 
     BSONObj _constructStateObject() const;
 
@@ -388,7 +409,13 @@ private:
                                      const BSONObj& doc,
                                      unsigned long long iteration) const;
 
-    Status _insert(
+    /**
+     * Inserts documents to be indexed from the collection scan into the bulk builder, to insert the
+     * relevant index keys into the external sorter.
+     * Returns the insert status along with the number of times the document was inserted into index
+     * bulk builders.
+     */
+    StatusWith<int64_t> _insert(
         OperationContext* opCtx,
         const CollectionPtr& collection,
         const BSONObj& wholeDocument,
@@ -457,6 +484,12 @@ private:
     // writeConflictRetry the spiller performs.
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> _exec;
     BSONObj _objToIndex;
+
+    // Paces the container writes of the spills issued by the collection scan phase. Installed by
+    // _doCollectionScan for the duration of the scan and reset on the way out, so that the
+    // SpillCallbacks captured in init() only pace the scan phase's spills. Disengaged when the
+    // scan is not running or when container writes are not replicated.
+    boost::optional<DataThrottle> _scanContainerWriteThrottle;
 
     // The temporary record store used for persisting the resume state of a resumable index build.
     boost::optional<LazyRecordStore> _resumeStateTempRecordStore;

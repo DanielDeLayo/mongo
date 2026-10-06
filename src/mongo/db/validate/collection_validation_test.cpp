@@ -16,9 +16,13 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/internode_validation_hash_utils.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_init.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_test_helpers.h"
+#include "mongo/db/rss/attached_storage/attached_persistence_provider.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
 #include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
@@ -138,7 +142,7 @@ std::vector<ValidateResults> foregroundValidate(
                       nss,
                       collection_validation::ValidationOptions{
                           mode, repairMode, /*logDiagnostics=*/false, validationVersion},
-                      &validateResults))
+                      validateResults))
             << "Validation Mode: " << static_cast<int>(mode);
         BSONObjBuilder validateResultsBuilder;
         validateResults.appendToResultObj(&validateResultsBuilder, true /* debugging */);
@@ -268,6 +272,60 @@ BSONObj resultToBSON(const ValidateResults& vr) {
     return builder.obj();
 }
 
+/**
+ * Bypasses 'create' validation that would reject an invalid index name to inject an invalid name.
+ */
+NamespaceString createClusteredCollectionWithIndexName(OperationContext* opCtx,
+                                                       repl::StorageInterface* storageInterface,
+                                                       std::string_view indexName) {
+    const auto nss = NamespaceString::createNamespaceString_forTest("test.clustered");
+
+    ClusteredIndexSpec indexSpec;
+    indexSpec.setKey(BSON("_id" << 1));
+    indexSpec.setUnique(true);
+    indexSpec.setName(std::string{indexName});
+
+    CollectionOptions options;
+    options.clusteredIndex =
+        ClusteredCollectionInfo(std::move(indexSpec), false /* legacyFormat */);
+    ASSERT_OK(storageInterface->createCollection(opCtx, nss, options));
+    return nss;
+}
+
+TEST_F(CollectionValidationTest, ValidateClusteredIndexNameWithEmbeddedNulByte) {
+    auto opCtx = operationContext();
+    const auto nss =
+        createClusteredCollectionWithIndexName(opCtx, storageInterface(), "leading\0trailing"sv);
+    const auto allResults = foregroundValidate(
+        nss, opCtx, {.valid = false, .numRecords = 0, .numErrors = 1, .numWarnings = 0});
+    for (const auto& results : allResults) {
+        EXPECT_THAT(results.getErrors(),
+                    testing::ElementsAre(
+                        testing::AllOf(testing::HasSubstr("The clustered index name is not valid"),
+                                       testing::HasSubstr("index name cannot contain NUL bytes"))));
+    }
+}
+
+TEST_F(CollectionValidationTest, ValidateClusteredIndexNameEmpty) {
+    auto opCtx = operationContext();
+    const auto nss = createClusteredCollectionWithIndexName(opCtx, storageInterface(), ""sv);
+    const auto allResults = foregroundValidate(
+        nss, opCtx, {.valid = false, .numRecords = 0, .numErrors = 1, .numWarnings = 0});
+    for (const auto& results : allResults) {
+        EXPECT_THAT(results.getErrors(),
+                    testing::ElementsAre(
+                        testing::AllOf(testing::HasSubstr("The clustered index name is not valid"),
+                                       testing::HasSubstr("index name cannot be empty"))));
+    }
+}
+
+TEST_F(CollectionValidationTest, ValidateClusteredIndexNameValid) {
+    auto opCtx = operationContext();
+    const auto nss =
+        createClusteredCollectionWithIndexName(opCtx, storageInterface(), "myClusteredIndex"sv);
+    foregroundValidate(
+        nss, opCtx, {.valid = true, .numRecords = 0, .numErrors = 0, .numWarnings = 0});
+}
 
 // Verify that calling validate() on an empty collection with different validation levels returns an
 // OK status.
@@ -290,6 +348,56 @@ TEST_F(CollectionValidationTest, Validate) {
                         .numRecords = insertDataRange(opCtx, 0, 5),
                         .numInvalidDocuments = 0,
                         .numErrors = 0});
+}
+
+// Enough records that a small target per slice yields many slices, and that the RecordId stride
+// between pivots stays above one so computeSlicePivots() does not collapse them into one slice.
+constexpr int64_t kRecordsForParallelTraversal{300};
+constexpr int64_t kTargetRecordsPerSliceForTest{10};
+
+/**
+ * Runs a foreground validation of kNss, requesting 'targetRecordsPerSlice' records per record store
+ * slice. A value of boost::none keeps the traversal single-threaded.
+ */
+ValidateResults validateWithSliceTarget(OperationContext* opCtx,
+                                        boost::optional<int64_t> targetRecordsPerSlice) {
+    ValidateResults results;
+    ASSERT_OK(collection_validation::validate(
+        opCtx,
+        kNss,
+        collection_validation::ValidationOptions{collection_validation::ValidateMode::kForeground,
+                                                 collection_validation::RepairMode::kNone,
+                                                 /*logDiagnostics=*/false,
+                                                 currentValidationVersion,
+                                                 /*verifyConfigurationOverride=*/boost::none,
+                                                 /*readTimestamp=*/boost::none,
+                                                 /*hashPrefixes=*/boost::none,
+                                                 /*revealHashedIds=*/boost::none,
+                                                 targetRecordsPerSlice},
+        results));
+    return results;
+}
+
+// Slicing the record store across worker threads must not change what validation reports. Each
+// slice traverses on an OperationContext of its own.
+TEST_F(CollectionValidationDiskTest, ParallelTraversalAgreesWithSerialTraversal) {
+    auto opCtx = operationContext();
+    ASSERT_EQ(kRecordsForParallelTraversal,
+              insertDataRange(opCtx, 0, static_cast<int>(kRecordsForParallelTraversal)));
+
+    const auto serialResults = validateWithSliceTarget(opCtx, boost::none);
+    ASSERT_TRUE(serialResults.isValid());
+    ASSERT_EQ(kRecordsForParallelTraversal, serialResults.getNumRecords().value_or(-1));
+    // Without a slice target the traversal is single-threaded, so no slice count is reported.
+    ASSERT_FALSE(serialResults.getNumRecordStoreSlices().has_value());
+
+    const auto parallelResults = validateWithSliceTarget(opCtx, kTargetRecordsPerSliceForTest);
+    ASSERT_TRUE(parallelResults.isValid());
+    ASSERT_EQ(kRecordsForParallelTraversal, parallelResults.getNumRecords().value_or(-1));
+    // Guards against this test silently degrading into a second serial traversal, which would
+    // exercise none of the parallel path.
+    ASSERT_EQ(kRecordsForParallelTraversal / kTargetRecordsPerSliceForTest,
+              parallelResults.getNumRecordStoreSlices().value_or(-1));
 }
 
 // Verify calling validate() on a collection with an invalid document.
@@ -338,6 +446,66 @@ TEST_F(CollectionValidationTest, ValidateEnforceFastCountAndSize) {
          .numInvalidDocuments = 0,
          .numErrors = 0},
         {collection_validation::ValidateMode::kForegroundFullEnforceFastCountAndSize});
+}
+
+// Verify that a record store which is empty from the traversal's point of view does not have its
+// zeroed traversal counters compared against the fast count. A record store can look empty to
+// validate's snapshot while the fast count still reflects records in some cases.
+TEST_F(CollectionValidationTest, ValidateEnforceFastCountSkippedWhenTraversalSeesNoRecords) {
+    auto opCtx = operationContext();
+
+    // Skew the fast count so it disagrees with the empty record store, standing in for records that
+    // exist but are invisible to this snapshot.
+    {
+        const AutoGetCollection coll(opCtx, kNss, MODE_X);
+        coll->getRecordStore()->updateStatsAfterRepair(/*numRecords=*/2, /*dataSize=*/64);
+        ASSERT_EQ(2, coll->latestSizeCount(opCtx).count);
+    }
+
+    foregroundValidate(
+        kNss,
+        opCtx,
+        {.valid = true,
+         .numRecords = 0,
+         .numInvalidDocuments = 0,
+         .numErrors = 0,
+         .numWarnings = 0},
+        {collection_validation::ValidateMode::kForegroundFullEnforceFastCount,
+         collection_validation::ValidateMode::kForegroundFullEnforceFastCountAndSize});
+}
+
+TEST_F(CollectionValidationTest, ValidateEnforceFastCountMismatchDoesNotStopValidation) {
+    auto opCtx = operationContext();
+    const int numRecords = insertDataRange(opCtx, 0, 5);
+
+    // Skew the fast count so it disagrees with the records the traversal will observe.
+    {
+        const AutoGetCollection coll(opCtx, kNss, MODE_X);
+        const int64_t skewedFastCount = numRecords + 2;
+        coll->getRecordStore()->updateStatsAfterRepair(skewedFastCount, /*dataSize=*/64);
+        ASSERT_EQ(skewedFastCount, coll->latestSizeCount(opCtx).count);
+    }
+
+    const auto allResults =
+        foregroundValidate(kNss,
+                           opCtx,
+                           {.valid = false,
+                            .numRecords = numRecords,
+                            .numInvalidDocuments = 0,
+                            .numErrors = 1,
+                            .numWarnings = 0},
+                           {collection_validation::ValidateMode::kForegroundFullEnforceFastCount});
+    ASSERT_EQ(1u, allResults.size());
+
+    const auto& results = allResults[0];
+    ASSERT_FALSE(results.isValid());
+    ASSERT_TRUE(results.continueValidation());
+
+    // Index validation must still have run; it only executes after the fast count check when
+    // validation is allowed to continue.
+    const auto& indexResults = results.getIndexResultsMap();
+    ASSERT_EQ(1u, indexResults.count("_id_"));
+    ASSERT_EQ(numRecords, indexResults.at("_id_").getKeysTraversed());
 }
 
 TEST_F(CollectionValidationTest, ValidateCollectionDocumentSizeUserLimit) {
@@ -637,6 +805,115 @@ TEST_F(CollectionValidationTest, HashPrefixesCases) {
         collection_validation::validateHashes({"abcd", "a", "ABCDEF"}, /*equalLength=*/true),
         DBException,
         ErrorCodes::InvalidOptions);
+}
+
+// Documents inserted by the slicing tests below, and the per-slice target that splits them across
+// many slices.
+static constexpr int kCountDocs{1'000};
+static constexpr int64_t kTargetRecordsPerSlice{10};
+
+TEST_F(CollectionValidationTest, LargeCollectionSlicesOnParallelExecution) {
+    auto opCtx = operationContext();
+    ASSERT_EQ(kCountDocs, insertDataRange(opCtx, 0, kCountDocs));
+    ValidateResults results;
+    collection_validation::ValidationOptions opts(
+        collection_validation::ValidateMode::kForeground,
+        collection_validation::RepairMode::kNone,
+        /*logDiagnostics=*/false,
+        currentValidationVersion,
+        /*verifyConfigurationOverride=*/boost::none,
+        /*readTimestamp=*/boost::none,
+        /*hashPrefixes=*/boost::none,
+        /*revealHashedIds=*/boost::none,
+        /*targetRecordsPerRecordStoreSlice=*/kTargetRecordsPerSlice);
+    ASSERT_OK(collection_validation::validate(opCtx, kNss, opts, results));
+    // Do not strictly validate on a particular count, simply check that it's more than one, and the
+    // value is populated.
+    ASSERT_GT(results.getNumRecordStoreSlices().value_or(-1), 1)
+        << "Expected more than one record store slice";
+}
+
+TEST_F(CollectionValidationTest, LargeCollectionDoesNotSliceOnSerialExecution) {
+    auto opCtx = operationContext();
+    ASSERT_EQ(kCountDocs, insertDataRange(opCtx, 0, kCountDocs));
+    collection_validation::ValidationOptions opts(collection_validation::ValidateMode::kForeground,
+                                                  collection_validation::RepairMode::kNone,
+                                                  /*logDiagnostics=*/false,
+                                                  currentValidationVersion,
+                                                  /*verifyConfigurationOverride=*/boost::none,
+                                                  /*readTimestamp=*/boost::none,
+                                                  /*hashPrefixes=*/boost::none,
+                                                  /*revealHashedIds=*/boost::none,
+                                                  /*targetRecordsPerRecordStoreSlice=*/boost::none);
+    ValidateResults results;
+    ASSERT_OK(collection_validation::validate(opCtx, kNss, opts, results));
+    // Ensure that only one slice was run, or the value is unpopulated.
+    ASSERT_EQ(results.getNumRecordStoreSlices().value_or(1), 1);
+}
+
+TEST_F(CollectionValidationTest, ParallelTraversalAgreesWithSerialTraversal) {
+    auto opCtx = operationContext();
+    ASSERT_EQ(kCountDocs, insertDataRange(opCtx, 0, kCountDocs));
+
+    auto validateWithSliceTarget = [&](boost::optional<int64_t> targetRecordsPerSlice) {
+        collection_validation::ValidationOptions opts(
+            collection_validation::ValidateMode::kForeground,
+            collection_validation::RepairMode::kNone,
+            /*logDiagnostics=*/false,
+            currentValidationVersion,
+            /*verifyConfigurationOverride=*/boost::none,
+            /*readTimestamp=*/boost::none,
+            /*hashPrefixes=*/boost::none,
+            /*revealHashedIds=*/boost::none,
+            /*targetRecordsPerRecordStoreSlice=*/targetRecordsPerSlice);
+        ValidateResults results;
+        ASSERT_OK(collection_validation::validate(opCtx, kNss, opts, results));
+        return results;
+    };
+
+    const auto serialResults = validateWithSliceTarget(boost::none);
+    ASSERT_TRUE(serialResults.isValid());
+    ASSERT_EQ(kCountDocs, serialResults.getNumRecords().value_or(-1));
+
+    // Slicing must not change what validation reports. The slice totals are cross-checked against a
+    // separate counting traversal on the caller's snapshot, so a gap or an overlap between slices
+    // -- or a worker reading from a snapshot other than the caller's -- surfaces as a record count
+    // mismatch and an invalid result.
+    const auto parallelResults = validateWithSliceTarget(kTargetRecordsPerSlice);
+    ASSERT_TRUE(parallelResults.isValid());
+    ASSERT_EQ(kCountDocs, parallelResults.getNumRecords().value_or(-1));
+    ASSERT_GT(parallelResults.getNumRecordStoreSlices().value_or(-1), 1);
+}
+
+// Every in-flight slice holds an index consistency bucket array of its own until the results are
+// merged, so the slice count must stay bounded no matter how small the per-slice target is
+// relative to the collection.
+TEST_F(CollectionValidationTest, SliceCountIsCappedRegardlessOfTarget) {
+    static constexpr int kMaxSlices{4};
+    unittest::ServerParameterGuard maxSlicesGuard{"validateParallelMaxRecordStoreSlices",
+                                                  kMaxSlices};
+
+    auto opCtx = operationContext();
+    ASSERT_EQ(kCountDocs, insertDataRange(opCtx, 0, kCountDocs));
+
+    // A target of one record per slice would ask for kCountDocs slices without the cap.
+    collection_validation::ValidationOptions opts(collection_validation::ValidateMode::kForeground,
+                                                  collection_validation::RepairMode::kNone,
+                                                  /*logDiagnostics=*/false,
+                                                  currentValidationVersion,
+                                                  /*verifyConfigurationOverride=*/boost::none,
+                                                  /*readTimestamp=*/boost::none,
+                                                  /*hashPrefixes=*/boost::none,
+                                                  /*revealHashedIds=*/boost::none,
+                                                  /*targetRecordsPerRecordStoreSlice=*/1);
+    ValidateResults results;
+    ASSERT_OK(collection_validation::validate(opCtx, kNss, opts, results));
+
+    ASSERT_TRUE(results.isValid());
+    ASSERT_EQ(kCountDocs, results.getNumRecords().value_or(-1));
+    const auto numSlices = results.getNumRecordStoreSlices().value_or(1);
+    ASSERT_GT(numSlices, 1);
+    ASSERT_LTE(numSlices, kMaxSlices);
 }
 
 enum class SchemaViolationTestMode { ExpectFailOnDocumentInsert, ExpectFailOnCollectionValidation };
@@ -1423,8 +1700,7 @@ TEST_F(TimeseriesCollectionValidationTest, ReportInvalidBSONColumnReason) {
         V1_Original);
 
     ASSERT_EQ(results.size(), 1U);
-    ASSERT_THAT(*results.front().getErrors().begin(),
-                ::testing::HasSubstr("Invalid BSONColumn encoding"));
+    ASSERT_THAT(*results.front().getErrors().begin(), ::testing::HasSubstr("InvalidBSONColumn"));
 }
 
 TEST_F(TimeseriesCollectionValidationTest, TimeseriesValidationFixedBucketingInconsistency) {
@@ -1446,6 +1722,573 @@ TEST_F(TimeseriesCollectionValidationTest, TimeseriesValidationFixedBucketingInc
         _nss, _opCtx, {.valid = false, .numRecords = 1, .numErrors = 1}, {_validateMode});
     ASSERT(results[0].getErrors().count(
         std::string{collection_validation::kTimeseriesFixedBucketingInconsistencyReason}));
+}
+
+/**
+ * Records the per-document validation hashes the way disaggregated storage does, which is what
+ * makes validate accumulate an XXH3 collection hash.
+ */
+class ContinuousInternodeValidationProvider : public rss::AttachedPersistenceProvider {
+public:
+    bool shouldUseContinuousInternodeValidation() const override {
+        return true;
+    }
+};
+
+// Enables both the replicated metadata system and continuous internode validation, so validate
+// accumulates a collection hash and has a persisted one to compare it against.
+class ComparableHashProvider
+    : public replicated_fast_count::test_helpers::ReplicatedFastCountTestPersistenceProvider {
+public:
+    bool shouldUseContinuousInternodeValidation() const override {
+        return true;
+    }
+};
+
+class CollectionHashComparisonTest : public CollectionValidationTest {
+protected:
+    CollectionHashComparisonTest()
+        : CollectionValidationTest(
+              Options{}.setPersistenceProvider(std::make_unique<ComparableHashProvider>())) {}
+
+    // Creates the replicated metadata containers and points the manager's stores at them, the way
+    // startup does. Without the second step the manager keeps its default collection-backed
+    // stores, whose read path expects a collection that does not exist here.
+    void createFastCountContainers() {
+        ASSERT_OK(createInternalFastCountContainers(operationContext(),
+                                                    NamespaceString::kAdminCommandNamespace,
+                                                    ident::kFastCountMetadataStore,
+                                                    KeyFormat::String,
+                                                    ident::kFastCountMetadataStoreTimestamps,
+                                                    KeyFormat::Long,
+                                                    /*writeToOplog=*/false));
+
+        KVEngine* engine = operationContext()->getServiceContext()->getStorageEngine()->getEngine();
+        replicated_fast_count::ReplicatedFastCountManager::get(getServiceContext())
+            .initializeContainerStores(
+                engine->getRecordStore(operationContext(),
+                                       NamespaceString::kAdminCommandNamespace,
+                                       ident::kFastCountMetadataStore,
+                                       RecordStore::Options{.keyFormat = KeyFormat::String},
+                                       /*uuid=*/boost::none),
+                engine->getRecordStore(operationContext(),
+                                       NamespaceString::kAdminCommandNamespace,
+                                       ident::kFastCountMetadataStoreTimestamps,
+                                       RecordStore::Options{.keyFormat = KeyFormat::Long},
+                                       /*uuid=*/boost::none));
+
+        // validate() requires an inactive recovery unit when it sets its prepare conflict
+        // behavior, and the setup above leaves a snapshot open.
+        shard_role_details::getRecoveryUnit(operationContext())->abandonSnapshot();
+    }
+
+    // The point a seeded hash is valid as of.
+    static inline const Timestamp kPersistedAt = Timestamp(1, 1);
+
+    // Seeds the replicated metadata system with a persisted hash for 'uuid', standing in for what
+    // a checkpoint flush would have written.
+    void seedPersistedHash(const UUID& uuid,
+                           boost::optional<int64_t> hash,
+                           bool writeBackingOplogEntry = true) {
+        auto& manager = replicated_fast_count::ReplicatedFastCountManager::get(getServiceContext());
+        auto [sizeCountStore, timestampStore] = manager.getSizeCountStores_ForTest();
+        replicated_fast_count::test_helpers::insertSizeCountEntry(
+            operationContext(),
+            *sizeCountStore,
+            uuid,
+            replicated_fast_count::SizeCountStore::Entry{
+                .timestamp = kPersistedAt, .size = 0, .count = 0, .hash = hash});
+
+        if (!writeBackingOplogEntry) {
+            shard_role_details::getRecoveryUnit(operationContext())->abandonSnapshot();
+            return;
+        }
+
+        // A valid-as-of names the last oplog entry the accumulator consumed, so that record has to
+        // exist. The scan seeks past it exclusively, so it contributes nothing itself.
+        replicated_fast_count::test_helpers::writeToOplog(
+            operationContext(),
+            replicated_fast_count::test_helpers::makeOplogEntry(
+                kPersistedAt,
+                replicated_fast_count::test_helpers::NsAndUUID{kNss, uuid},
+                repl::OpTypeEnum::kInsert,
+                /*sizeDelta=*/0));
+        shard_role_details::getRecoveryUnit(operationContext())->abandonSnapshot();
+    }
+
+    // Seeds the store's global valid-as-of, the point the accumulator has processed the oplog up
+    // to across all collections, along with the oplog record it names.
+    void seedGlobalValidAsOf(const UUID& uuid, Timestamp ts) {
+        auto& manager = replicated_fast_count::ReplicatedFastCountManager::get(getServiceContext());
+        auto [sizeCountStore, timestampStore] = manager.getSizeCountStores_ForTest();
+        replicated_fast_count::test_helpers::insertSizeCountTimestamp(
+            operationContext(), *timestampStore, ts);
+        replicated_fast_count::test_helpers::writeToOplog(
+            operationContext(),
+            replicated_fast_count::test_helpers::makeOplogEntry(
+                ts,
+                replicated_fast_count::test_helpers::NsAndUUID{kNss, uuid},
+                repl::OpTypeEnum::kInsert,
+                /*sizeDelta=*/0,
+                /*hash=*/0));
+        shard_role_details::getRecoveryUnit(operationContext())->abandonSnapshot();
+    }
+
+    UUID collectionUuid() {
+        const AutoGetCollection coll(operationContext(), kNss, MODE_IS);
+        return coll->uuid();
+    }
+
+    void insertDocs(const std::vector<BSONObj>& docs) {
+        const AutoGetCollection coll(operationContext(), kNss, MODE_IX);
+        WriteUnitOfWork wuow(operationContext());
+        ASSERT_OK(Helpers::insert(operationContext(), *coll, docs));
+        wuow.commit();
+        shard_role_details::getRecoveryUnit(operationContext())->abandonSnapshot();
+    }
+
+    static uint64_t xxh3Of(const std::vector<BSONObj>& docs) {
+        uint64_t hash = 0;
+        for (const auto& doc : docs) {
+            hash ^= static_cast<uint64_t>(repl::computeDocValidationHash(doc));
+        }
+        return hash;
+    }
+
+    ValidateResults hashValidate() {
+        ValidateResults results;
+        EXPECT_EQ(ErrorCodes::OK,
+                  collection_validation::validate(
+                      operationContext(),
+                      kNss,
+                      collection_validation::ValidationOptions{
+                          collection_validation::ValidateMode::kCollectionHash,
+                          collection_validation::RepairMode::kNone,
+                          /*logDiagnostics=*/false},
+                      results));
+        return results;
+    }
+};
+
+// Probe: reports how far the comparison gets with the replicated metadata system enabled.
+TEST_F(CollectionHashComparisonTest, ReportsNoPersistedEntryBeforeAnythingIsFlushed) {
+    createFastCountContainers();
+    const auto results = hashValidate();
+    ASSERT_TRUE(results.getHashComparison().has_value());
+    EXPECT_EQ(toString(*results.getHashComparison()), "noPersistedEntry");
+    EXPECT_FALSE(results.getExpectedXxh3CollectionHash().has_value());
+}
+
+TEST_F(CollectionHashComparisonTest, MatchesWhenThePersistedHashAgrees) {
+    createFastCountContainers();
+    const std::vector<BSONObj> docs = {BSON("_id" << 1), BSON("_id" << 2)};
+    insertDocs(docs);
+    seedPersistedHash(collectionUuid(), static_cast<int64_t>(xxh3Of(docs)));
+
+    const auto results = hashValidate();
+    ASSERT_TRUE(results.getHashComparison().has_value());
+    EXPECT_EQ(toString(*results.getHashComparison()), "matched");
+    EXPECT_TRUE(results.getWarnings().empty());
+    EXPECT_TRUE(results.isValid());
+}
+
+TEST_F(CollectionHashComparisonTest, FoldsInOplogEntriesWrittenSinceTheHashWasPersisted) {
+    createFastCountContainers();
+
+    // Stands in for a collection whose hash was persisted when it held 'flushed', after which
+    // 'sinceFlush' was written. The persisted hash is stale by exactly that document, so the
+    // comparison only holds if validate replays the oplog and folds it back in.
+    const std::vector<BSONObj> flushed = {BSON("_id" << 1), BSON("_id" << 2)};
+    const BSONObj sinceFlush = BSON("_id" << 3);
+    insertDocs(flushed);
+    insertDocs({sinceFlush});
+
+    const auto uuid = collectionUuid();
+    seedPersistedHash(uuid, static_cast<int64_t>(xxh3Of(flushed)));
+
+    // The entry is persisted as of Timestamp(1, 1), so this lands in the replayed range.
+    replicated_fast_count::test_helpers::writeToOplog(
+        operationContext(),
+        replicated_fast_count::test_helpers::makeOplogEntry(
+            Timestamp(2, 1),
+            replicated_fast_count::test_helpers::NsAndUUID{kNss, uuid},
+            repl::OpTypeEnum::kInsert,
+            /*sizeDelta=*/sinceFlush.objsize(),
+            repl::computeDocValidationHash(sinceFlush)));
+    shard_role_details::getRecoveryUnit(operationContext())->abandonSnapshot();
+
+    const auto results = hashValidate();
+    ASSERT_TRUE(results.getHashComparison().has_value());
+    EXPECT_EQ(toString(*results.getHashComparison()), "matched");
+    EXPECT_TRUE(results.getWarnings().empty());
+
+    // Without the replay the expected value would still be the stale persisted hash.
+    ASSERT_TRUE(results.getExpectedXxh3CollectionHash().has_value());
+    EXPECT_NE(static_cast<uint64_t>(*results.getExpectedXxh3CollectionHash()), xxh3Of(flushed));
+}
+
+TEST_F(CollectionHashComparisonTest, ReplaysFromTheGlobalValidAsOfNotTheEntrysOwn) {
+    createFastCountContainers();
+    const BSONObj doc = BSON("_id" << 1);
+    insertDocs({doc});
+
+    const auto uuid = collectionUuid();
+
+    // The entry's hash already accounts for 'doc', and its own valid-as-of is old. The global
+    // valid-as-of is later, which is the normal state for a collection that has not changed since
+    // an earlier checkpoint.
+    seedPersistedHash(uuid, static_cast<int64_t>(xxh3Of({doc})));
+    seedGlobalValidAsOf(uuid, Timestamp(5, 1));
+
+    // The write that produced that hash still sits in the oplog between the two timestamps.
+    // Seeking from the entry's own valid-as-of would replay it a second time, and XOR being its
+    // own inverse would cancel it out into a mismatch on a healthy collection.
+    replicated_fast_count::test_helpers::writeToOplog(
+        operationContext(),
+        replicated_fast_count::test_helpers::makeOplogEntry(
+            Timestamp(2, 1),
+            replicated_fast_count::test_helpers::NsAndUUID{kNss, uuid},
+            repl::OpTypeEnum::kInsert,
+            /*sizeDelta=*/doc.objsize(),
+            repl::computeDocValidationHash(doc)));
+    shard_role_details::getRecoveryUnit(operationContext())->abandonSnapshot();
+
+    const auto results = hashValidate();
+    ASSERT_TRUE(results.getHashComparison().has_value());
+    EXPECT_EQ(toString(*results.getHashComparison()), "matched");
+    ASSERT_TRUE(results.getExpectedXxh3CollectionHash().has_value());
+    EXPECT_EQ(static_cast<uint64_t>(*results.getExpectedXxh3CollectionHash()), xxh3Of({doc}));
+}
+
+TEST_F(CollectionHashComparisonTest, ReportsNoPersistedHashWhenTheEntryCarriesNone) {
+    createFastCountContainers();
+    insertDocs({BSON("_id" << 1)});
+
+    // An entry that predates hash validation, or whose contributions could not all be accounted
+    // for, holds size and count but no hash. Absence is sticky, so this is the permanent state for
+    // such a collection rather than a transient one.
+    seedPersistedHash(collectionUuid(), boost::none);
+
+    const auto results = hashValidate();
+    ASSERT_TRUE(results.getHashComparison().has_value());
+    EXPECT_EQ(toString(*results.getHashComparison()), "noPersistedHash");
+    EXPECT_FALSE(results.getExpectedXxh3CollectionHash().has_value());
+    EXPECT_TRUE(results.getWarnings().empty());
+}
+
+TEST_F(CollectionHashComparisonTest, SkipsWhenTheCallerPinsAReadTimestamp) {
+    createFastCountContainers();
+    const std::vector<BSONObj> docs = {BSON("_id" << 1)};
+    insertDocs(docs);
+    seedPersistedHash(collectionUuid(), static_cast<int64_t>(xxh3Of(docs)));
+
+    // The scan would read an earlier instant than the replayed oplog describes, so the two sides
+    // would be measuring different moments and could disagree on a healthy collection.
+    ValidateResults results;
+    EXPECT_EQ(
+        ErrorCodes::OK,
+        collection_validation::validate(operationContext(),
+                                        kNss,
+                                        collection_validation::ValidationOptions{
+                                            collection_validation::ValidateMode::kCollectionHash,
+                                            collection_validation::RepairMode::kNone,
+                                            /*logDiagnostics=*/false,
+                                            currentValidationVersion,
+                                            /*verifyConfigurationOverride=*/boost::none,
+                                            /*readTimestamp=*/
+                                            operationContext()
+                                                ->getServiceContext()
+                                                ->getStorageEngine()
+                                                ->getAllDurableTimestamp()},
+                                        results));
+
+    ASSERT_TRUE(results.getHashComparison().has_value());
+    EXPECT_EQ(toString(*results.getHashComparison()), "pinnedReadTimestamp");
+    EXPECT_FALSE(results.getExpectedXxh3CollectionHash().has_value());
+}
+
+TEST_F(CollectionHashComparisonTest, SkipsACollectionCreatedSinceTheLastCheckpoint) {
+    createFastCountContainers();
+    const BSONObj doc = BSON("_id" << 1);
+    insertDocs({doc});
+
+    const auto uuid = collectionUuid();
+
+    // No per-collection entry, which is the state for a collection whose create is still in the
+    // unflushed oplog range: either it was created since the last checkpoint, or an earlier
+    // incarnation was dropped, that drop was flushed away (which removes the entry), and it was
+    // then recreated. Both land here as kCreated with nothing persisted.
+    //
+    // The replayed delta could answer for the collection on its own, since a create restarts the
+    // hash from zero. That is deliberately not done: it would compare the oplog against the data
+    // rather than the persisted hash against the data, and reporting a match would claim more than
+    // was checked.
+    seedGlobalValidAsOf(uuid, kPersistedAt);
+
+    replicated_fast_count::test_helpers::writeToOplog(
+        operationContext(),
+        replicated_fast_count::test_helpers::makeCreateOplogEntry(
+            Timestamp(2, 1), replicated_fast_count::test_helpers::NsAndUUID{kNss, uuid}));
+    replicated_fast_count::test_helpers::writeToOplog(
+        operationContext(),
+        replicated_fast_count::test_helpers::makeOplogEntry(
+            Timestamp(3, 1),
+            replicated_fast_count::test_helpers::NsAndUUID{kNss, uuid},
+            repl::OpTypeEnum::kInsert,
+            /*sizeDelta=*/doc.objsize(),
+            repl::computeDocValidationHash(doc)));
+    shard_role_details::getRecoveryUnit(operationContext())->abandonSnapshot();
+
+    const auto results = hashValidate();
+    ASSERT_TRUE(results.getHashComparison().has_value());
+    EXPECT_EQ(toString(*results.getHashComparison()), "noPersistedEntry");
+    EXPECT_FALSE(results.getExpectedXxh3CollectionHash().has_value());
+    EXPECT_TRUE(results.getWarnings().empty());
+}
+
+TEST_F(CollectionHashComparisonTest, ReportsIncompleteWhenAReplayedEntryCarriesNoHash) {
+    createFastCountContainers();
+    const std::vector<BSONObj> docs = {BSON("_id" << 1)};
+    insertDocs(docs);
+    seedPersistedHash(collectionUuid(), static_cast<int64_t>(xxh3Of(docs)));
+
+    // An entry with a size delta but no per-document hash, which is what a write records when the
+    // storage model was not accumulating hashes at the time. One such entry means not every write
+    // in the range can be accounted for, so the folded value is incomplete and must not be
+    // compared rather than compared while missing a contribution.
+    replicated_fast_count::test_helpers::writeToOplog(
+        operationContext(),
+        replicated_fast_count::test_helpers::makeOplogEntry(
+            Timestamp(2, 1),
+            replicated_fast_count::test_helpers::NsAndUUID{kNss, collectionUuid()},
+            repl::OpTypeEnum::kInsert,
+            /*sizeDelta=*/16));
+    shard_role_details::getRecoveryUnit(operationContext())->abandonSnapshot();
+
+    const auto results = hashValidate();
+    ASSERT_TRUE(results.getHashComparison().has_value());
+    EXPECT_EQ(toString(*results.getHashComparison()), "incompleteDelta");
+    EXPECT_FALSE(results.getExpectedXxh3CollectionHash().has_value());
+    EXPECT_TRUE(results.getWarnings().empty());
+}
+
+TEST_F(CollectionHashComparisonTest, ReportsIncompleteWhenAnImportedCollectionHasNoHash) {
+    createFastCountContainers();
+    const BSONObj doc = BSON("_id" << 1);
+    insertDocs({doc});
+
+    const auto uuid = collectionUuid();
+    seedPersistedHash(uuid, 0x1234);
+
+    // An import brings in a collection whose documents were never hashed, so its delta carries no
+    // hash and nothing folded over that range can be trusted.
+    replicated_fast_count::test_helpers::writeToOplog(
+        operationContext(),
+        replicated_fast_count::test_helpers::makeImportCollectionOplogEntry(
+            Timestamp(2, 1),
+            replicated_fast_count::test_helpers::NsAndUUID{kNss, uuid},
+            /*numRecords=*/1,
+            /*dataSize=*/doc.objsize()));
+    shard_role_details::getRecoveryUnit(operationContext())->abandonSnapshot();
+
+    const auto results = hashValidate();
+    ASSERT_TRUE(results.getHashComparison().has_value());
+    EXPECT_EQ(toString(*results.getHashComparison()), "incompleteDelta");
+    EXPECT_FALSE(results.getExpectedXxh3CollectionHash().has_value());
+    EXPECT_TRUE(results.getWarnings().empty());
+}
+
+TEST_F(CollectionHashComparisonTest, AFailedComparisonDoesNotCutValidationShort) {
+    createFastCountContainers();
+    insertDocs({BSON("_id" << 1), BSON("_id" << 2)});
+    seedPersistedHash(collectionUuid(), 0);
+
+    // Without an oplog the replay throws. That must be reported rather than propagated: validate's
+    // outer handler records a warning and skips everything after it, index validation included,
+    // while still calling the collection valid.
+    ASSERT_OK(
+        storageInterface()->dropCollection(operationContext(), NamespaceString::kRsOplogNamespace));
+    shard_role_details::getRecoveryUnit(operationContext())->abandonSnapshot();
+
+    const auto results = hashValidate();
+    ASSERT_TRUE(results.getHashComparison().has_value());
+    EXPECT_EQ(toString(*results.getHashComparison()), "comparisonFailed");
+    EXPECT_FALSE(results.getExpectedXxh3CollectionHash().has_value());
+
+    // The rest of validation still ran.
+    ASSERT_TRUE(results.getNumRecords().has_value());
+    EXPECT_EQ(*results.getNumRecords(), 2);
+    EXPECT_TRUE(results.isValid());
+}
+
+TEST_F(CollectionHashComparisonTest, WarnsButStaysValidWhenThePersistedHashDisagrees) {
+    createFastCountContainers();
+    const std::vector<BSONObj> docs = {BSON("_id" << 1), BSON("_id" << 2)};
+    insertDocs(docs);
+    // Stands in for the collection having diverged from what replication believes it holds.
+    seedPersistedHash(collectionUuid(), static_cast<int64_t>(xxh3Of(docs)) ^ 0xabcd);
+
+    const auto results = hashValidate();
+    ASSERT_TRUE(results.getHashComparison().has_value());
+    EXPECT_EQ(toString(*results.getHashComparison()), "mismatched");
+    EXPECT_EQ(results.getWarnings().size(), 1);
+    // A divergence is surfaced, but must not by itself declare the collection invalid.
+    EXPECT_TRUE(results.isValid());
+}
+
+class CollectionValidationXxh3Test : public CollectionValidationTest {
+protected:
+    CollectionValidationXxh3Test()
+        : CollectionValidationTest(Options{}.setPersistenceProvider(
+              std::make_unique<ContinuousInternodeValidationProvider>())) {}
+
+    ValidateResults collectionHashValidate(const NamespaceString& nss = kNss) {
+        ValidateResults results;
+        EXPECT_EQ(ErrorCodes::OK,
+                  collection_validation::validate(
+                      operationContext(),
+                      nss,
+                      collection_validation::ValidationOptions{
+                          collection_validation::ValidateMode::kCollectionHash,
+                          collection_validation::RepairMode::kNone,
+                          /*logDiagnostics=*/false},
+                      results));
+        return results;
+    }
+
+    // XORs the per-document validation hashes the same way the replicated collection validation
+    // hash accumulates them.
+    static uint64_t expectedXxh3(const std::vector<BSONObj>& docs) {
+        uint64_t hash = 0;
+        for (const auto& doc : docs) {
+            hash ^= static_cast<uint64_t>(repl::computeDocValidationHash(doc));
+        }
+        return hash;
+    }
+
+    void insertDocs(const std::vector<BSONObj>& docs, const NamespaceString& nss = kNss) {
+        const AutoGetCollection coll(operationContext(), nss, MODE_IX);
+        WriteUnitOfWork wuow(operationContext());
+        ASSERT_OK(Helpers::insert(operationContext(), *coll, docs));
+        wuow.commit();
+    }
+
+    // Stands in for the same collection on a second node, so the two hashes can be compared the
+    // way continuous internode validation compares them across a replica set.
+    const NamespaceString& secondNss() {
+        static const NamespaceString nss =
+            NamespaceString::createNamespaceString_forTest("test.t2");
+        return nss;
+    }
+
+    void createSecondCollection(const std::vector<BSONObj>& docs) {
+        ASSERT_OK(storageInterface()->createCollection(
+            operationContext(), secondNss(), CollectionOptions{}));
+        insertDocs(docs, secondNss());
+    }
+};
+
+TEST_F(CollectionValidationXxh3Test, ReportsWhyNoComparisonHappened) {
+    // An untracked replicated hash doesn't get compared.
+    const auto results = collectionHashValidate();
+    ASSERT_TRUE(results.getHashComparison().has_value());
+    EXPECT_EQ(toString(*results.getHashComparison()), "notTracked");
+    EXPECT_FALSE(results.getExpectedXxh3CollectionHash().has_value());
+}
+
+TEST_F(CollectionValidationXxh3Test, EmptyCollectionHashesToZero) {
+    const auto results = collectionHashValidate();
+    ASSERT_TRUE(results.getXxh3CollectionHash().has_value());
+    EXPECT_EQ(*results.getXxh3CollectionHash(), 0U);
+}
+
+TEST_F(CollectionValidationXxh3Test, HashIsTheXorOfThePerDocumentHashes) {
+    const std::vector<BSONObj> docs = {BSON("_id" << 1), BSON("_id" << 2), BSON("_id" << 3)};
+    insertDocs(docs);
+
+    const auto results = collectionHashValidate();
+    ASSERT_TRUE(results.getXxh3CollectionHash().has_value());
+    EXPECT_EQ(*results.getXxh3CollectionHash(), expectedXxh3(docs));
+}
+
+TEST_F(CollectionValidationXxh3Test, SameContentsInAnyOrderHashTheSame) {
+    insertDocs({BSON("_id" << 1), BSON("_id" << 2), BSON("_id" << 3)});
+    createSecondCollection({BSON("_id" << 3), BSON("_id" << 1), BSON("_id" << 2)});
+
+    const auto first = collectionHashValidate();
+    const auto second = collectionHashValidate(secondNss());
+    ASSERT_TRUE(first.getXxh3CollectionHash().has_value());
+    ASSERT_TRUE(second.getXxh3CollectionHash().has_value());
+    EXPECT_EQ(*first.getXxh3CollectionHash(), *second.getXxh3CollectionHash());
+}
+
+TEST_F(CollectionValidationXxh3Test, DifferingContentsHashDifferently) {
+    insertDocs({BSON("_id" << 1), BSON("_id" << 2), BSON("_id" << 3)});
+    createSecondCollection({BSON("_id" << 1), BSON("_id" << 2), BSON("_id" << 4)});
+
+    const auto first = collectionHashValidate();
+    const auto second = collectionHashValidate(secondNss());
+    ASSERT_TRUE(first.getXxh3CollectionHash().has_value());
+    ASSERT_TRUE(second.getXxh3CollectionHash().has_value());
+    EXPECT_NE(*first.getXxh3CollectionHash(), *second.getXxh3CollectionHash());
+}
+
+TEST_F(CollectionValidationXxh3Test, MissingDocumentHashesDifferently) {
+    insertDocs({BSON("_id" << 1), BSON("_id" << 2), BSON("_id" << 3)});
+    createSecondCollection({BSON("_id" << 1), BSON("_id" << 2)});
+
+    const auto first = collectionHashValidate();
+    const auto second = collectionHashValidate(secondNss());
+    ASSERT_TRUE(first.getXxh3CollectionHash().has_value());
+    ASSERT_TRUE(second.getXxh3CollectionHash().has_value());
+    EXPECT_NE(*first.getXxh3CollectionHash(), *second.getXxh3CollectionHash());
+}
+
+TEST_F(CollectionValidationXxh3Test, RecordThatIsNotValidBSONIsStillHashed) {
+    const auto doc = BSON("_id" << 1);
+    insertDocs({doc});
+    ASSERT_EQ(1, setUpInvalidData(operationContext()));
+
+    const auto results = collectionHashValidate();
+    EXPECT_FALSE(results.isValid());
+    ASSERT_TRUE(results.getXxh3CollectionHash().has_value());
+
+    // The corrupt record contributes its raw bytes, which is what the accompanying warning is
+    // about.
+    const auto invalidBson = "\0\0\0\0\0"sv;
+    EXPECT_EQ(*results.getXxh3CollectionHash(),
+              static_cast<uint64_t>(repl::computeDocValidationHash(doc)) ^
+                  static_cast<uint64_t>(repl::computeDocValidationHash(
+                      ConstDataRange(invalidBson.data(), invalidBson.size()))));
+}
+
+TEST_F(CollectionValidationTest, NoXxh3HashWithoutContinuousInternodeValidation) {
+    {
+        const AutoGetCollection coll(operationContext(), kNss, MODE_IX);
+        WriteUnitOfWork wuow(operationContext());
+        ASSERT_OK(Helpers::insert(operationContext(), *coll, BSON("_id" << 1)));
+        wuow.commit();
+    }
+
+    ValidateResults results;
+    EXPECT_EQ(
+        ErrorCodes::OK,
+        collection_validation::validate(operationContext(),
+                                        kNss,
+                                        collection_validation::ValidationOptions{
+                                            collection_validation::ValidateMode::kCollectionHash,
+                                            collection_validation::RepairMode::kNone,
+                                            /*logDiagnostics=*/false},
+                                        results));
+
+    // The default attached storage provider does not record the per-document validation hashes,
+    // so there is nothing for this hash to be compared against.
+    ASSERT_TRUE(results.getCollectionHash().has_value());
+    EXPECT_FALSE(results.getXxh3CollectionHash().has_value());
+
+    // The comparison does not apply to a storage model that carries no per-document validation
+    // hashes, so no outcome is reported at all.
+    EXPECT_FALSE(results.getHashComparison().has_value());
 }
 
 }  // namespace

@@ -11,6 +11,11 @@ namespace mongo::join_ordering {
 using JoinPredicateEstimatorFixture = JoinOrderingTestFixture;
 using namespace cost_based_ranker;
 
+namespace {
+// Provides 'JoinReorderingContext' an empty set of indexes to pass into JoinReorderingContext.
+const AvailableIndexes kNoIndexes{};
+}  // namespace
+
 // Join graph: A -- B with edge A.foo = B.foo and 'A' being the main collection
 // The cardinality estimate for 'A' is smaller, so we assert that we use NDV(A.foo) for the join
 // predicate selectivity estimate.
@@ -39,16 +44,21 @@ TEST_F(JoinPredicateEstimatorFixture, NDVSmallerCollection) {
         CardinalityEstimate{CardinalityType{20}, EstimationSource::Sampling});
 
     JoinGraph graph(std::move(mgraph));
-    JoinReorderingContext ctx{graph, paths};
-    auto selEst =
-        JoinCardinalityEstimator::joinPredicateSel(ctx, samplingEstimators, graph.getEdge(0));
+    JoinReorderingContext ctx{graph, paths, {} /* singleTableAccess */, kNoIndexes};
+    OpDebug::JoinOptimizationMetrics::PlanEnumerationMetrics ceMetrics;
+    auto selEst = JoinCardinalityEstimator::joinPredicateSel(
+        ctx, samplingEstimators, graph.getEdge(0), ceMetrics);
     // The selectivity estimate comes from 1 / NDV(A.foo) = 1 / 5 = 0.2
     auto expectedSel = SelectivityEstimate{SelectivityType{0.2}, EstimationSource::Sampling};
-    ASSERT_EQ(expectedSel, selEst);
+    ASSERT_EQ(expectedSel, selEst.selectivity);
 
-    auto edgeSels = JoinCardinalityEstimator::estimateEdgeSelectivities(ctx, samplingEstimators);
+    auto edgeSels =
+        JoinCardinalityEstimator::estimateEdgeSelectivities(ctx, samplingEstimators, ceMetrics);
     ASSERT_EQ(1U, edgeSels.size());
-    ASSERT_EQ(expectedSel, edgeSels[0]);
+    ASSERT_EQ(expectedSel, edgeSels[0].selectivity);
+
+    // There is no unique index information, so NDV came from sampling for both calls above.
+    ASSERT_EQ(0, ceMetrics.numUniqueIndexesUsedForNDV);
 }
 
 // Join graph: A -- B with edge A.foo = B.foo and 'A' being the main collection
@@ -81,16 +91,21 @@ TEST_F(JoinPredicateEstimatorFixture, NDVSmallerCollectionEmbedPath) {
     samplingEstimators[bNss] = std::move(bSamplingEstimator);
 
     JoinGraph graph(std::move(mgraph));
-    JoinReorderingContext ctx{graph, paths};
-    auto selEst =
-        JoinCardinalityEstimator::joinPredicateSel(ctx, samplingEstimators, graph.getEdge(0));
+    JoinReorderingContext ctx{graph, paths, {} /* singleTableAccess */, kNoIndexes};
+    OpDebug::JoinOptimizationMetrics::PlanEnumerationMetrics ceMetrics;
+    auto selEst = JoinCardinalityEstimator::joinPredicateSel(
+        ctx, samplingEstimators, graph.getEdge(0), ceMetrics);
     // The selectivity estimate comes from 1 / NDV(B.foo) = 1 / 5 = 0.2
     auto expectedSel = SelectivityEstimate{SelectivityType{0.2}, EstimationSource::Sampling};
-    ASSERT_EQ(expectedSel, selEst);
+    ASSERT_EQ(expectedSel, selEst.selectivity);
 
-    auto edgeSels = JoinCardinalityEstimator::estimateEdgeSelectivities(ctx, samplingEstimators);
+    auto edgeSels =
+        JoinCardinalityEstimator::estimateEdgeSelectivities(ctx, samplingEstimators, ceMetrics);
     ASSERT_EQ(1U, edgeSels.size());
-    ASSERT_EQ(expectedSel, edgeSels[0]);
+    ASSERT_EQ(expectedSel, edgeSels[0].selectivity);
+
+    // There is no unique index information, so NDV came from sampling for both calls above.
+    ASSERT_EQ(0, ceMetrics.numUniqueIndexesUsedForNDV);
 }
 
 // Join graph: A -- B with compound edge A.foo = B.foo && A.bar = B.bar and 'A' being the main
@@ -131,16 +146,21 @@ TEST_F(JoinPredicateEstimatorFixture, NDVCompoundJoinKey) {
         CardinalityEstimate{CardinalityType{20}, EstimationSource::Sampling});
 
     JoinGraph graph(std::move(mgraph));
-    JoinReorderingContext ctx{graph, paths};
-    auto selEst =
-        JoinCardinalityEstimator::joinPredicateSel(ctx, samplingEstimators, graph.getEdge(0));
+    JoinReorderingContext ctx{graph, paths, {} /* singleTableAccess */, kNoIndexes};
+    OpDebug::JoinOptimizationMetrics::PlanEnumerationMetrics ceMetrics;
+    auto selEst = JoinCardinalityEstimator::joinPredicateSel(
+        ctx, samplingEstimators, graph.getEdge(0), ceMetrics);
     // The selectivity estimate comes from 1 / NDV(A.foo, A.bar) = 1 / 5 = 0.2
     auto expectedSel = SelectivityEstimate{SelectivityType{0.2}, EstimationSource::Sampling};
-    ASSERT_EQ(expectedSel, selEst);
+    ASSERT_EQ(expectedSel, selEst.selectivity);
 
-    auto edgeSels = JoinCardinalityEstimator::estimateEdgeSelectivities(ctx, samplingEstimators);
+    auto edgeSels =
+        JoinCardinalityEstimator::estimateEdgeSelectivities(ctx, samplingEstimators, ceMetrics);
     ASSERT_EQ(1U, edgeSels.size());
-    ASSERT_EQ(expectedSel, edgeSels[0]);
+    ASSERT_EQ(expectedSel, edgeSels[0].selectivity);
+
+    // There is no unique index information, so NDV came from sampling for both calls above.
+    ASSERT_EQ(0, ceMetrics.numUniqueIndexesUsedForNDV);
 }
 
 namespace {
@@ -178,8 +198,7 @@ TEST_F(JoinPredicateEstimatorFixture, EstimateSubsetCardinality) {
 
     EdgeSelectivities edgeSels;
     for (size_t i = 0; i < numNodes; i++) {
-        edgeSels.push_back(cost_based_ranker::SelectivityEstimate(SelectivityType(i * 0.1),
-                                                                  EstimationSource::Sampling));
+        edgeSels.push_back(makeJoinSelectivityEstimate(i * 0.1));
     }
 
     nodeCards = nodeCEs;
@@ -246,8 +265,7 @@ TEST_F(JoinPredicateEstimatorFixture, EstimateSubsetCardinalityAlmostCycle) {
 
     EdgeSelectivities edgeSels;
     for (size_t i = 0; i < numNodes; i++) {
-        edgeSels.push_back(cost_based_ranker::SelectivityEstimate(SelectivityType(i * 0.1),
-                                                                  EstimationSource::Sampling));
+        edgeSels.push_back(makeJoinSelectivityEstimate(i * 0.1));
     }
 
     nodeCards = nodeCEs;
@@ -287,8 +305,7 @@ TEST_F(JoinPredicateEstimatorFixture, EstimateSubsetCardinalitySameCollectionPre
     graph.addSimpleEqualityEdge(NodeId(1), NodeId(2), 2, 3);
     EdgeSelectivities edgeSels;
     for (size_t i = 0; i < 2; i++) {
-        edgeSels.push_back(cost_based_ranker::SelectivityEstimate(SelectivityType((i + 1) * 0.1),
-                                                                  EstimationSource::Sampling));
+        edgeSels.push_back(makeJoinSelectivityEstimate((i + 1) * 0.1));
     }
     NodeCardinalities nodeCEs{
         oneCE * 10,
@@ -336,23 +353,57 @@ TEST_F(JoinPredicateEstimatorFixture, JoinPredicateSelUsesUniqueFields) {
     samplingEstimators[bNss] = std::make_unique<FakeNdvEstimator>(
         CardinalityEstimate{CardinalityType{20}, EstimationSource::Sampling});
     auto jCtx = makeContext();
+    OpDebug::JoinOptimizationMetrics::PlanEnumerationMetrics ceMetrics;
 
     // Selectivity test without unique information. Here the selectivity estimate comes from
     // 1 / NDV(a.foo) = 1 / 5 = 0.2
     {
-        auto selEst = JoinCardinalityEstimator::joinPredicateSel(
-            jCtx, samplingEstimators, jCtx.joinGraph.getEdge(0));
+        auto ndvEstimate = JoinCardinalityEstimator::joinPredicateSel(
+            jCtx, samplingEstimators, jCtx.joinGraph.getEdge(0), ceMetrics);
         auto expectedSel = SelectivityEstimate{SelectivityType{0.2}, EstimationSource::Sampling};
-        ASSERT_EQ(expectedSel, selEst);
+        ASSERT_EQ(expectedSel, ndvEstimate.selectivity);
+        // NDV came from sampling, so the unique-index shortcut was not taken.
+        ASSERT_EQ(0, ceMetrics.numUniqueIndexesUsedForNDV);
+        // The recorded estimate captures the sampled NDV and its provenance.
+        ASSERT_EQ(5.0, ndvEstimate.ndv.toDouble());
+        ASSERT_EQ(JoinNdvEstimateSource::kSampling, ndvEstimate.source);
+    }
+    // Selectivity test with persisted statistics.
+    {
+        auto persistedEstimator = std::make_unique<FakeNdvEstimator>(
+            CardinalityEstimate{CardinalityType{10}, EstimationSource::Sampling});
+        persistedEstimator->addFakeNDVEstimate(
+            {FieldPath("foo")},
+            CardinalityEstimate{CardinalityType{5}, EstimationSource::Sampling});
+        // Simulate the estimator having served "foo" from persisted statistics.
+        persistedEstimator->addPersistedNDVStats({"foo"});
+        samplingEstimators[aNss] = std::move(persistedEstimator);
+
+        auto ndvEstimate = JoinCardinalityEstimator::joinPredicateSel(
+            jCtx, samplingEstimators, jCtx.joinGraph.getEdge(0), ceMetrics);
+        auto expectedSel = SelectivityEstimate{SelectivityType{0.2}, EstimationSource::Sampling};
+        ASSERT_EQ(expectedSel, ndvEstimate.selectivity);
+        // The recorded estimate captures the persisted-statistics provenance rather than sampling.
+        ASSERT_EQ(5.0, ndvEstimate.ndv.toDouble());
+        // TODO SERVER-135494: actually report this.
+        ASSERT_EQ(JoinNdvEstimateSource::kSampling, ndvEstimate.source);
     }
     // Selectivity test with unique information. Tell the context that "foo" is a unique field. This
     // should change our estimate for NDV(a.foo) to |a| = 10, giving a new selectivity of 0.1.
     {
         jCtx.uniqueFieldInfo.emplace(aNss, buildUniqueFieldInfo({fromjson("{foo: 1}")}));
-        auto selEst = JoinCardinalityEstimator::joinPredicateSel(
-            jCtx, samplingEstimators, jCtx.joinGraph.getEdge(0));
+        auto ndvEstimate = JoinCardinalityEstimator::joinPredicateSel(
+            jCtx, samplingEstimators, jCtx.joinGraph.getEdge(0), ceMetrics);
         auto expectedSel = SelectivityEstimate{SelectivityType{0.1}, EstimationSource::Sampling};
-        ASSERT_EQ(expectedSel, selEst);
+        ASSERT_EQ(expectedSel, ndvEstimate.selectivity);
+        // The NDV for this edge came from index uniqueness metadata rather than sampling. Note that
+        // 'operator==' above ignores the estimation source, so assert on it separately to keep the
+        // metric and the behavior it describes from drifting apart.
+        ASSERT_EQ(EstimationSource::Metadata, ndvEstimate.ndv.source());
+        ASSERT_EQ(1, ceMetrics.numUniqueIndexesUsedForNDV);
+        // The recorded estimate captures the unique-index NDV shortcut.
+        ASSERT_EQ(10.0, ndvEstimate.ndv.toDouble());
+        ASSERT_EQ(JoinNdvEstimateSource::kUniqueIndex, ndvEstimate.source);
     }
 }
 
@@ -380,23 +431,35 @@ TEST_F(JoinPredicateEstimatorFixture, JoinPredicateSelUsesUniqueFieldsCompoundJo
     samplingEstimators[bNss] = std::make_unique<FakeNdvEstimator>(
         CardinalityEstimate{CardinalityType{20}, EstimationSource::Sampling});
     auto jCtx = makeContext();
+    OpDebug::JoinOptimizationMetrics::PlanEnumerationMetrics ceMetrics;
 
     // Selectivity test without unique information. Here the selectivity estimate comes from
     // 1 / NDV(a.foo, a.bar) = 1 / 5 = 0.2
     {
-        auto selEst = JoinCardinalityEstimator::joinPredicateSel(
-            jCtx, samplingEstimators, jCtx.joinGraph.getEdge(0));
+        auto ndvEstimate = JoinCardinalityEstimator::joinPredicateSel(
+            jCtx, samplingEstimators, jCtx.joinGraph.getEdge(0), ceMetrics);
         auto expectedSel = SelectivityEstimate{SelectivityType{0.2}, EstimationSource::Sampling};
-        ASSERT_EQ(expectedSel, selEst);
+        ASSERT_EQ(expectedSel, ndvEstimate.selectivity);
+        // NDV came from sampling, so the unique-index shortcut was not taken.
+        ASSERT_EQ(0, ceMetrics.numUniqueIndexesUsedForNDV);
+        // The recorded estimate captures the sampled NDV and its provenance. The field paths are
+        // reported in canonical sorted order.
+        ASSERT_EQ(5.0, ndvEstimate.ndv.toDouble());
+        ASSERT_EQ(JoinNdvEstimateSource::kSampling, ndvEstimate.source);
     }
     // Selectivity test with unique information. Tell the context that {"foo", "bar"} are unique.
     // This should change our NDV estimate to 10, giving a new selectivity of 0.1.
     {
         jCtx.uniqueFieldInfo.emplace(aNss, buildUniqueFieldInfo({fromjson("{foo: 1, bar: 1}")}));
-        auto selEst = JoinCardinalityEstimator::joinPredicateSel(
-            jCtx, samplingEstimators, jCtx.joinGraph.getEdge(0));
+        auto ndvEstimate = JoinCardinalityEstimator::joinPredicateSel(
+            jCtx, samplingEstimators, jCtx.joinGraph.getEdge(0), ceMetrics);
         auto expectedSel = SelectivityEstimate{SelectivityType{0.1}, EstimationSource::Sampling};
-        ASSERT_EQ(expectedSel, selEst);
+        ASSERT_EQ(expectedSel, ndvEstimate.selectivity);
+        ASSERT_EQ(EstimationSource::Metadata, ndvEstimate.ndv.source());
+        ASSERT_EQ(1, ceMetrics.numUniqueIndexesUsedForNDV);
+        // The recorded estimate captures the unique-index NDV shortcut.
+        ASSERT_EQ(10.0, ndvEstimate.ndv.toDouble());
+        ASSERT_EQ(JoinNdvEstimateSource::kUniqueIndex, ndvEstimate.source);
     }
 }
 

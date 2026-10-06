@@ -3,6 +3,7 @@
 
 #include "mongo/db/extension/host/document_source_extension_optimizable.h"
 
+#include "mongo/base/checked_cast.h"
 #include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/db/extension/host/document_source_extension_for_query_shape.h"
 #include "mongo/db/extension/host/extension_search_server_status.h"
@@ -168,16 +169,10 @@ LiteParsedDesugarer::StageExpander
             return pipeline->replaceStageWith(index, std::move(expanded));
         };
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(RegisterStageExpanderForLiteParsedExtensionExpandable,
-                                     ("EndStageIdAllocation"))
-(InitializerContext*) {
-    tassert(11533001,
-            "ExpandableStageParams::id must be allocated before registering expander",
-            ExpandableStageParams::id != StageParams::kUnallocatedId);
-    LiteParsedDesugarer::registerStageExpander(
-        ExpandableStageParams::id,
-        DocumentSourceExtensionOptimizable::LiteParsedExpandable::stageExpander);
-}
+REGISTER_LITE_PARSED_DESUGARER_STAGE_EXPANDER(
+    extensionExpandable,
+    ExpandableStageParams::id,
+    DocumentSourceExtensionOptimizable::LiteParsedExpandable::stageExpander);
 
 // TODO SERVER-121094 Remove this check when the extension can do this through
 // bindResolvedNamespace().
@@ -635,7 +630,7 @@ void DocumentSourceExtensionOptimizable::applyPipelineSuffixDependencies(
     _logicalStage->applyPipelineSuffixDependencies(&deps);
 }
 
-void DocumentSourceExtensionOptimizable::propagatePipelineSuffixDependencies(
+void DocumentSourceExtensionOptimizable::applyPipelineSuffixDependencies(
     const DepsTracker& deps, const std::set<std::string>& builtinVarRefs) {
     const host_connector::PipelineDependenciesAdapter adapter(deps, builtinVarRefs);
     applyPipelineSuffixDependencies(adapter);
@@ -664,7 +659,7 @@ bool extensionApplyDependenciesPrecondition(
 
 bool extensionApplyDependenciesTransform(
     rule_based_rewrites::pipeline::PipelineRewriteContext& ctx) {
-    auto* stage = dynamic_cast<DocumentSourceExtensionOptimizable*>(&ctx.current());
+    auto* stage = checked_cast<DocumentSourceExtensionOptimizable*>(&ctx.current());
     const host_connector::PipelineDependenciesAdapter adapter(
         ctx.getPipelineSuffixDependencies(), ctx.getBuiltInVariableRefsInPipelineSuffix());
     stage->applyPipelineSuffixDependencies(adapter);

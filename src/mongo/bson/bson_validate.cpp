@@ -33,6 +33,7 @@
 #include <utility>
 #include <vector>
 
+#include <absl/container/inlined_vector.h>
 #include <fmt/format.h>
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
@@ -86,7 +87,7 @@ constexpr ErrorCodes::Error InvalidBSONColumn = ErrorCodes::InvalidBSONColumn;
 
 class DefaultValidator {
 public:
-    void checkNonConformantElem(const char* ptr, uint32_t offsetToValue, uint8_t type) {}
+    void checkNonConformantElem(const char* ptr, uint32_t offsetToValue, const int8_t type) {}
 
     void checkDuplicateFieldName() {}
 
@@ -99,7 +100,7 @@ public:
 
 class ExtendedValidator {
 public:
-    void checkNonConformantElem(const char* ptr, uint32_t offsetToValue, uint8_t type) {
+    void checkNonConformantElem(const char* ptr, uint32_t offsetToValue, const int8_t type) {
         // Increments the pointer to the actual element value.
         BSONElementValue bsonElemVal(ptr + offsetToValue);
         switch (type) {
@@ -107,9 +108,14 @@ public:
                 const auto binData = bsonElemVal.BinData();
                 switch (binData.type) {
                     case BinDataType::Column: {
-                        // Check for exceptions when decompressing.
-                        // Calling size() decompresses the entire column.
-                        BSONColumn(BSONElement(ptr)).size();
+                        // Check for exceptions when decompressing. The block-based decoder is used
+                        // over BSONColumn's iterator API, and the materialized elements are
+                        // discarded, as we only care about whether decoding throws.
+                        bsoncolumn::DiscardingContainer<BSONElement> elements;
+                        bsoncolumn::BSONColumnBlockBased(static_cast<const char*>(binData.data),
+                                                         binData.length)
+                            .decompress<bsoncolumn::BSONElementMaterializer>(
+                                elements, new BSONElementStorage());
                         break;
                     }
                     case BinDataType::Encrypt:
@@ -190,7 +196,7 @@ public:
         _objFrames.push_back({.type = BSONType::object, .indexCounter = 0});
     }
 
-    void checkNonConformantElem(const char* ptr, uint32_t offsetToValue, uint8_t type) {
+    void checkNonConformantElem(const char* ptr, uint32_t offsetToValue, const int8_t type) {
         // Validate that array indices are monotonically increasing base-10 strings, and field
         // names are UTF8 strings.
         _checkFieldName(ptr);
@@ -338,7 +344,6 @@ private:
 template <bool precise>
 Status _doValidateColumn(const char* originalBuffer,
                          uint64_t maxLength,
-                         uint64_t& accUncompressedSize,
                          BSONValidateModeEnum mode,
                          ValidationVersion validationVersion);
 
@@ -376,14 +381,6 @@ public:
             const char* end = _currFrame->end = _data + len;
             uassert(InvalidBSON, "BSON object not terminated with EOO", end[-1] == 0);
             _validateIterative(Cursor{cursor.ptr, end});
-
-            // Last, check memory limit for uncompressed size. This calculation cannot overflow in a
-            // int64 because our BSON limit is 16MB.
-            if (MONGO_unlikely(len + _accumulatedUncompressedColumnSize >=
-                               (uint64_t)bsonMaxExpandedMemUsage.loadRelaxed())) {
-                uassertExceedsMemoryLimit(_accumulatedUncompressedColumnSize, len);
-            }
-
         } catch (const ExceptionFor<ErrorCategory::ValidationError>& e) {
             return Status(e.code(), str::stream() << e.what() << " " << _context());
         }
@@ -409,8 +406,9 @@ public:
         // multiple instances or an EOO.  Only resume with the iterative loop if
         // we have nested objects
         _currElem = _data;
-        const char* ptr = _validateElem<false>(Cursor{_data + 2, _data + _maxLength}, *_data);
-        _validator.checkNonConformantElem(_data, 2, *_data);
+        const int8_t type = ConstDataView(_data).read<int8_t>();
+        const char* ptr = _validateElem<false>(Cursor{_data + 2, _data + _maxLength}, type);
+        _validator.checkNonConformantElem(_data, 2, type);
 
         if (_firstFrameUpdated) {
             // We know that type was kObject/kArray/kCodeWScope
@@ -433,7 +431,6 @@ private:
     void inline setupValidation() {
         _currFrame = _frames.begin();
         _currElem = nullptr;
-        _accumulatedUncompressedColumnSize = 0;
         auto maxFrames = BSONDepth::getMaxAllowableDepth() + 1;  // A flat BSON has one frame.
         uassert(InvalidBSON, "Cannot enforce max nesting depth", _frames.size() <= maxFrames);
     }
@@ -442,7 +439,11 @@ private:
      * Extra information for each nesting level in the precise validation mode.
      */
     struct PreciseFrameInfo {
-        BSONElement elem;  // _id for top frame, unchecked Object, Array or CodeWScope otherwise.
+        // Points to the start (type byte) of the element that started this nesting level
+        // (Object, Array, or CodeWScope). An exception to this case is the CodeWScope scope
+        // frame (see _pushCodeWithScope), where nestedElemStart points to the NUL terminator
+        // of the code string.
+        const char* nestedElemStart = nullptr;
     };
 
     struct Frame : public std::conditional<precise, PreciseFrameInfo, Empty>::type {
@@ -502,8 +503,7 @@ private:
         _currFrame->end = obj + len;
 
         if constexpr (precise) {
-            auto nameLen = obj - _currElem - 1;  // exclude type byte
-            _currFrame->elem = BSONElement(_currElem, nameLen, BSONElement::TrustedInitTag{});
+            _currFrame->nestedElemStart = _currElem;
         }
         return cursor.ptr;
     }
@@ -516,7 +516,7 @@ private:
         return true;
     }
 
-    const char* _validateSpecial(Cursor cursor, uint8_t type) {
+    const char* _validateSpecial(Cursor cursor, int8_t type) {
         switch (type) {
             case stdx::to_underlying(BSONType::binData): {
                 auto count = cursor.template read<uint32_t>();
@@ -530,11 +530,8 @@ private:
                     /* do not pass down cursor; we want to reset the nesting depth */
                     uassert(NonConformantBSON,
                             "Invalid BSON column",
-                            _doValidateColumn<precise>(columnStart,
-                                                       count,
-                                                       _accumulatedUncompressedColumnSize,
-                                                       _validator.validateMode(),
-                                                       _validationVersion)
+                            _doValidateColumn<precise>(
+                                columnStart, count, _validator.validateMode(), _validationVersion)
                                 .isOK());
                 }
                 break;
@@ -552,8 +549,7 @@ private:
                 cursor.skipString();  // Like String, but...
                 cursor.skip(12);      // ...also skip the 12-byte ObjectId.
                 break;
-            case static_cast<uint8_t>(
-                stdx::to_underlying(BSONType::minKey)):  // Need to cast, as MinKey is negative.
+            case stdx::to_underlying(BSONType::minKey):
             case stdx::to_underlying(BSONType::maxKey):
                 cursor.skip(0);  // Force validation of the ptr after skipping past the field name.
                 break;
@@ -579,17 +575,21 @@ private:
         if constexpr (precise) {
             // When ending the scope of a CodeWScope, pop the extra dummy frame and check its
             // size.
-            if (_currFrame != _frames.begin() &&
-                (_currFrame - 1)->elem.type() == BSONType::codeWScope) {
-                invariant(_popFrame());
-                uassert(InvalidBSON, "incorrect BSON length", cursor.ptr == _currFrame->end);
+            if (_currFrame != _frames.begin()) {
+                if (auto nestedElemStart = (_currFrame - 1)->nestedElemStart;
+                    nestedElemStart != nullptr &&
+                    static_cast<BSONType>(ConstDataView(nestedElemStart).read<int8_t>()) ==
+                        BSONType::codeWScope) {
+                    invariant(_popFrame());
+                    uassert(InvalidBSON, "incorrect BSON length", cursor.ptr == _currFrame->end);
+                }
             }
         }
     }
 
     template <bool nestedFrame>
-    const char* _validateElem(Cursor cursor, uint8_t type) {
-        if (MONGO_unlikely(type > stdx::to_underlying(BSONType::jsTypeMax)))
+    const char* _validateElem(Cursor cursor, int8_t type) {
+        if (MONGO_unlikely(type < 0 || type > stdx::to_underlying(BSONType::jsTypeMax)))
             return _validateSpecial(cursor, type);
 
         auto style = kTypeInfoTable[type];
@@ -622,7 +622,7 @@ private:
             // is safe.
             uassert(InvalidBSON, "BSON size is larger than buffer size", cursor.ptr < cursor.end);
             while (size_t len = cursor.strlen()) {
-                uint8_t type = *cursor.ptr;
+                const int8_t type = ConstDataView(cursor.ptr).read<int8_t>();
                 _currElem = cursor.ptr;
                 // In case _currElem is moved (for instance when the type is CodeWScope).
                 auto elemStart = cursor.ptr;
@@ -634,10 +634,9 @@ private:
                 _validator.checkNonConformantElem(elemStart, len + 1, type);
 
                 if constexpr (precise) {
-                    // See if the _id field was just validated. If so, set the global scope
-                    // element.
+                    // See if the _id field was just validated. If so, capture it for error context.
                     if (_currFrame == _frames.begin() && std::string_view(_currElem + 1) == "_id"sv)
-                        _currFrame->elem = BSONElement(_currElem);  // This is fully validated now.
+                        _id = BSONElement(_currElem);  // This is fully validated now.
                 }
                 dassert(cursor.ptr < cursor.end);
             }
@@ -658,63 +657,37 @@ private:
         str::stream ctx;
         ctx << "in element with field name '";
         if constexpr (precise) {
-            std::for_each(_frames.begin() + 1,
-                          _currFrame + (_currFrame != _frames.end()),
-                          [&](auto& frame) { ctx << frame.elem.fieldName() << "."; });
+            std::for_each(
+                _frames.begin() + 1, _currFrame + (_currFrame != _frames.end()), [&](auto& frame) {
+                    // `nestedElemStart` is the type byte of the Object/Array/CodeWScope that
+                    // opened this frame. Skip when it was never assigned.
+                    // Also skip the CodeWScope *scope* frame (see _pushCodeWithScope), which
+                    // stores the code string's null terminator as a dummy element.
+                    if (frame.nestedElemStart && *frame.nestedElemStart) {
+                        // Field name was validated for null termination before this frame was
+                        // pushed.
+                        ctx << frame.nestedElemStart + 1 << ".";
+                    }
+                });
         }
-        ctx << (_currElem ? _currElem + 1 : "?") << "'";
+        // Also prints "?" for CodeWScope scope frame, see comment above.
+        ctx << (_currElem && *_currElem ? _currElem + 1 : "?") << "'";
 
         if constexpr (precise) {
-            auto _id = _frames.begin()->elem;
-            ctx << " in object with " << (_id ? BSONElement(_id).toString() : "unknown _id");
+            ctx << " in object with " << (_id ? _id.toString() : "unknown _id");
         }
         return str::escape(ctx);
-    }
-
-    /**
-     * Throws a uassert with a rate-limited log. Allows logging once per minute.
-     *
-     * 'accumLen' is the total expanded size to include in the log message
-     * 'objLen' is the size of the unexpanded BSONObj to include in the log message
-     */
-    static void uassertExceedsMemoryLimit(uint64_t accumLen, int32_t objLen) {
-        // Atomics to implement lockless log rate limiting
-        static Atomic<long long> lastLogTime{std::numeric_limits<long long>::min()};
-        static Atomic<long long> numDocsExceedLimit{0};
-
-        // Keep track on how many times we've exceeded the limit
-        auto num = numDocsExceedLimit.addAndFetch(1);
-
-        // Perform a log at most once a minute
-        auto now = Date_t::now();
-        if (now > Date_t::fromMillisSinceEpoch(lastLogTime.load()) + Seconds(60)) {
-            // Update atomic first to minimize risk that more logs slip in during the window
-            lastLogTime.store(now.toMillisSinceEpoch());
-
-            // Perform log. This is internally serialized so important that we have a
-            // backoff.
-            LOGV2_WARNING(11761700,
-                          "BSON object would exceed memory limit when expanding compressed data",
-                          "objsize"_attr = objLen,
-                          "expandedsize"_attr = accumLen,
-                          "num"_attr = num,
-                          "limit"_attr = bsonMaxExpandedMemUsage.load());
-        }
-
-        // Always respond with error when we are over the limit
-        uasserted(ErrorCodes::ExceededMemoryLimit,
-                  "BSON object would exceed memory limit when expanding compressed data");
     }
 
     const char* const _data;  // The data buffer to check.
     const size_t _maxLength;  // The size of the data buffer. The BSON object may be smaller.
     const char* _currElem = nullptr;  // Element to validate: only the name is known to be good.
     typename Frames::iterator _currFrame;  // Frame currently being validated.
-    Frames _frames;  // Has end pointers to check and the containing element for precise mode.
+    Frames _frames;   // Has end pointers to check and the containing element for precise mode.
+    BSONElement _id;  // The _id element of the root object. Used in error context string.
     BSONValidator _validator;
     ValidationVersion _validationVersion;
     bool _insideColumn;
-    uint64_t _accumulatedUncompressedColumnSize;
     bool _firstFrameUpdated = false;  // Has the first frame received nested while measuring an elem
 };
 
@@ -739,114 +712,9 @@ Status _doValidate(const char* originalBuffer,
 
 template <bool precise>
 class ColumnValidator {
-private:
-    /*
-     * Helper class to estimate amount of uncompressed memory stored in a BSONColumn.
-     *
-     * The estimator is not exact and it is possible to specifically craft BSONColumn that contain
-     * logical data that exceeds this estimate by 2x. These cases are very unlikely in a real
-     * workload, but this constitutes a ceiling of actual memory usage by multiplying this estimate
-     * by 2.
-     */
-    class DecompressedMemoryEstimator {
-    public:
-        DecompressedMemoryEstimator(uint64_t& accUncompressedSize)
-            : _accUncompressedSize(accUncompressedSize) {}
-
-        // Does not throw
-        void onUncompressedElement(BSONType type, int size) {
-            // String and Code type have variable length that can change in the delta encoding up to
-            // 16 bytes. For the estimate to be reasonably bounded we estimate strings to use at
-            // least 8 bytes. This creates a 50% ceiling for the error when a small string is
-            // enlarged to a 16 byte string. However, it also results us to overestimate small
-            // strings with up to 8 bytes. With the current logical max limit of 16/3 MB due to the
-            // control min/max fields we can store up to (16/3)*1024*1024/8 = ~700K empty strings (1
-            // type byte + 1 field name byte + 4 str count bytes + 1 null terminator byte + 1
-            // bsoncolumn terminator byte = 8 bytes per empty string). This results a worst case
-            // estimation of a stored object as 700K*(8+8) = 11.2MB which still fit well within our
-            // 200MB limit when multiplied with the default min elements per bucket of 10.
-            if (type == BSONType::string || type == BSONType::code) {
-                size = std::max(size, 8);
-            }
-
-            if (!_interleavedMode) {
-                // Start by flushing what we have collected so far
-                _flushSizeEstimate();
-
-                // Re-initialize memory tracking for this element
-                _lastUncompressedSize = size;
-                _numElements = 1;
-                _numStreams = 1;
-            } else {
-                // Estimate memory usage by adding this size to the reference and increase number of
-                // streams. This will create an average of all uncompressed sizes in this
-                // interleaved stream. This can cause the estimate to be off up to +/- 50% in the
-                // worst case.
-                _lastUncompressedSize += size;
-                _numElements += 1;
-                _numStreams += 1;
-            }
-        }
-
-        // May throw 'InvalidBSONColumn'
-        void onSimple8bControl(const char* block, size_t size) {
-            // Calculate number of elements stored in this block, this does not account for
-            // 'skipped' elements and serves as an upper bound.
-            _numElements += simple8b::count(block, size);
-        }
-
-        // May throw 'InvalidBSONColumn'
-        void onStartInterleavedMode(const BSONObj& refObj, uint8_t control) {
-            _interleavedMode = true;
-            _lastUncompressedSize = refObj.objsize();
-            // The reference object does not encode any elements
-            _numElements = 0;
-            // Calculate the number of scalar elements in this object based on the control byte
-            _numStreams = bsoncolumn::numInterleavedStreams(refObj, control);
-        }
-
-        // Does not throw
-        void onEndOfStream() {
-            // Start by flushing what we have collected so far
-            _flushSizeEstimate();
-
-            // Re-initialize state in case we exited interleaved mode. We leave
-            // '_lastUncompressedSize' as-is as the stream may continue with simple8b data that
-            // repeats previous element.
-            _numElements = 0;
-            _numStreams = 1;
-            _interleavedMode = false;
-        }
-
-    private:
-        void _flushSizeEstimate() {
-            // Account for amount of uncompressed elements. This multiplication (or addition) cannot
-            // overflow with our 16MB BSON limit in an int64. The maximum of RLE in BSONColumn is
-            // 30720 elements per 129 bytes of uncompressed data. With a 16MB compressed BSON limit,
-            // the maximum uncompressed size is 7.3 PB for a 2MB object repeated using 14MB of RLE
-            // sequences. This count is well within the limit of what can be stored in an int64.
-            _accUncompressedSize += (_lastUncompressedSize / _numStreams) * _numElements;
-        }
-
-        // Calculations in _flushSizeEstimate() could overflow if BSONObj size is allowed to reach
-        // ~531MB. This is much larger than our current 16MB limit. Static assertion that this
-        // continue to hold for the foreseeable future.
-        static_assert(BSONObjMaxUserSize < 1024 * 1024 * 512);
-
-        uint64_t& _accUncompressedSize;
-        uint64_t _lastUncompressedSize =
-            sizeof(boost::optional<BSONElement>);  // BSONColumn may start with simple8b blocks
-                                                   // which indicates skipped elements that are
-                                                   // represented by this type.
-        uint64_t _numElements = 0;
-        uint64_t _numStreams = 1;
-        bool _interleavedMode = false;
-    };
-
 public:
     static Status doValidateBSONColumn(const char* originalBuffer,
                                        int maxLength,
-                                       uint64_t& accUncompressedSize,
                                        BSONValidateModeEnum mode,
                                        ValidationVersion validationVersion) noexcept {
         // run control pointer through to end of buffer
@@ -861,8 +729,6 @@ public:
         const char* end = originalBuffer + maxLength;
         bool interleavedMode = false;
 
-        DecompressedMemoryEstimator memEstimator(accUncompressedSize);
-
         try {
             // Check this beforehand to ensure we cannot overflow the buffer with any strlen
             uassert(NonConformantBSON,
@@ -873,9 +739,6 @@ public:
                 uint8_t control = *ptr;
                 if (control == stdx::to_underlying(BSONType::eoo)) {
                     ptr++;
-
-                    memEstimator.onEndOfStream();
-
                     if (interleavedMode) {
                         interleavedMode = false;
                     } else {
@@ -887,7 +750,6 @@ public:
                     }
                 } else if (bsoncolumn::isUncompressedLiteralControlByte(control)) {
                     int size;
-
                     if (MONGO_likely(mode == BSONValidateModeEnum::kDefault))
                         size = ValidateBuffer<precise, DefaultValidator>(
                                    ptr, end - ptr, DefaultValidator(), validationVersion, true)
@@ -903,9 +765,7 @@ public:
                     else
                         MONGO_UNREACHABLE;
 
-                    memEstimator.onUncompressedElement(static_cast<BSONType>(*ptr), size);
                     ptr += size;
-
                 } else if (bsoncolumn::isInterleavedStartControlByte(control)) {
                     // interleaved objects begin with a reference object, and then a series
                     // of diff blocks for followup objects, ending with an EOO. Nesting
@@ -934,9 +794,7 @@ public:
                     // we now know the reference object is valid and safe to interpret
                     BSONObj reference(ptr);
                     ptr += reference.objsize();
-
                     interleavedMode = true;
-                    memEstimator.onStartInterleavedMode(reference, control);
                 } else {
                     // Simple8b block sequence, just check for memory overflow of block count
                     uint8_t numBlocks = bsoncolumn::numSimple8bBlocksForControlByte(control);
@@ -944,8 +802,6 @@ public:
                     uassert(InvalidBSONColumn,
                             "BSONColumn blocks exceed buffer size",
                             ptr + size + 1 <= end);
-
-                    memEstimator.onSimple8bControl(ptr + 1, size);
                     ptr += 1 + size;
                 }
             }
@@ -961,7 +817,6 @@ public:
 template <bool precise>
 Status _doValidateColumn(const char* originalBuffer,
                          uint64_t maxLength,
-                         uint64_t& accUncompressedSize,
                          BSONValidateModeEnum mode,
                          ValidationVersion validationVersion) {
     if constexpr (precise) {
@@ -969,17 +824,16 @@ Status _doValidateColumn(const char* originalBuffer,
         // return a not-OK status for objects with CodeWScope or nesting exceeding 32 levels.
         // These cases and actual failures will rerun the precise version that gives a detailed
         // error context.
-        if (MONGO_likely(
-                ColumnValidator<false>::doValidateBSONColumn(
-                    originalBuffer, maxLength, accUncompressedSize, mode, validationVersion)
-                    .isOK()))
+        if (MONGO_likely(ColumnValidator<false>::doValidateBSONColumn(
+                             originalBuffer, maxLength, mode, validationVersion)
+                             .isOK()))
             return Status::OK();
 
         return ColumnValidator<true>::doValidateBSONColumn(
-            originalBuffer, maxLength, accUncompressedSize, mode, validationVersion);
+            originalBuffer, maxLength, mode, validationVersion);
     } else {
         return ColumnValidator<false>::doValidateBSONColumn(
-            originalBuffer, maxLength, accUncompressedSize, mode, validationVersion);
+            originalBuffer, maxLength, mode, validationVersion);
     }
 }
 
@@ -1011,9 +865,76 @@ Status validateBSONColumn(const char* originalBuffer,
                           int maxLength,
                           BSONValidateModeEnum mode,
                           ValidationVersion validationVersion) noexcept {
-    uint64_t uncompressedSize = 0;
-    return _doValidateColumn<true>(
-        originalBuffer, maxLength, uncompressedSize, mode, validationVersion);
+    return _doValidateColumn<true>(originalBuffer, maxLength, mode, validationVersion);
+}
+
+void uassertValidBSONFromJavaScript(const BSONObj& obj, std::string_view context) {
+    if (auto status = validateBSON(obj); !status.isOK()) {
+        std::string ctx{context};
+        uasserted(ErrorCodes::InvalidBSONFromJavaScript,
+                  str::stream() << ctx << ": " << status.toString());
+    }
+}
+
+namespace {
+
+/**
+ * Shared implementation of validateBSONDepthForUserStorage. If not a nullptr, 'topLevelVisitor' is
+ * invoked for every top-level element of 'obj' while the depth validation traversal is already
+ * visiting those elements. Does not return a status, but throws when encountering validation
+ * errors. If not a nullptr, the visitor is expected to be cheap (or a no-op) because it is called
+ * once per top-level field.
+ */
+template <typename F>
+void validateBSONDepthForUserStorageImpl(const BSONObj& obj, const F& topLevelVisitor) {
+    absl::InlinedVector<BSONObjIterator, 32> frames;
+    frames.emplace_back(obj);
+
+    while (!frames.empty()) {
+        if (!frames.back().more()) {
+            frames.pop_back();
+            continue;
+        }
+
+        const auto elem = frames.back().next();
+        if constexpr (!std::is_same_v<F, std::nullptr_t>) {
+            if (frames.size() == 1) {
+                topLevelVisitor(elem);
+            }
+        }
+
+        if (elem.type() == BSONType::object || elem.type() == BSONType::array) {
+            if (auto subObj = elem.embeddedObject(); !subObj.isEmpty()) {
+                // Empty subdocuments do not count toward the depth of a document.
+                const auto maxDepth = BSONDepth::getMaxDepthForUserStorage();
+                uassert(ErrorCodes::Overflow,
+                        fmt::format("object exceeds {} levels of nesting", maxDepth),
+                        frames.size() < maxDepth);
+                frames.emplace_back(subObj);
+            }
+        }
+    }
+}
+
+}  // namespace
+
+Status validateBSONDepthForUserStorage(const BSONObj& obj) {
+    try {
+        validateBSONDepthForUserStorageImpl(obj, nullptr);
+        return Status::OK();
+    } catch (const DBException& e) {
+        return e.toStatus();
+    }
+}
+
+Status validateBSONDepthForUserStorage(
+    const BSONObj& obj, const std::function<void(const BSONElement&)>& topLevelVisitor) {
+    try {
+        validateBSONDepthForUserStorageImpl(obj, topLevelVisitor);
+        return Status::OK();
+    } catch (const DBException& e) {
+        return e.toStatus();
+    }
 }
 
 }  // namespace mongo

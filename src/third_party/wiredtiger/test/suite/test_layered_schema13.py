@@ -112,8 +112,8 @@ class test_layered_schema13(wttest.WiredTigerTestCase, suite_subprocess, DisaggS
 
         conn_follow, session_follow = self.open_follower()
 
-        session_follow.create(self.uri, self.table_config)
         self.set_stable_epoch(10, conn_follow)
+        session_follow.create(self.uri, self.table_config)
 
         # Epoch equal to stable must fail.
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
@@ -136,7 +136,7 @@ class test_layered_schema13(wttest.WiredTigerTestCase, suite_subprocess, DisaggS
         """
         self.setup_leader_with_epoch()
 
-        conn_follow, session_follow = self.open_follower()
+        conn_follow, session_follow = self.open_follower_epoch(10)
 
         session_follow.create(self.uri, self.table_config)
         # No schema_epoch in the config: returns success without publishing anything.
@@ -148,7 +148,7 @@ class test_layered_schema13(wttest.WiredTigerTestCase, suite_subprocess, DisaggS
         self.checkpoint_and_advance(100, 2, conn_follow)
         # The create remains at the unpublished sentinel epoch, deferred past any stable epoch.
         self.assertFalse(self.uri_in_shared_metadata(conn_follow, self.uri))
-        self.assertFalse(self.uri_in_local_metadata(self.conn, self.uri))
+        self.assertFalse(self.uri_stable_exists(self.conn, self.uri))
 
         conn_follow.close('debug=(skip_checkpoint=true)')
 
@@ -168,6 +168,10 @@ class test_layered_schema13(wttest.WiredTigerTestCase, suite_subprocess, DisaggS
         self.setup_leader_with_epoch()
 
         conn_follow, session_follow = self.open_follower()
+
+        # Make sure the follower has a stable epoch set, so that it knows to treat new tables as
+        # unpublished.
+        self.set_stable_epoch(10, conn_follow)
 
         session_follow.create(self.uri, self.table_config)
         session_follow.close()
@@ -238,6 +242,6 @@ class test_layered_schema13(wttest.WiredTigerTestCase, suite_subprocess, DisaggS
         _, _, checkpoint_timestamp, _ = self.disagg_get_complete_checkpoint_ext(conn_inspect)
         self.assertEqual(checkpoint_timestamp, 1)
         self.assertFalse(self.uri_in_shared_metadata(conn_inspect, self.uri))
-        self.assertFalse(self.uri_in_local_metadata(conn_inspect, self.uri))
+        self.assertFalse(self.uri_stable_exists(conn_inspect, self.uri))
 
         conn_inspect.close('debug=(skip_checkpoint=true)')

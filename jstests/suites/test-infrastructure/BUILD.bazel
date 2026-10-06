@@ -41,19 +41,36 @@ load("//bazel/resmoke:resmoke.bzl", "resmoke_suite_test")
         "multiversion_sanity_check_last_lts_new_new_old": "last-lts",
         "multiversion_sanity_check_last_lts_new_old_new": "last-lts",
         "multiversion_sanity_check_last_lts_old_new_new": "last-lts",
+        "multiversion_sanity_check_last_patch_new_new_old": "last-patch",
+        "multiversion_sanity_check_last_patch_new_old_new": "last-patch",
+        "multiversion_sanity_check_last_patch_old_new_new": "last-patch",
     }.items()
 ]
 
 resmoke_suite_test(
     name = "resmoke_end2end_tests",
     config = "//buildscripts/resmokeconfig:suites/resmoke_end2end_tests.yml",
-    shard_count = 2,
+    data = [
+        "//buildscripts/modules/atlas:all_suite_configs",
+        "//buildscripts/resmokeconfig:all_files",
+        "//buildscripts/tests/resmoke_end2end:all_test_data",
+        "//buildscripts/tests/resmoke_end2end:js_debugger_test_deps",
+        "//etc:evergreen_config",
+        "//jstests/noPassthrough/shell/js:mochalite.js",
+        "//jstests/resmoke_selftest:all_subpackage_javascript_files",
+    ],
     tags = [
         "ci-default",
-        "incompatible_with_bazel_remote_test",  # Makes many assumptions about paths that are incompatible with sandboxing.
+        "incompatible_with_bazel_remote_test",  # Requires binaries from the system, such as `evergreen`.
     ],
+    target_compatible_with = select({
+        "//bazel/config:asan_enabled": ["@platforms//:incompatible"],
+        "//bazel/config:ubsan_enabled": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
     deps = [
         "//src/mongo/db:mongod",
+        "//src/mongo/s:mongos",
         "//src/mongo/shell:mongo",
     ],
 )
@@ -63,7 +80,6 @@ resmoke_suite_test(
     config = "//buildscripts/resmokeconfig:suites/unittest_shell_hang_analyzer.yml",
     tags = [
         "ci-release-critical",
-        "incompatible_with_bazel_remote_test",  # Expects a system python to be available: `python ./buildscripts/resmoke.py hang-analyzer ...` Unable to start program python: No such file or directory
         "requires_compile_variant",
         "requires_execution_on_windows_patch_build",
     ],

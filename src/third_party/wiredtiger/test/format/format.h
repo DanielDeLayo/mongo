@@ -87,6 +87,9 @@
 
 #define FORMAT_OPERATION_REPS 3 /* 3 thread operations sets */
 
+#define FOLLOWER_READ_ROWS 200  /* rows one follower snapshot read scans */
+#define FOLLOWER_READ_PASSES 12 /* times it re-reads them */
+
 #define FORMAT_PAD_BYTE '-'  /* modify pad byte */
 #define MAX_MODIFY_ENTRIES 5 /* maximum change vectors */
 #define REALLOC_MAX_TABLES 5 /* maximum number of tables with realloc_exact and realloc_malloc */
@@ -96,6 +99,9 @@
 /* Duration of the follower run in disagg switch mode. */
 #define DISAGG_SWITCH_FOLLOWER_OPS_SEC 10
 
+/* Post-drain window of continued leader writes (routed to ingest) before the write pause. */
+#define DISAGG_STEPDOWN_INGEST_WINDOW_SEC 10
+
 /* Number of RTS threads to use up to 10 (11 is for NULL config). */
 #define RTS_THREADS_MAX 11
 
@@ -104,6 +110,9 @@
 #define SESSION_PREFETCH_CFG_OFF "prefetch=(enabled=false)"
 
 #define MIN_TIMESTAMP 2 /* Minimum timestamp */
+
+/* Capacity of the static push-mode key rotation history. */
+#define KEY_PUSH_HISTORY_MAX 10 * WT_THOUSAND
 
 #include "format_config.h"
 extern CONFIG configuration_list[];
@@ -285,6 +294,7 @@ typedef struct {
 
     wt_timestamp_t replay_cached_committed; /* Our committed timestamp, cached */
     uint32_t replay_calculate_committed;    /* Times before recalculating cached committed */
+    wt_timestamp_t reopen_timestamp;        /* Timestamp recovered when reopening the database */
     wt_timestamp_t replay_start_timestamp;  /* Timestamp at the beginning of a run */
     FILE *replay_op_log;                    /* Predictable replay per-run operation log */
     wt_timestamp_t stop_timestamp;          /* If non-zero, stop when stable reaches this */
@@ -307,7 +317,8 @@ typedef struct {
      */
     RWLOCK timestamp_lock;
 
-    wt_timestamp_t stepdown_ts; /* Boundary timestamp when step-down is active; 0 if not active. */
+    /* Pause worker writes for the step-down checkpoint and role transition. */
+    volatile bool stepdown_pause_writes;
 
     volatile bool checkpoint_quit; /* Signal checkpoint thread to stop before workers finish. */
     volatile bool timestamp_quit;  /* Signal timestamp thread to stop before workers finish. */
@@ -335,16 +346,20 @@ typedef struct {
 #define PREFIX_LEN_CONFIG_MAX 80
     uint32_t prefix_len_max;
 
-    bool disagg_leader; /* If disaggregated storage role is configured as a leader. */
-    pid_t follower_pid; /* For multi-node disagg follower process */
+    volatile bool disagg_leader; /* If disaggregated storage role is configured as a leader. */
+    pid_t follower_pid;          /* For multi-node disagg follower process */
     char checkpoint_metadata[FILENAME_MAX]; /* Last checkpoint metadata picked up by follower. */
     DISAGG_MULTI_DB_HASH *disagg_multi_db_hash; /* Leader and follower database hash */
     int disagg_multi_sync_socket;               /* Socket for leader-follower sync */
 
+    /* Push-mode key rotation history, cleared on step-down; protected by key_push_lock. */
+    pthread_rwlock_t key_push_lock;
+    wt_timestamp_t key_push_history[KEY_PUSH_HISTORY_MAX]; /* Push-mode key rotation: timestamps */
+    size_t key_push_count; /* Number of pushed timestamps recorded */
+
     bool column_store_config;           /* At least one column-store table configured */
     bool disagg_storage_config;         /* If disaggregated storage is configured */
     bool multi_table_config;            /* If configuring multiple tables */
-    bool tiered_storage_config;         /* If tiered storage is configured */
     bool transaction_timestamps_config; /* If transaction timestamps configured on any table */
 
 #define CHECKPOINT_OFF 1
@@ -404,6 +419,9 @@ typedef struct {
     bool replay_again; /* Need to redo an operation at a timestamp. */
 
     volatile bool quit; /* thread should quit */
+
+    /* Set when the write pause has been observed with no transaction in flight. */
+    volatile bool pause_ack;
 
     uint64_t ops;    /* total operations */
     uint64_t commit; /* operation counts */
@@ -469,6 +487,12 @@ WT_THREAD_RET backup(void *);
 WT_THREAD_RET checkpoint(void *);
 WT_THREAD_RET compact(void *);
 WT_THREAD_RET follower(void *);
+WT_THREAD_RET follower_read_no_ts(void *);
+WT_THREAD_RET disagg_key_rotation(void *);
+void disagg_key_push_initial(WT_CONNECTION *, bool);
+void disagg_key_history_clear(void);
+void disagg_key_validate_after_checkpoint(WT_SESSION *);
+int follower_fetch_full_metadata(WT_SESSION *, WT_PAGE_LOG *, const WT_ITEM *, WT_ITEM *);
 WT_THREAD_RET hs_cursor(void *);
 WT_THREAD_RET import(void *);
 WT_THREAD_RET random_kv(void *);
@@ -476,6 +500,7 @@ WT_THREAD_RET timestamp(void *);
 
 uint32_t atou32(const char *, const char *, int);
 uint64_t checksum_database(WT_SESSION *);
+void abort_with_state_dump(WT_CONNECTION *, const char *) WT_GCC_FUNC_DECL_ATTRIBUTE((noreturn));
 void config_clear(void);
 void config_compat(const char **);
 void config_error(void);
@@ -512,6 +537,7 @@ void snap_init(TINFO *);
 void snap_op_init(TINFO *, wt_timestamp_t, bool);
 void snap_repeat_stable(WT_SESSION *, TINFO **, size_t);
 void snap_repeat_single(TINFO *);
+wt_timestamp_t snap_repeat_ts_span(void);
 int snap_repeat_txn(TINFO *);
 void snap_repeat_update(TINFO *, bool);
 void snap_teardown(TINFO *);
@@ -537,7 +563,6 @@ wt_timestamp_t replay_read_ts(TINFO *);
 void replay_rollback(TINFO *);
 void replay_run_begin(WT_SESSION *);
 void replay_run_end(WT_SESSION *);
-bool replay_stale_read_ts(TINFO *);
 int timestamp_query(const char *, wt_timestamp_t *);
 void timestamp_teardown(WT_SESSION *);
 void trace_config(const char *);
@@ -545,6 +570,7 @@ void trace_init(void);
 void trace_ops_init(TINFO *);
 void trace_teardown(void);
 void track(const char *, uint64_t);
+void track_msg(const char *, ...) WT_GCC_FUNC_DECL_ATTRIBUTE((format(printf, 1, 2)));
 void track_ops(TINFO *);
 void val_gen(TABLE *, WT_RAND_STATE *, WT_ITEM *, uint64_t);
 void val_gen_init(WT_ITEM *);

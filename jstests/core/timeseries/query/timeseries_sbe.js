@@ -2,6 +2,7 @@
  * Tests that we do lower queries over time-series to SBE when the corresponding flags are enabled.
  *
  * @tags: [
+ *   uses_explain,
  *   requires_timeseries,
  *   # Aggregation with explain may return incomplete results if interrupted by a stepdown.
  *   does_not_support_stepdowns,
@@ -247,7 +248,7 @@ runTest({
     shouldUseSbe: sbeUnpackPushdownEnabled,
 
     // Everything should get pushed into SBE except setWindowFields.
-    aggStages: sbeFullyEnabled ? [] : ["$_internalSetWindowFields"],
+    aggStages: ["$_internalSetWindowFields"],
 });
 
 // $lookup-$unwind is not lowered to SBE for time-series collections in default settings.

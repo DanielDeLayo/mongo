@@ -19,6 +19,7 @@
 #include "mongo/db/commands/server_status/server_status_metric.h"
 #include "mongo/db/curop_bson_helpers.h"
 #include "mongo/db/database_name_util.h"
+#include "mongo/db/exec/mutable_bson/document.h"
 #include "mongo/db/namespace_string_util.h"
 #include "mongo/db/operation_context_options_gen.h"
 #include "mongo/db/profile_filter.h"
@@ -49,12 +50,14 @@
 #include "mongo/util/clock_source.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/log_with_sampling.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
 #include <tuple>
 
@@ -175,6 +178,25 @@ BSONObj serializeDollarDbInOpDescription(boost::optional<TenantId> tenantId,
                                          .firstElement());
     return newCmdObj;
 }
+
+struct AggregateAdmissionStats {
+    std::int32_t admissions = 0;
+    std::int32_t lowPriorityAdmissions = 0;
+    Microseconds totalTimeQueued{0};
+    bool loadShed = false;
+};
+
+AggregateAdmissionStats sumAdmissionStatsAcrossGates(OperationContext* opCtx) {
+    AggregateAdmissionStats stats;
+    for (auto&& [queueType, lookup] : TicketHolderQueueStats::getQueueMetricsRegistry()) {
+        const AdmissionContext* admCtx = lookup(opCtx);
+        stats.admissions += admCtx->getAdmissions();
+        stats.lowPriorityAdmissions += admCtx->getLowAdmissions();
+        stats.totalTimeQueued += admCtx->totalTimeQueuedMicros();
+        stats.loadShed = stats.loadShed || admCtx->getLoadShed();
+    }
+    return stats;
+}
 }  // namespace
 
 Counter64& CurOp::totalInterruptChecks_forTest() {
@@ -260,9 +282,7 @@ private:
         // of the current operation. Also store the current ticket wait time as the base ticket
         // wait time.
         if (_top) {
-            const boost::optional<ExecutionAdmissionContext> admCtx =
-                ExecutionAdmissionContext::get(opCtx());
-            curOp->_resourceStatsBase = curOp->getAdditiveResourceStats(admCtx);
+            curOp->_resourceStatsBase = curOp->getAdditiveResourceStats();
         }
 
         _top = curOp;
@@ -509,20 +529,22 @@ void CurOp::_setEndOfOpMetrics(OpDebug::AdditiveMetrics& metrics) {
                          admCtx.getMaxAcquisitionDelinquencyMillis())};
         }
 
-        if (admCtx.getAdmissions() > 0) {
+        const auto admissionStats = sumAdmissionStatsAcrossGates(opCtx());
+        if (admissionStats.admissions > 0) {
             metrics.totalTimeQueuedMicros =
                 metrics.totalTimeQueuedMicros.value_or(Microseconds(0)) +
-                admCtx.totalTimeQueuedMicros();
-            metrics.totalAdmissions = metrics.totalAdmissions.value_or(0) + admCtx.getAdmissions();
+                admissionStats.totalTimeQueued;
+            metrics.totalAdmissions =
+                metrics.totalAdmissions.value_or(0) + admissionStats.admissions;
             // Low priority admissions come from AdmissionContext::getLowAdmissions().
             // Normal priority admissions = total - low.
-            auto lowAdmissions = admCtx.getLowAdmissions();
-            auto normalAdmissions = admCtx.getAdmissions() - lowAdmissions;
+            auto lowAdmissions = admissionStats.lowPriorityAdmissions;
+            auto normalAdmissions = admissionStats.admissions - lowAdmissions;
             metrics.totalNormalPriorityAdmissions =
                 metrics.totalNormalPriorityAdmissions.value_or(0) + normalAdmissions;
             metrics.totalLowPriorityAdmissions =
                 metrics.totalLowPriorityAdmissions.value_or(0) + lowAdmissions;
-            metrics.wasLoadShed = metrics.wasLoadShed.value_or(false) || admCtx.getLoadShed();
+            metrics.wasLoadShed = metrics.wasLoadShed.value_or(false) || admissionStats.loadShed;
             metrics.wasDeprioritized =
                 metrics.wasDeprioritized.value_or(false) || admCtx.getPriorityLowered();
             metrics.wasMarkedNonDeprioritizable =
@@ -625,7 +647,7 @@ void CurOp::updateStatsOnTransactionUnstash(WithLock) {
     // These stats have accrued outside of this CurOp instance so we will ignore/subtract them when
     // reporting on this operation.
     _initializeResourceStatsBaseIfNecessary();
-    _resourceStatsBase->addForUnstash(getAdditiveResourceStats(boost::none));
+    _resourceStatsBase->addForUnstash(getAdditiveResourceStats());
 }
 
 void CurOp::updateStatsOnTransactionStash(WithLock) {
@@ -634,7 +656,7 @@ void CurOp::updateStatsOnTransactionStash(WithLock) {
     // stats which includes the snapshot of stats when it was unstashed. This stats delta on
     // stashing is added when reporting on this operation.
     _initializeResourceStatsBaseIfNecessary();
-    _resourceStatsBase->subtractForStash(getAdditiveResourceStats(boost::none));
+    _resourceStatsBase->subtractForStash(getAdditiveResourceStats());
 }
 
 void CurOp::setMemoryTrackingStats(const int64_t inUseTrackedMemoryBytes,
@@ -733,16 +755,16 @@ Milliseconds CurOp::_sumBlockedTimeTotal() {
                                              ->getPrepareConflictTracker()
                                              .getThisOpPrepareConflictDuration();
     auto cumulativeLockWaitTime = Microseconds(locker->stats().getCumulativeWaitTimeMicros());
-    auto timeQueuedForTickets = ExecutionAdmissionContext::get(opCtx()).totalTimeQueuedMicros();
+    auto timeQueuedForAdmission = AdmissionContext::getTotalTimeQueuedForAdmission(opCtx());
     auto timeQueuedForFlowControl = Microseconds(locker->getFlowControlStats().timeAcquiringMicros);
 
     if (_resourceStatsBase) {
         cumulativeLockWaitTime -= _resourceStatsBase->cumulativeLockWaitTime;
-        timeQueuedForTickets -= _resourceStatsBase->timeQueuedForTickets;
+        timeQueuedForAdmission -= _resourceStatsBase->timeQueuedForAdmission;
         timeQueuedForFlowControl -= _resourceStatsBase->timeQueuedForFlowControl;
     }
 
-    return duration_cast<Milliseconds>(cumulativeLockWaitTime + timeQueuedForTickets +
+    return duration_cast<Milliseconds>(cumulativeLockWaitTime + timeQueuedForAdmission +
                                        timeQueuedForFlowControl + prepareConflictDurationMicros);
 }
 
@@ -1133,6 +1155,17 @@ void CurOp::reportState(BSONObjBuilder* builder,
 
         curop_bson_helpers::appendObjectTruncatingAsNecessary(
             "command", redactedCommandBuilder.done(), maxQuerySize, *builder);
+    } else if (_command) {
+        // Apply the command's own field-level redaction (the same the slow-query log uses) so this
+        // diagnostic output stays consistent with the log.
+        mutablebson::Document cmdToLog(obj, mutablebson::Document::kInPlaceDisabled);
+        _command->snipForLogging(&cmdToLog);
+        curop_bson_helpers::appendObjectTruncatingAsNecessary(
+            "command", cmdToLog.getObject(), maxQuerySize, *builder);
+    } else if (isCommand()) {
+        // No resolved Command* for this command; report it as "unrecognized" rather than echoing
+        // the request, consistent with the slow-query log.
+        builder->append("command", "unrecognized");
     } else {
         curop_bson_helpers::appendObjectTruncatingAsNecessary(
             "command", obj, maxQuerySize, *builder);
@@ -1235,10 +1268,11 @@ void CurOp::reportState(BSONObjBuilder* builder,
             BSONObjBuilder sub(builder->subobjStart("delinquencyInfo"));
             OpDebug::appendDelinquentInfo(opCtx, sub);
         }
-        if (admCtx.getAdmissions() > 0) {
-            builder->append("totalTimeQueuedMicros", admCtx.totalTimeQueuedMicros().count());
-            builder->append("totalAdmissions", admCtx.getAdmissions());
-            builder->append("wasLoadShed", admCtx.getLoadShed());
+        const auto admissionStats = sumAdmissionStatsAcrossGates(opCtx);
+        if (admissionStats.admissions > 0) {
+            builder->append("totalTimeQueuedMicros", admissionStats.totalTimeQueued.count());
+            builder->append("totalAdmissions", admissionStats.admissions);
+            builder->append("wasLoadShed", admissionStats.loadShed);
             builder->append("wasDeprioritized", admCtx.getPriorityLowered());
         }
     }
@@ -1250,8 +1284,52 @@ void CurOp::reportState(BSONObjBuilder* builder,
     }
 }
 
-CurOp::AdditiveResourceStats CurOp::getAdditiveResourceStats(
-    const boost::optional<ExecutionAdmissionContext>& admCtx) {
+void CurOp::reportDebugInfo(BSONObjBuilder* builder) {
+    builder->append("ns",
+                    NamespaceStringUtil::serialize(_nss, SerializationContext::stateDefault()));
+
+    // Report the redacted command, snipped for logging in the same way as the slow-op log line.
+    auto query = curop_bson_helpers::appendCommentField(opCtx(), _opDescription);
+    if (!query.isEmpty()) {
+        if (_isCommand) {
+            if (const Command* curCommand = getCommand()) {
+                builder->append("command", redact(snipCommandForLogging(curCommand, query)));
+            } else {
+                // We don't know what the request payload is intended to be, so it might be
+                // sensitive, and we don't know how to redact it properly without a 'Command*'.
+                builder->append("command", "unrecognized");
+            }
+        } else {
+            builder->append("command", redact(query));
+        }
+    }
+
+    if (_debug.planCacheShapeHash) {
+        builder->append("planCacheShapeHash", zeroPaddedHex(*_debug.planCacheShapeHash));
+    }
+    if (_debug.planCacheKey) {
+        builder->append("planCacheKey", zeroPaddedHex(*_debug.planCacheKey));
+    }
+
+    if (!_planSummary.empty()) {
+        builder->append("planSummary", _planSummary);
+    }
+
+    if (auto start = _start.load()) {
+        auto elapsedTimeTotal = computeElapsedTimeTotal(start, _end.load());
+        builder->append("secs_running", durationCount<Seconds>(elapsedTimeTotal));
+    }
+
+    builder->append("numYields", _numYields.load());
+
+    // Only report storage statistics that have already been gathered; do not call into the storage
+    // engine from here, as this runs while the lock manager buckets are held.
+    if (_debug.storageStats) {
+        builder->append("storage", _debug.storageStats->toBSON());
+    }
+}
+
+CurOp::AdditiveResourceStats CurOp::getAdditiveResourceStats() {
     CurOp::AdditiveResourceStats stats;
 
     auto locker = shard_role_details::getLocker(opCtx());
@@ -1260,9 +1338,10 @@ CurOp::AdditiveResourceStats CurOp::getAdditiveResourceStats(
     stats.timeQueuedForFlowControl =
         Microseconds(locker->getFlowControlStats().timeAcquiringMicros);
 
-    if (admCtx != boost::none) {
-        stats.timeQueuedForTickets = admCtx->totalTimeQueuedMicros();
-    }
+    // Snapshot the admission wait time over the same set of queues that _sumBlockedTimeTotal sums,
+    // so that a sub-operation's base does not leave the enclosing operation's queueing time
+    // attributed to it.
+    stats.timeQueuedForAdmission = AdmissionContext::getTotalTimeQueuedForAdmission(opCtx());
 
     return stats;
 }
@@ -1307,13 +1386,13 @@ void CurOp::AdditiveResourceStats::addForUnstash(const CurOp::AdditiveResourceSt
     lockStats.append(other.lockStats);
     cumulativeLockWaitTime += other.cumulativeLockWaitTime;
     timeQueuedForFlowControl += other.timeQueuedForFlowControl;
-    // timeQueuedForTickets is intentionally excluded as it is tracked separately
+    // timeQueuedForAdmission is intentionally excluded as it is tracked separately
 }
 
 void CurOp::AdditiveResourceStats::subtractForStash(const CurOp::AdditiveResourceStats& other) {
     lockStats.subtract(other.lockStats);
     cumulativeLockWaitTime -= other.cumulativeLockWaitTime;
     timeQueuedForFlowControl -= other.timeQueuedForFlowControl;
-    // timeQueuedForTickets is intentionally excluded as it is tracked separately
+    // timeQueuedForAdmission is intentionally excluded as it is tracked separately
 }
 }  // namespace mongo

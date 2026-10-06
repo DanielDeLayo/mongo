@@ -17,6 +17,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/feature_compatibility_version_parser.h"
 #include "mongo/db/generic_argument_util.h"
 #include "mongo/db/global_catalog/chunk_manager.h"
 #include "mongo/db/global_catalog/ddl/notify_sharding_event_gen.h"
@@ -34,6 +35,7 @@
 #include "mongo/db/namespace_string_util.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/distinct_command_gen.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/query/write_ops/write_ops_gen.h"
 #include "mongo/db/query/write_ops/write_ops_parsers.h"
 #include "mongo/db/repl/change_stream_oplog_notification.h"
@@ -177,7 +179,7 @@ void deleteCollection(OperationContext* opCtx,
                 auto now = VectorClock::get(getGlobalServiceContext())->getTime();
                 const auto clusterTime = now.clusterTime().asTimestamp();
                 NamespacePlacementType placementInfo(
-                    NamespaceString(nss), clusterTime, std::vector<ShardRef>{} /*shards*/);
+                    NamespaceString(nss), clusterTime, {} /*shards*/);
                 placementInfo.setUuid(uuid);
                 write_ops::InsertCommandRequest insertPlacementEntry(
                     NamespaceString::kConfigsvrPlacementHistoryNamespace, {placementInfo.toBSON()});
@@ -810,7 +812,7 @@ std::vector<BatchedCommandRequest> getOperationsToCreateOrShardCollectionOnShard
         NamespacePlacementType placementInfo{
             nss,
             placementVersion.getTimestamp(),
-            std::vector<mongo::ShardRef>(shardIds.cbegin(), shardIds.cend())};
+            std::vector<mongo::ShardId>(shardIds.cbegin(), shardIds.cend())};
         placementInfo.setUuid(uuid);
         return write_ops::InsertCommandRequest(NamespaceString::kConfigsvrPlacementHistoryNamespace,
                                                {placementInfo.toBSON()});
@@ -975,8 +977,14 @@ void cloneAuthoritativeCollectionMetadataToShards(
             str::stream() << "The collection " << nss.toStringForErrorMsg() << " is not tracked",
             cm.hasRoutingTable());
     std::set<ShardId> shardIds;
-    cm.getAllShardIds(&shardIds);
-
+    if (cm.isUnsplittable()) {
+        // We can just target the data shard, since the collection's single chunk can't be moved.
+        cm.getAllShardIds(&shardIds);
+    } else {
+        // For sharded collections, target all shards to cover current and historical chunk owners.
+        const auto allShardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+        shardIds.insert(allShardIds.begin(), allShardIds.end());
+    }
     // The DB primary must always know that a collection is tracked, even when it owns no chunks.
     shardIds.insert(primaryShardId);
 
@@ -1161,6 +1169,57 @@ void commitChunkOperationsMetadataToShardCatalog(
     sendAuthenticatedCommandToShards(opCtx, opts, shardIds);
 }
 
+multiversion::FeatureCompatibilityVersion getShardFCV(OperationContext* opCtx,
+                                                      const ShardId& shardId) {
+    const auto shard = uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId));
+
+    FindCommandRequest findCommand(NamespaceString::kServerConfigurationNamespace);
+    findCommand.setFilter(BSON("_id" << multiversion::kParameterName));
+    findCommand.setLimit(1);
+    findCommand.setReadConcern(repl::ReadConcernArgs(repl::ReadConcernLevel::kMajorityReadConcern));
+
+    const auto response = uassertStatusOK(
+        shard->runExhaustiveCursorCommand(opCtx,
+                                          ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                          DatabaseName::kAdmin,
+                                          findCommand.toBSON(),
+                                          Milliseconds(-1)));
+
+    tassert(13154100,
+            fmt::format("Could not find the featureCompatibilityVersion document on shard {}",
+                        shardId.toString()),
+            !response.docs.empty());
+
+    return uassertStatusOK(FeatureCompatibilityVersionParser::parse(response.docs.front()));
+}
+
+void assertShardsAreNotInFCVTransitionsForMovePrimary(
+    OperationContext* opCtx,
+    const ShardId& recipientShardId,
+    AuthoritativeMetadataAccessLevelEnum donorAccessLevel) {
+
+    uassert(ErrorCodes::ConflictingOperationInProgress,
+            "Cannot start a movePrimary operation while donor shard is modifying its FCV to either "
+            "upgrade or downgrade",
+            donorAccessLevel != AuthoritativeMetadataAccessLevelEnum::kWritesAllowed);
+
+    const auto recipientFCV = getShardFCV(opCtx, recipientShardId);
+    bool ddlAuthoritative = feature_flags::gAuthoritativeShardsDDL.isEnabledOnVersion(recipientFCV);
+    bool crudAuthoritative =
+        feature_flags::gAuthoritativeShardsCRUD.isEnabledOnVersion(recipientFCV);
+    uassert(
+        ErrorCodes::ConflictingOperationInProgress,
+        fmt::format(
+            "Cannot start movePrimary while recipient shard {} is in an FCV transition (FCV: {}). "
+            "Wait for setFeatureCompatibilityVersion to complete on all shards.",
+            recipientShardId.toString(),
+            multiversion::toString(recipientFCV)),
+        (donorAccessLevel == AuthoritativeMetadataAccessLevelEnum::kNone && !ddlAuthoritative &&
+         !crudAuthoritative) ||
+            (donorAccessLevel == AuthoritativeMetadataAccessLevelEnum::kWritesAndReadsAllowed &&
+             ddlAuthoritative && crudAuthoritative));
+}
+
 AuthoritativeMetadataAccessLevelEnum getGrantedAuthoritativeMetadataAccessLevel(
     const VersionContext& vCtx, const ServerGlobalParams::FCVSnapshot& snapshot) {
     const bool isAuthoritativeDDLEnabled =
@@ -1200,8 +1259,8 @@ boost::optional<ShardId> pickShardOwningCollectionChunks(OperationContext* opCtx
     return chunks.empty() ? boost::none : boost::optional<ShardId>(chunks[0].getShard());
 }
 
-std::vector<ShardRef> getListOfShardsOwningChunksForCollection(OperationContext* opCtx,
-                                                               const UUID& collUuid) {
+std::vector<ShardId> getListOfShardsOwningChunksForCollection(OperationContext* opCtx,
+                                                              const UUID& collUuid) {
     // Use the content of config.chunks to obtain the placement of the collection.
     // The request is equivalent to 'configDb.chunks.distinct("shard", {uuid:collectionUuid})'.
     DistinctCommandRequest distinctRequest(NamespaceString::kConfigsvrChunksNamespace);
@@ -1218,18 +1277,18 @@ std::vector<ShardRef> getListOfShardsOwningChunksForCollection(OperationContext*
                                 Shard::RetryPolicy::kIdempotent));
 
     uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(reply));
-    std::vector<ShardRef> shardRefs;
+    std::vector<ShardId> shardIds;
     for (const auto& valueElement : reply.response.getField("values").Array()) {
-        shardRefs.emplace_back(ShardRef::parse(valueElement));
+        shardIds.emplace_back(valueElement.String());
     }
-    return shardRefs;
+    return shardIds;
 }
 
 void upsertPlacementHistoryDocInTransaction(const txn_api::TransactionClient& txnClient,
                                             const NamespaceString& nss,
                                             const boost::optional<UUID>& uuid,
                                             const Timestamp& timestamp,
-                                            const std::vector<ShardRef>& shards,
+                                            const std::vector<ShardId>& shards,
                                             int stmtId) {
     write_ops::UpdateCommandRequest upsertPlacementChangeRequest(
         NamespaceString::kConfigsvrPlacementHistoryNamespace);

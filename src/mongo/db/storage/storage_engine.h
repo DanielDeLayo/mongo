@@ -15,6 +15,7 @@
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/storage_tier_gen.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/modules.h"
 #include "mongo/util/periodic_runner.h"
 #include "mongo/util/str.h"
@@ -22,6 +23,7 @@
 #include <compare>
 #include <initializer_list>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -74,8 +76,6 @@ public:
     using OldestActiveTransactionTimestampResult = StatusWith<boost::optional<Timestamp>>;
     using OldestActiveTransactionTimestampCallback =
         std::function<OldestActiveTransactionTimestampResult(Timestamp stableTimestamp)>;
-
-    using DropIdentCallback = std::function<void()>;
 
     /**
      * Information on last storage engine shutdown state that is relevant to the recovery process.
@@ -582,9 +582,7 @@ public:
      * - the 'dropTime' is sufficiently old to ensure no future data accesses
      * - and no holders of 'ident' remain (the index/collection is no longer in active use)
      */
-    virtual void addDropPendingIdent(const DropTime& dropTime,
-                                     std::shared_ptr<Ident> ident,
-                                     DropIdentCallback&& onDrop = nullptr) = 0;
+    virtual void addDropPendingIdent(const DropTime& dropTime, std::shared_ptr<Ident> ident) = 0;
 
     /**
      * Drops the data for the given ident which is not present in the catalog, but whose exact drop
@@ -693,19 +691,24 @@ public:
     /**
      * Configures the specified checkpoint as the starting point for recovery.
      */
-    virtual void setRecoveryCheckpointMetadata(std::string_view checkpointMetadata) = 0;
+    virtual Status setRecoveryCheckpointMetadata(std::string_view checkpointMetadata) = 0;
 
     /**
      * Configures the storage engine as the leader, allowing it to flush checkpoints to remote
      * storage.
+     * Invariants on failure.
+     * This is NOT idempotent - it will invariant if the storage engine is already in
+     * leader mode.
      */
     virtual void promoteToLeader() = 0;
 
     /**
-     * Configures the storage engine as a standby. Inverse of promoteToLeader(). Must be safe to
-     * call even if we're already not a leader.
+     * Configures the storage engine as a follower. Inverse of promoteToLeader().
+     * Invariants on failure.
+     * This is NOT idempotent - it will invariant if the storage engine is already in
+     * follower mode.
      */
-    virtual void demoteFromLeader() = 0;
+    virtual void demoteToFollower() = 0;
 
     /**
      * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint. This
@@ -733,15 +736,23 @@ public:
     /**
      * Sets the cutover timestamp for a planned step-down of disaggregated storage. Only valid on a
      * disaggregated leader that does not already have a step-down timestamp set; violating either
-     * precondition is fatal.
+     * precondition is fatal. The caller must hold the stepdown lock acquired via lockStepDown().
      */
-    virtual void setStepDownTimestamp(Timestamp stepDownTimestamp) = 0;
+    virtual void setStepDownTimestamp(WithLock, Timestamp stepDownTimestamp) = 0;
 
     /**
      * Returns the step-down (cutover) timestamp last set via setStepDownTimestamp(), or a null
      * timestamp if none has been set.
      */
     virtual Timestamp getStepDownTimestamp() const = 0;
+
+    /**
+     * Returns a lock which must be held across operations which cannot be rolled back if a stepdown
+     * cutover is set concurrently with the operation. The stepdown lock must be acquired after
+     * GlobalLock if a global lock is also needed, and before the replication Optime lock if that
+     * is needed.
+     */
+    virtual std::unique_lock<std::mutex> lockStepDown() = 0;
 
     /**
      * Sets the oldest timestamp for which the storage engine must maintain snapshot history
@@ -1032,22 +1043,13 @@ public:
     }
 
     /**
-     * Pauses (pause=true) or resumes (pause=false) background auto-compaction for a replica set
-     * write block critical section transition. Pausing saves the currently-active configuration so
-     * the storage engine can restore it on resume; a run-once compaction is never treated as
-     * active, so it is stopped but not saved/restored. Pausing aborts any in-progress compaction
-     * rather than waiting for it to finish. On resume the caller passes the current oplog ident to
-     * exclude (empty if there is none); the exclusion is recomputed rather than restored from the
-     * saved options, since those intentionally omit excludedIdents (they are non-owning views). An
-     * explicit user-initiated disable (via autoCompact) discards the saved configuration, so a
-     * write block released afterwards does not resurrect compaction the user turned off.
+     * Pauses background auto-compaction for a replica set write block critical section transition.
+     * Pausing aborts any in-progress compaction rather than waiting for it to finish.
      *
      * A no-op on storage engines that don't support compaction. Failures are logged, not thrown,
      * so a write block transition is never failed by auto-compaction reconfiguration.
      */
-    virtual void pauseOrResumeAutoCompactForWriteBlock(OperationContext* opCtx,
-                                                       bool pause,
-                                                       std::string_view oplogIdent = {}) {}
+    virtual void pauseAutoCompactForReplicaSetWritesBlock(OperationContext* opCtx) {}
 
     /**
      * Return true if the storage engine indicates that it is under cache pressure.
@@ -1081,6 +1083,15 @@ public:
      */
     virtual StatusWith<int64_t> getIndexStorageSize(
         OperationContext* opCtx, const std::vector<std::string>& indexIdents) const {
+        return 0;
+    }
+
+    /**
+     * Returns the compressed size of the shared history store table
+     * (`WiredTigerSharedHS.wt_stable`) as of the last checkpoint. Returns 0 if the engine does not
+     * support this operation, is not disaggregated, or the table is missing.
+     */
+    virtual StatusWith<int64_t> getSharedHistoryStoreStorageSize(OperationContext* opCtx) const {
         return 0;
     }
 };

@@ -6,7 +6,6 @@
 #include "mongo/db/collection_crud/container_write.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/shard_role/lock_manager/exception_util.h"
-#include "mongo/db/shard_role/shard_catalog/collection.h"
 #include "mongo/db/sorter/sorter.h"
 #include "mongo/db/sorter/sorter_template_defs.h"
 #include "mongo/db/storage/container.h"
@@ -15,13 +14,13 @@
 #include "mongo/db/storage/spill_util.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/bufreader.h"
 #include "mongo/util/modules.h"
 #include "mongo/util/scopeguard.h"
 
 #include <algorithm>
-#include <functional>
 #include <iterator>
 #include <memory>
 #include <span>
@@ -32,6 +31,26 @@
 
 [[MONGO_MOD_PUBLIC]];
 namespace mongo::sorter {
+
+/**
+ * Callbacks to be run upon spilling, including merging spills.
+ */
+struct [[MONGO_MOD_OPEN]] SpillCallbacks {
+    virtual ~SpillCallbacks() = default;
+    // Run before performing any spilling.
+    virtual void preSpill() {}
+    // Run after completing spilling.
+    virtual void postSpill() {}
+    // Run after each spilled range is complete. While merging spills this happens before deleting
+    // the merged-from ranges.
+    virtual void onSpill() {}
+    // Run in between each batch boundary while spilling.
+    virtual void onSpillBatch() {}
+    // Run once per committed chunk of a spill or a merge, with the serialized size of the entries
+    // that chunk wrote. This runs with locks still held, so implementations should only account
+    // for the bytes here and do any pacing wait from 'onSpillBatch', which runs while yielded.
+    virtual void onChunkWritten(int64_t bytesWritten) {}
+};
 
 template <typename Key, typename Value>
 class ContainerIterator : public Iterator<Key, Value> {
@@ -246,6 +265,15 @@ public:
             size == 0 ? std::span<const char>{} : std::span<const char>(buffer.buf(), size);
 
         WriteUnitOfWork wuow(&_opCtx);
+        if (!_writeableGuarantee) {
+            _writeableGuarantee.emplace(
+                container_write::CanAcceptContainerWritesGuarantee::assertCanAcceptContainerWrites(
+                    &_opCtx));
+            _ru.onCommit([this](OperationContext*, boost::optional<Timestamp>) {
+                _writeableGuarantee.reset();
+            });
+            _ru.onRollback([this](OperationContext*) { _writeableGuarantee.reset(); });
+        }
         _ru.onCommit([this, size](OperationContext*, boost::optional<Timestamp>) {
             // The container-based sorter does not compress in the sorter layer, so report the same
             // value for compressed and uncompressed bytes.
@@ -259,6 +287,7 @@ public:
                                                 _container,
                                                 _nextKey++,
                                                 value,
+                                                _writeableGuarantee,
                                                 container_write::NonexistentKeyGuarantee{}));
         if (size > 0) {
             this->_checksumCalculator.addUncommittedData(buffer.buf(), size);
@@ -275,8 +304,122 @@ public:
             });
         }
         wuow.commit();
+        _lastWrittenKVBufferSize = size;
+    }
 
-        _lastAddedSize = size;
+    /**
+     * How much a call to SortedStorageWriter::addAlreadySorted() wrote: the number of KV pairs and
+     * their total serialized size. A range-accepting overload may write fewer pairs than it was
+     * given.
+     */
+    struct AddAlreadySortedResult {
+        size_t kvPairsWritten{0};
+        int64_t bytesWritten{0};
+    };
+
+    /**
+     * Provides a version of addAlreadySorted for internal class use that returns the size of the
+     * buffer written.
+     */
+    [[nodiscard]] AddAlreadySortedResult addAlreadySortedWrapper(const Key& key, const Value& val) {
+        _lastWrittenKVBufferSize = 0;
+        addAlreadySorted(key, val);
+        return {.kvPairsWritten = 1, .bytesWritten = _lastWrittenKVBufferSize};
+    }
+
+    /**
+     * Serializes a range of pre-sorted KV pairs and inserts them into the container as a single
+     * batched write -- the container reuses one cursor for the whole range, and the oplog entries
+     * for the consecutive keys collapse into one -- advancing the container key range.
+     *
+     * Stops early once the serialized size of the entries written reaches 'maxBytes', so the entry
+     * that crosses the threshold is still written and at least one entry is always written.
+     * Returns the number of entries written, which is less than 'data.size()' if 'maxBytes' was
+     * reached.
+     */
+    [[nodiscard]] AddAlreadySortedResult addAlreadySortedBatch(
+        std::span<const std::pair<Key, Value>> data,
+        int64_t maxBytes,
+        boost::optional<container_write::CanAcceptContainerWritesGuarantee> wg = boost::none) {
+        if (data.empty()) {
+            return {.kvPairsWritten = 0, .bytesWritten = 0};
+        }
+
+        // Serialize into one buffer, recording each entry's extent, until the byte budget is met.
+        // The spans can only be formed once the buffer has stopped growing, since appending to it
+        // may reallocate.
+        BufBuilder buffer;
+        const auto [extents, bytesInExtents] = std::invoke([&] {
+            std::vector<std::pair<int, int>> extents;
+            extents.reserve(data.size());
+            for (auto&& [key, val] : data) {
+                const int start = buffer.len();
+                key.serializeForSorter(buffer);
+                val.serializeForSorter(buffer);
+                extents.push_back({start, buffer.len() - start});
+                if (buffer.len() >= maxBytes) {
+                    break;
+                }
+            }
+            return std::pair{extents, buffer.len()};
+        });
+
+        const int64_t rangeStart = _nextKey;
+        const auto count = static_cast<int64_t>(extents.size());
+        const auto totalSize = static_cast<int64_t>(buffer.len());
+        int64_t rangeEnd;
+        uassert(10896400,
+                "Sorter container key range overflowed",
+                !overflow::add(rangeStart, count, &rangeEnd));
+
+        std::vector<int64_t> keys(extents.size());
+        std::vector<std::span<const char>> values(extents.size());
+        for (size_t i = 0; i < extents.size(); ++i) {
+            const auto [start, len] = extents[i];
+            values[i] = len == 0 ? std::span<const char>{}
+                                 : std::span<const char>(buffer.buf() + start, len);
+            keys[i] = rangeStart + static_cast<int64_t>(i);
+        }
+
+        WriteUnitOfWork wuow(&_opCtx);
+        _ru.onCommit([this, totalSize, count](OperationContext*, boost::optional<Timestamp>) {
+            // The container-based sorter does not compress in the sorter layer, so report the same
+            // value for compressed and uncompressed bytes.
+            _containerStats.addSpilledDataSize(totalSize);
+            _containerStats.addSpilledDataSizeUncompressed(totalSize);
+            _containerStats.incrementNumSpilledEntries(count);
+        });
+        _ru.onRollback([this, rangeStart](OperationContext*) { _nextKey = rangeStart; });
+        uassertStatusOK(container_write::insert(&_opCtx,
+                                                _ru,
+                                                _container,
+                                                std::span<const int64_t>{keys},
+                                                std::span<const std::span<const char>>{values},
+                                                wg,
+                                                container_write::NonexistentKeyGuarantee{}));
+        _nextKey = rangeEnd;
+
+        // The reader checksums each container entry separately, so the chunk boundaries here must
+        // match it one entry at a time.
+        for (const auto& [start, len] : extents) {
+            if (len > 0) {
+                this->_checksumCalculator.addUncommittedData(buffer.buf() + start, len);
+            }
+        }
+        if (!_uncommittedChecksum) {
+            _uncommittedChecksum = true;
+            _ru.onCommit([this](OperationContext*, boost::optional<Timestamp>) {
+                this->_checksumCalculator.commit();
+                _uncommittedChecksum = false;
+            });
+            _ru.onRollback([this](OperationContext*) {
+                this->_checksumCalculator.abort();
+                _uncommittedChecksum = false;
+            });
+        }
+        wuow.commit();
+
+        return {.kvPairsWritten = extents.size(), .bytesWritten = bytesInExtents};
     }
 
     std::shared_ptr<Iterator> done() override {
@@ -298,10 +441,6 @@ public:
 
     void writeChunk() override {};
 
-    int64_t lastAddedSize() const {
-        return _lastAddedSize;
-    }
-
 private:
     OperationContext& _opCtx;
     RecoveryUnit& _ru;
@@ -309,12 +448,13 @@ private:
     SorterContainerStats& _containerStats;
     int64_t _nextKey;
     int64_t _rangeStartKey;
-    int64_t _lastAddedSize = 0;
     bool _uncommittedChecksum = false;
+    boost::optional<container_write::CanAcceptContainerWritesGuarantee> _writeableGuarantee;
+    int _lastWrittenKVBufferSize{0};
 };
 
 template <typename Key, typename Value>
-class ContainerBasedStorage : public StorageBase<Key, Value> {
+class ContainerBasedStorage final : public StorageBase<Key, Value> {
 public:
     using Settings = StorageBase<Key, Value>::Settings;
 
@@ -377,7 +517,8 @@ public:
     };
 
     /**
-     * The lifetime of the container is managed by the user of the storage, so keeping is a no-op.
+     * The lifetime of the container is managed by the user of the storage, so keeping is a
+     * no-op.
      */
     void keep() override {};
 
@@ -405,19 +546,7 @@ private:
 template <typename Key, typename Value, typename Comparator>
 class ContainerBasedSpiller : public SpillerBase<Key, Value, Comparator> {
 public:
-    using SpillCallback = std::function<void()>;
-
-    /**
-     * Callbacks to be run upon spilling, including merging spills.
-     */
-    struct SpillCallbacks {
-        // Run before spilling or merging spills.
-        SpillCallback preSpill;
-        // Run after spilling. Run while merging spills before deleting the merged-from ranges.
-        SpillCallback onSpill;
-        // Run after spilling or merging spills.
-        SpillCallback postSpill;
-    };
+    using Settings = SpillerBase<Key, Value, Comparator>::Settings;
 
     ContainerBasedSpiller(OperationContext& opCtx,
                           RecoveryUnit& ru,
@@ -426,7 +555,7 @@ public:
                           SorterContainerStats& stats,
                           boost::optional<DatabaseName> dbName,
                           SorterChecksumVersion checksumVersion,
-                          SpillCallbacks callbacks,
+                          std::unique_ptr<SpillCallbacks> callbacks,
                           int64_t batchSize,
                           int64_t batchBytes,
                           int64_t minAvailableDiskBytesToSpill)
@@ -447,7 +576,7 @@ public:
                           SorterContainerStats& stats,
                           boost::optional<DatabaseName> dbName,
                           SorterChecksumVersion checksumVersion,
-                          SpillCallbacks callbacks,
+                          std::unique_ptr<SpillCallbacks> callbacks,
                           int64_t batchSize,
                           int64_t batchBytes,
                           int64_t minAvailableDiskBytesToSpill)
@@ -464,7 +593,7 @@ public:
                                 minAvailableDiskBytesToSpill) {}
 
     void spill(const SortOptions& opts,
-               const SpillerBase<Key, Value, Comparator>::Settings& settings,
+               const Settings& settings,
                std::span<std::pair<Key, Value>> data) override {
         _runWithSpillCallbacks([&] {
             SpillerBase<Key, Value, Comparator>::spill(opts, settings, data);
@@ -473,7 +602,7 @@ public:
     }
 
     void mergeSpills(const SortOptions& opts,
-                     const SpillerBase<Key, Value, Comparator>::Settings& settings,
+                     const Settings& settings,
                      SorterStats& stats,
                      Comparator comp,
                      std::size_t numTargetedSpills,
@@ -496,7 +625,7 @@ public:
     // TODO SERVER-125808: Tighten the memory consumption bounds of container-based spillWithHeap().
     std::shared_ptr<sorter::Iterator<Key, Value>> spillWithHeap(
         const SortOptions& opts,
-        const SpillerBase<Key, Value, Comparator>::Settings& settings,
+        const Settings& settings,
         std::priority_queue<std::pair<Key, Value>,
                             std::vector<std::pair<Key, Value>>,
                             Greater<Key, Value, Comparator>>& heap) override {
@@ -506,41 +635,73 @@ public:
             data.push_back(heap.top());
             heap.pop();
         }
-        std::shared_ptr<sorter::Iterator<Key, Value>> result;
         // Using _spill() allows us to re-use the _current bookkeeping required by the
         // container-based spiller.
-        _runWithSpillCallbacks([&] { result = _spill(opts, settings, data)->done(); });
-        return result;
+        return _runWithSpillCallbacks([&] { return _spill(opts, settings, data)->done(); });
     }
 
 private:
-    void _runPreSpill() {
-        if (_callbacks.preSpill) {
-            _callbacks.preSpill();
+    void _runOnChunkWritten(int64_t bytesWritten) {
+        if (_callbacks) {
+            _callbacks->onChunkWritten(bytesWritten);
         }
     }
 
     void _runOnSpill() {
-        if (_callbacks.onSpill) {
-            _callbacks.onSpill();
+        if (_callbacks) {
+            _callbacks->onSpill();
+        }
+    }
+
+    void _runOnSpillBatch() {
+        if (_callbacks) {
+            _callbacks->onSpillBatch();
+        }
+    }
+
+    void _runPreSpill() {
+        if (_callbacks) {
+            _callbacks->preSpill();
         }
     }
 
     void _runPostSpill() {
-        if (_callbacks.postSpill) {
-            _callbacks.postSpill();
+        if (_callbacks) {
+            _callbacks->postSpill();
         }
     }
 
     template <typename Fn>
-    void _runWithSpillCallbacks(Fn&& fn) {
+    auto _runWithSpillCallbacks(Fn&& fn) {
         _runPreSpill();
-        ScopeGuard postGuard([this] { _runPostSpill(); });
-        fn();
+        ScopeGuard postGuard([this] {
+            // Only reached when an exception is propagating out of the spill, so restoring whatever
+            // state 'postSpill' owns is best-effort: the in-flight exception is what the caller
+            // needs to see, and ~ScopeGuard is noexcept, so letting a second exception escape here
+            // would terminate the process. A postSpill that restores a plan executor throws when
+            // the operation has been interrupted, which is exactly the case that unwinds a spill
+            // that is being paced by a throttle.
+            try {
+                _runPostSpill();
+            } catch (const DBException&) {
+            }
+        });
+        if constexpr (std::is_void_v<std::invoke_result_t<Fn&>>) {
+            fn();
+            // On the success path a postSpill failure is a real error and must propagate.
+            postGuard.dismiss();
+            _runPostSpill();
+        } else {
+            auto result = fn();
+            // On the success path a postSpill failure is a real error and must propagate.
+            postGuard.dismiss();
+            _runPostSpill();
+            return result;
+        }
     }
 
     void _mergeSpills(const SortOptions& opts,
-                      const SpillerBase<Key, Value, Comparator>::Settings& settings,
+                      const Settings& settings,
                       SorterStats& stats,
                       Comparator comp,
                       std::size_t numTargetedSpills,
@@ -550,8 +711,8 @@ private:
             // outer pass even after we erase them from _iterators below.
             auto oldIters = this->_iterators;
             for (size_t i = 0; i < oldIters.size(); i += maxSpillsPerMerge) {
-                auto count = std::min(maxSpillsPerMerge, oldIters.size() - i);
-                auto spillsToMerge = std::span(oldIters).subspan(i, count);
+                const auto count = std::min(maxSpillsPerMerge, oldIters.size() - i);
+                const auto spillsToMerge = std::span(oldIters).subspan(i, count);
                 validateMergeSpillRanges<Key, Value>(spillsToMerge);
 
                 // For container-based spilling we append merged data back into the same container
@@ -564,46 +725,60 @@ private:
                 auto mergeIterator = sorter::merge<Key, Value>(spillsToMerge, opts, comp);
                 auto writer = this->_storage->makeWriter(opts, settings);
 
-                int64_t deleteRangeStart = spillsToMerge.front()->getRange().getStart();
-                int64_t deleteRangeEnd = spillsToMerge.back()->getRange().getEnd();
+                const int64_t deleteRangeStart = spillsToMerge.front()->getRange().getStart();
+                const int64_t deleteRangeEnd = spillsToMerge.back()->getRange().getEnd();
                 const int64_t numSourceRows = deleteRangeEnd - deleteRangeStart;
 
                 int64_t numSpilled = 0;
 
                 std::vector<std::pair<Key, Value>> batch;
+                batch.reserve(_batchSize);
                 auto& containerWriter =
                     *static_cast<SortedContainerWriter<Key, Value>*>(writer.get());
                 while (mergeIterator->more()) {
+                    // Drain the merge iterator into the buffer under its own write conflict retry,
+                    // separate from the writes below, so that a retried write re-writes the same
+                    // pairs rather than consuming more from the iterator. 'batch' is cleared
+                    // outside the retry and the loop is bounded by its size, so a retried read
+                    // tops the buffer back up rather than dropping already-consumed pairs.
                     batch.clear();
                     writeConflictRetry(&_opCtx,
                                        _ru,
-                                       "ContainerBasedSpiller::mergeSpills_insert",
+                                       "ContainerBasedSpiller::mergeSpills_read"sv,
                                        NamespaceString::kEmpty,
                                        [&] {
-                                           int64_t bytesInBatch = 0;
-
-                                           WriteUnitOfWork wuow{&_opCtx};
-
-                                           // In the case of a write conflict, re-add any buffered
-                                           // items from the batch before getting more from the
-                                           // merge iterator.
-                                           for (size_t i = 0; i < batch.size(); ++i) {
-                                               containerWriter.addAlreadySorted(batch[i].first,
-                                                                                batch[i].second);
-                                               bytesInBatch += containerWriter.lastAddedSize();
-                                           }
-
                                            while (mergeIterator->more() &&
-                                                  static_cast<int64_t>(batch.size()) < _batchSize &&
-                                                  bytesInBatch < _batchBytes) {
+                                                  static_cast<int64_t>(batch.size()) < _batchSize) {
                                                batch.push_back(mergeIterator->next());
-                                               containerWriter.addAlreadySorted(
-                                                   batch.back().first, batch.back().second);
-                                               bytesInBatch += containerWriter.lastAddedSize();
                                            }
-
-                                           wuow.commit();
                                        });
+
+                    // A byte-heavy buffer may take more than one batched write, since
+                    // addAlreadySortedBatch stops once it reaches '_batchBytes'.
+                    for (size_t i = 0, written = 0; i < batch.size(); i += written) {
+                        const std::span<const std::pair<Key, Value>> pairsToWrite =
+                            std::span(batch).subspan(i);
+                        int64_t bytesWritten = 0;
+                        writeConflictRetry(&_opCtx,
+                                           _ru,
+                                           "ContainerBasedSpiller::mergeSpills_insert"sv,
+                                           NamespaceString::kEmpty,
+                                           [&] {
+                                               WriteUnitOfWork wuow{&_opCtx};
+                                               // A write conflict re-writes the whole chunk, so
+                                               // both counts are overwritten rather than
+                                               // accumulated.
+                                               const auto result =
+                                                   containerWriter.addAlreadySortedBatch(
+                                                       pairsToWrite, _batchBytes);
+                                               written = result.kvPairsWritten;
+                                               bytesWritten = result.bytesWritten;
+                                               wuow.commit();
+                                           });
+                        // Outside the write unit of work. This only reports the bytes written;
+                        // any pacing wait is done by the callback owner at a yield point.
+                        _runOnChunkWritten(bytesWritten);
+                    }
                     numSpilled += batch.size();
                 }
                 invariant((opts.limit) ? numSpilled <= numSourceRows : numSpilled == numSourceRows);
@@ -647,34 +822,35 @@ private:
 
     std::unique_ptr<SortedStorageWriter<Key, Value>> _spill(
         const SortOptions& opts,
-        const SpillerBase<Key, Value, Comparator>::Settings& settings,
+        const Settings& settings,
         std::span<std::pair<Key, Value>> data) override {
-        auto writer = this->_storage->makeWriter(opts, settings);
 
-        for (size_t i = 0; i < data.size();) {
-            auto batchStart = i;
-            auto batch = data.subspan(batchStart,
-                                      batchStart + _batchSize < data.size() ? _batchSize
-                                                                            : std::dynamic_extent);
+        auto writer = this->_storage->makeWriter(opts, settings);
+        auto& containerWriter = *static_cast<SortedContainerWriter<Key, Value>*>(writer.get());
+
+        for (size_t i = 0, lastBatchSize = 0; i < data.size(); i += lastBatchSize) {
+            const auto batch =
+                data.subspan(i, i + _batchSize < data.size() ? _batchSize : std::dynamic_extent);
+            int64_t lastBatchBytes = 0;
             writeConflictRetry(
                 &_opCtx, _ru, "ContainerBasedSpiller::_spill", NamespaceString::kEmpty, [&] {
-                    i = batchStart;
-                    int64_t bytesInBatch = 0;
-
                     WriteUnitOfWork wuow{&_opCtx};
-                    for (auto&& [key, value] : batch) {
-                        writer->addAlreadySorted(key, value);
-                        ++i;
-
-                        bytesInBatch +=
-                            static_cast<SortedContainerWriter<Key, Value>*>(writer.get())
-                                ->lastAddedSize();
-                        if (bytesInBatch >= _batchBytes) {
-                            break;
-                        }
-                    }
+                    // Write spills as a batch, save the count of pairs written to increment the
+                    // counter for the next subspan. A write conflict retries the whole chunk, so
+                    // both counts are overwritten rather than accumulated.
+                    const auto result = containerWriter.addAlreadySortedBatch(batch, _batchBytes);
+                    lastBatchSize = result.kvPairsWritten;
+                    lastBatchBytes = result.bytesWritten;
                     wuow.commit();
                 });
+            // Outside the write unit of work. This only reports the bytes written; any pacing
+            // wait is done by the callback owner in 'onSpillBatch', where it can sleep during the
+            // yield.
+            _runOnChunkWritten(lastBatchBytes);
+
+            if (i + lastBatchSize < data.size()) {
+                _runOnSpillBatch();
+            }
         }
 
         _current += data.size();
@@ -685,7 +861,7 @@ private:
 
     OperationContext& _opCtx;
     RecoveryUnit& _ru;
-    SpillCallbacks _callbacks;
+    std::unique_ptr<SpillCallbacks> _callbacks;
     int64_t _batchSize;
     int64_t _batchBytes;
     int64_t _current;

@@ -5,6 +5,7 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobj_comparator.h"
 #include "mongo/bson/bsonobj_comparator_interface.h"
@@ -22,6 +23,8 @@
 #include "mongo/db/logical_time.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
+#include "mongo/db/memory_tracking/query_memory_load_shedding.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregation_request_helper.h"
@@ -51,7 +54,6 @@
 #include "mongo/db/router_role/cluster_commands_helpers.h"
 #include "mongo/db/router_role/collection_routing_info_targeter.h"
 #include "mongo/db/router_role/router_role.h"
-#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/shard_role/shard_catalog/raw_data_operation.h"
 #include "mongo/db/sharding_environment/client/shard.h"
@@ -135,10 +137,7 @@ std::unique_ptr<CanonicalQuery> parseDistinctCmd(
         expCtx, queryShapeHash, nss, distinctCommandRequest.getQuerySettings());
 
     // We do not collect queryStats on explain for distinct.
-    if (feature_flags::gFeatureFlagQueryStatsCountDistinct.isEnabledUseLastLTSFCVWhenUninitialized(
-            VersionContext::getDecoration(opCtx),
-            serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
-        !verbosity.has_value()) {
+    if (!verbosity.has_value()) {
         query_stats::registerRequest(opCtx, nss, [&]() {
             uassertStatusOKWithContext(deferredShape->getStatus(), "Failed to compute query shape");
             return std::make_unique<query_stats::DistinctKey>(
@@ -159,12 +158,29 @@ BSONObj prepareDistinctForPassthrough(
     const bool requestQueryStats,
     const boost::optional<query_shape::QueryShapeHash>& queryShapeHash) {
     const auto qsBson = qs.toBSON();
-    if (requestQueryStats || !qsBson.isEmpty() || queryShapeHash) {
-        BSONObjBuilder bob(cmd);
-        // Append distinct command with the query settings and includeQueryStatsMetrics if needed.
-        if (requestQueryStats) {
-            bob.append(DistinctCommandRequest::kIncludeQueryStatsMetricsFieldName, true);
+    // Replace the client-supplied 'maxTimeMS' with the one resolved from the query settings, so
+    // that the shard's deadline reflects the override rather than the stale, client-supplied value.
+    // 'addField' replaces in place, preserving field order, so the forwarded command carries
+    // exactly one 'maxTimeMS'. This function is only reached on the non-explain path, hence
+    // 'isExplain' is false.
+    const auto cmdWithResolvedMaxTimeMS = [&] {
+        if (auto qsMaxTimeMS =
+                query_settings::resolveMaxTimeMSForShardForwarding(qs, false /* isExplain */)) {
+            return cmd.addField(
+                BSON(GenericArguments::kMaxTimeMSFieldName << *qsMaxTimeMS).firstElement());
         }
+        return cmd;
+    }();
+    // addField replaces in place so a client-supplied includeQueryStatsMetrics is overwritten
+    // instead of duplicated in the shard OP_MSG.
+    auto cmdForPassthrough = cmdWithResolvedMaxTimeMS;
+    if (requestQueryStats) {
+        cmdForPassthrough = cmdForPassthrough.addField(
+            BSON(DistinctCommandRequest::kIncludeQueryStatsMetricsFieldName << true)
+                .firstElement());
+    }
+    if (!qsBson.isEmpty() || queryShapeHash) {
+        BSONObjBuilder bob(cmdForPassthrough);
         if (!qsBson.isEmpty() && !cmd.hasField(DistinctCommandRequest::kQuerySettingsFieldName)) {
             bob.append(DistinctCommandRequest::kQuerySettingsFieldName, qsBson);
         }
@@ -187,7 +203,7 @@ BSONObj prepareDistinctForPassthrough(
         return CommandHelpers::filterCommandRequestForPassthrough(bob.done());
     }
 
-    return CommandHelpers::filterCommandRequestForPassthrough(cmd);
+    return CommandHelpers::filterCommandRequestForPassthrough(cmdForPassthrough);
 }
 
 void runDistinctAsAgg(OperationContext* opCtx,
@@ -371,6 +387,7 @@ public:
 
         void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) override {
             CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+            markOperationQueryMemorySheddingEligible(opCtx);
             try {
                 executeDistinct(opCtx, boost::none /* verbosity */, reply);
             } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
@@ -445,8 +462,9 @@ public:
                 cmdForShards = ClusterExplain::wrapAsExplain(
                     cmdObj, *verbosity, canonicalQuery->getExpCtx()->getQuerySettings().toBSON());
             } else {
-                // Users cannot set 'includeQueryStatsMetrics' for distinct commands on mongos. We
-                // will decide if remote query stats metrics should be collected.
+                // includeQueryStatsMetrics is not returned in the mongos distinct reply. When this
+                // op is sampled, prepareDistinctForPassthrough overwrites the field to true so
+                // shards return metrics for the query stats store.
                 requestQueryStats =
                     query_stats::shouldRequestRemoteMetrics(CurOp::get(opCtx)->debug());
                 boost::optional<query_shape::QueryShapeHash> queryShapeHash =

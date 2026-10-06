@@ -21,8 +21,10 @@
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/platform/atomic.h"
+#include "mongo/stdx/thread.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/future_impl.h"
 #include "mongo/util/str.h"
 
@@ -306,7 +308,7 @@ protected:
                     const ConnectionString cs = ConnectionString::forReplicaSet(
                         shardId.toString(), {HostAndPort(str::stream() << shardId << ":123")});
                     ShardType sType;
-                    sType.setHandle(ShardHandle{ShardId(cs.getSetName()), boost::none});
+                    sType.setName(cs.getSetName());
                     sType.setHost(cs.toString());
                     shardTypes.push_back(std::move(sType));
                 };
@@ -633,6 +635,77 @@ TEST_F(AsyncWorkSchedulerTest, ShutdownAllowedFromScheduleWorkAtCallback) {
     });
 
     future.get();
+}
+
+// AsyncWorkScheduler schedules on the executor while holding '_mutex', and the callback re-acquires
+// '_mutex'. Block the scheduling thread holding '_mutex', shut the executor down, then let it
+// proceed: it must not self-deadlock, and scheduleWork must resolve with an error.
+TEST_F(AsyncWorkSchedulerTest, NoDeadlockWhenExecutorShutsDownWhileSchedulingUnderMutex) {
+    AsyncWorkScheduler async(getServiceContext());
+
+    boost::optional<StatusWith<int>> result;
+    stdx::thread scheduler;
+    {
+        FailPointEnableBlock fpBlock("hangAfterShutdownCheckWhileHoldingSchedulerMutex");
+
+        scheduler = stdx::thread(
+            [&] { result = async.scheduleWork([](OperationContext*) { return 0; }).getNoThrow(); });
+
+        // Wait until the scheduling thread is blocked holding '_mutex', just past the shutdown
+        // check.
+        fpBlock->waitForTimesEntered(fpBlock.initialTimesEntered() + 1);
+
+        // Shut the executor down while the scheduling thread holds '_mutex' mid-schedule.
+        shutdownExecutorPool();
+    }  // Disabling the failpoint here releases the blocked thread.
+
+    // The scheduling thread must finish without deadlocking on '_mutex'.
+    scheduler.join();
+
+    ASSERT(result);
+    ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, result->getStatus());
+}
+
+// Regression test: the scheduler must stay alive while a scheduleRemoteCommand continuation that
+// captured a raw 'this' is still pending. The failpoint parks a worker after targeting but before
+// the command handle is registered, so join() must block until the command completes. Without the
+// fix join() returns in that window and the scheduler is freed under the continuation, which ASAN
+// catches as a use-after-free.
+TEST_F(AsyncWorkSchedulerTest, SchedulerStaysAliveUntilRemoteCommandCompletes) {
+    auto async = std::make_unique<AsyncWorkScheduler>(getServiceContext());
+
+    auto* fp = globalFailPointRegistry().find(
+        "hangTransactionCoordinatorAsyncWorkSchedulerBeforeSchedulingRemoteCommand");
+    ASSERT(fp);
+    // Enable via a scope block so the failpoint is always disabled on exit, even if the test
+    // aborts.
+    FailPointEnableBlock fpBlock(fp);
+
+    auto future = async->scheduleRemoteCommand(
+        kShardIds[1], ReadPreferenceSetting{ReadPreference::PrimaryOnly}, BSON("TestCommand" << 1));
+
+    // Tears the scheduler down as soon as it looks idle. join() must block until the command
+    // completes; before the fix it returned early and freed the scheduler under the continuation.
+    stdx::thread owner([&] {
+        async->join();
+        async.reset();
+    });
+
+    // Wait until the worker is parked: targeting done, command handle not yet registered.
+    fp->waitForTimesEntered(fpBlock.initialTimesEntered() + 1);
+
+    // Release the worker so the command can be sent, then service it.
+    fp->setMode(FailPoint::off);
+    onCommand([&](const executor::RemoteCommandRequest& request) {
+        ASSERT_BSONOBJ_EQ(BSON("TestCommand" << 1), request.cmdObj);
+        return BSON("ok" << 1);
+    });
+
+    // join() returns (and reset() runs) only after the command completed; no use-after-free.
+    owner.join();
+
+    ASSERT(future.isReady());
+    ASSERT_OK(future.getNoThrow().getStatus());
 }
 
 TEST_F(AsyncWorkSchedulerTest, DestroyingSchedulerCapturedInFutureCallback) {

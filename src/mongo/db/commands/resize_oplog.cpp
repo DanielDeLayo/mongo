@@ -13,18 +13,22 @@
 #include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/rss/persistence_provider.h"
+#include "mongo/db/rss/replicated_storage_service.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/shard_role/lock_manager/exception_util.h"
 #include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
 #include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
 #include "mongo/db/shard_role/shard_catalog/collection.h"
 #include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/db/shard_role/transaction_resources.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/atomic.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 #include <string>
 
@@ -73,6 +77,23 @@ public:
              const DatabaseName&,
              const BSONObj& jsobj,
              BSONObjBuilder& result) override {
+        auto params =
+            ReplSetResizeOplogRequest::parse(jsobj, IDLParserContext("replSetResizeOplog"));
+
+        if (auto sizeMB = params.getSize()) {
+            const auto minSizeMB = rss::ReplicatedStorageService::get(opCtx)
+                                       .getPersistenceProvider()
+                                       .getMinOplogSizeMB();
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "Oplog size must be at least " << minSizeMB << "MB, but got "
+                                  << *sizeMB << "MB",
+                    *sizeMB >= minSizeMB);
+        }
+
+        // Resizing updates the oplog's durable catalog entry. 'local' is unreplicated, so no oplog
+        // entry is logged and nothing supplies a commit timestamp.
+        shard_role_details::allowOneUntimestampedWrite(opCtx);
+
         // Use LocalWrite intent so the IntentRegistry does not enforce primary-only
         // write access, allowing replSetResizeOplog to run on secondaries as intended.
         AutoGetCollection coll(
@@ -83,9 +104,6 @@ public:
                 .explicitIntent = rss::consensus::IntentRegistry::Intent::LocalWrite}));
         uassert(ErrorCodes::NamespaceNotFound, "oplog does not exist", coll);
         uassert(ErrorCodes::IllegalOperation, "oplog isn't capped", coll->isCapped());
-
-        auto params =
-            ReplSetResizeOplogRequest::parse(jsobj, IDLParserContext("replSetResizeOplog"));
 
         return writeConflictRetry(opCtx, "replSetResizeOplog", coll->ns(), [&] {
             WriteUnitOfWork wunit(opCtx);

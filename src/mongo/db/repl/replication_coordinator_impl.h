@@ -22,6 +22,7 @@
 #include "mongo/db/repl/initial_sync/initial_syncer_interface.h"
 #include "mongo/db/repl/intent_registry.h"
 #include "mongo/db/repl/last_vote.h"
+#include "mongo/db/repl/lock_guard_with_deferred_task.h"
 #include "mongo/db/repl/member_config.h"
 #include "mongo/db/repl/member_data.h"
 #include "mongo/db/repl/member_id.h"
@@ -47,6 +48,7 @@
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/repl/vote_requester.h"
+#include "mongo/db/repl/write_concern_waiter_list.h"
 #include "mongo/db/replication_state_transition_lock_guard.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -85,6 +87,7 @@
 #include <thread>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <absl/container/node_hash_map.h>
@@ -107,43 +110,6 @@ namespace rpc {
 class OplogQueryMetadata;
 class ReplSetMetadata;
 }  // namespace rpc
-
-namespace repl {
-// HashWriteConcernForReplication and EqualWriteConcernForReplication are used to make a hash
-// map of write concerns.  They should include all the fields, and only the fields which are
-// relevant to _doneWaitingForReplication -- syncMode, w, and checkCondition.
-// They are declared here, rather than inside ReplCoordinatorImpl, because it is not possible
-// to use the IsTrustedHasher template for an inner class.
-class HashWriteConcernForReplication {
-public:
-    std::size_t operator()(const WriteConcernOptions& a) const {
-        std::size_t seed = 0;
-        boost::hash_combine(seed, stdx::to_underlying(a.syncMode));
-        boost::hash_combine(seed, a.checkCondition);
-        std::visit(OverloadedVisitor{[&](const std::string& s) { boost::hash_combine(seed, s); },
-                                     [&](std::int64_t n) { boost::hash_combine(seed, n); },
-                                     [&](const WTags& tags) {
-                                         for (const auto& tag : tags) {
-                                             boost::hash_combine(seed, tag.first);
-                                             boost::hash_combine(seed, tag.second);
-                                         }
-                                     }},
-                   a.w);
-        return seed;
-    }
-};
-
-class EqualWriteConcernForReplication {
-public:
-    bool operator()(const WriteConcernOptions& a, const WriteConcernOptions& b) const {
-        return a.syncMode == b.syncMode && a.checkCondition == b.checkCondition && a.w == b.w;
-    }
-};
-}  // namespace repl
-
-template <>
-struct IsTrustedHasher<repl::HashWriteConcernForReplication, WriteConcernOptions> : std::true_type {
-};
 
 namespace repl {
 
@@ -419,7 +385,8 @@ public:
     void setOldestTimestampMetric(const Timestamp& timestamp);
     void setOldestTimestamp(const Timestamp& timestamp) override;
 
-    Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
+    Status processHeartbeatV1(OperationContext* opCtx,
+                              const ReplSetHeartbeatArgsV1& args,
                               ReplSetHeartbeatResponse* response) override;
 
     bool getWriteConcernMajorityShouldJournal() override;
@@ -452,7 +419,10 @@ public:
 
     WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(WriteConcernOptions wc) override;
 
-    Status stepUpIfEligible(OperationContext* opCtx, bool skipDryRun) override;
+    Status stepUpIfEligible(
+        OperationContext* opCtx,
+        bool skipDryRun,
+        boost::optional<Date_t> priorPrimaryStopAcceptingWritesTime = boost::none) override;
 
     Status abortCatchupIfNeeded(PrimaryCatchUpConclusionReason reason) override;
 
@@ -582,6 +552,13 @@ public:
                                                               long long memberId,
                                                               const OpTime& opTime,
                                                               Date_t wallTime = Date_t());
+
+    /**
+     * Resolves `writeConcern` into the fulfillment that _wakeReadyWaiters() would act on. Acquires
+     * _mutex.
+     */
+    [[MONGO_MOD_PRIVATE]] WriteConcernFulfillment resolveWriteConcernFulfillment_forTest(
+        const WriteConcernOptions& writeConcern);
 
     /**
      * Simple test wrappers that expose private methods.
@@ -767,16 +744,10 @@ private:
         kActionStartSingleNodeElection
     };
 
-    struct Waiter {
-        Promise<void> promise;
-        boost::optional<WriteConcernOptions> writeConcern;
-        // A flag to mark this waiter abandoned which allows early clean-up for the waiter.
-        Atomic<bool> givenUp{false};
-        explicit Waiter(Promise<void> p, boost::optional<WriteConcernOptions> w = boost::none)
-            : promise(std::move(p)), writeConcern(w) {}
-    };
-
-    using SharedWaiterHandle = std::shared_ptr<Waiter>;
+    // The guard used to hold _mutex on paths that need to run work once it is released -- notably
+    // waking write-concern waiters, which must not happen under _mutex. See
+    // LockGuardWithDeferredTask.
+    using LockGuard = LockGuardWithDeferredTask<ObservableMutex<std::mutex>>;
 
     // This is a waiter list for things waiting on local opTimes only.
     class WaiterList {
@@ -805,44 +776,6 @@ private:
         std::multimap<OpTime, SharedWaiterHandle> _waiters;
         // We keep a separate count outside _waiters.size() in order to avoid having to
         // take a lock to read the metric.
-        Counter64& _waiterCountMetric;
-    };
-
-    // This is a waiter list for things waiting on opTimes along with a WriteConcern.  It breaks
-    // the waiters up by WriteConcern (using the hash and equal functors above) so that within a
-    // sub-list, the waiters are satisfied in order.
-    class WriteConcernWaiterList {
-    public:
-        WriteConcernWaiterList() = delete;
-        WriteConcernWaiterList(Counter64& waiterCountMetric);
-
-        // Adds waiter into the list.
-        void add(WithLock lk, const OpTime& opTime, SharedWaiterHandle waiter);
-        // Adds a waiter into the list and returns the future of the waiter's promise.
-        std::pair<SharedSemiFuture<void>, SharedWaiterHandle> add(WithLock lk,
-                                                                  const OpTime& opTime,
-                                                                  WriteConcernOptions w);
-        // Returns whether waiter is found and removed.
-        bool remove(WithLock lk, const OpTime& opTime, SharedWaiterHandle waiter);
-
-        // Signals all waiters whose opTime is <= the given opTime (if any) that satisfy the
-        // condition in func.  The func must have the property that, for any given
-        // WriteConcernOptions, there is some optime T such that func returns true for all
-        // optimes <= T, and false for all optimes > T.
-        void setValueIf(
-            WithLock lk,
-            std::function<bool(WithLock, const OpTime&, const WriteConcernOptions&)> func,
-            boost::optional<OpTime> opTime = boost::none);
-        // Signals all waiters from the list and fulfills promises with Error status.
-        void setErrorAll(WithLock lk, Status status);
-
-    private:
-        // Waiters sorted by OpTime.
-        stdx::unordered_map<WriteConcernOptions,
-                            std::multimap<OpTime, SharedWaiterHandle, std::less<>>,
-                            HashWriteConcernForReplication,
-                            EqualWriteConcernForReplication>
-            _waiters;
         Counter64& _waiterCountMetric;
     };
 
@@ -1047,7 +980,7 @@ private:
         Atomic<unsigned> _canServeNonLocalReads;
     };
 
-    void _resetMyLastOpTimes(WithLock lk);
+    void _resetMyLastOpTimes(LockGuard& lk);
 
     /**
      * Returns a new WriteConcernOptions based on "wc" but with UNSET syncMode reset to JOURNAL or
@@ -1084,16 +1017,38 @@ private:
      * Returns an action to be performed after unlocking _mutex, via
      * _performPostMemberStateUpdateAction.
      */
-    PostMemberStateUpdateAction _setCurrentRSConfig(WithLock lk,
+    PostMemberStateUpdateAction _setCurrentRSConfig(LockGuard& lk,
                                                     OperationContext* opCtx,
                                                     const ReplSetConfig& newConfig,
                                                     int myIndex);
 
     /**
-     * Helper to wake waiters in _replicationWaiterList waiting for opTime <= the opTime passed in
-     * (or all waiters if opTime passed in is boost::none) that are doneWaitingForReplication.
+     * Helper to wake the waiters in _replicationWaiterList that are doneWaitingForReplication, by
+     * resolving each waited-on WriteConcern to the highest opTime that currently satisfies it (see
+     * _resolveWriteConcernFulfillment).
      */
-    void _wakeReadyWaiters(WithLock lk, boost::optional<OpTime> opTime = boost::none);
+    void _wakeReadyWaiters(LockGuard& lk);
+
+    /**
+     * Returns which of `writeConcern`'s waiters can be woken right now: the highest opTime that
+     * currently satisfies it (null if none does), `true` if it is an OpTime-independent condition
+     * that is now satisfied, or an error Status if resolving it failed.
+     *
+     * This answers for a whole WriteConcern at once what _doneWaitingForReplication() answers for a
+     * single (opTime, writeConcern) pair, so that waking waiters does not have to test them one by
+     * one.
+     */
+    WriteConcernFulfillment _resolveWriteConcernFulfillment(
+        WithLock lk, const WriteConcernOptions& writeConcern);
+
+    /**
+     * Resolves every WriteConcern currently being waited on into the fulfillment map that
+     * WriteConcernWaiterList::setValueIf() applies. Write concerns that nothing satisfies yet are
+     * left out of the map, since an absent entry wakes none of their waiters.
+     *
+     * Building the map is the whole of the decision that needs _mutex; applying it does not.
+     */
+    WriteConcernFulfillmentMap _makeWriteConcernFulfillmentMap(WithLock lk);
 
     /**
      * Scheduled to cause the ReplicationCoordinator to reconsider any state that might
@@ -1179,7 +1134,7 @@ private:
      * replication coordinator state and notifies waiters after remote optime updates.  Must be
      * called within the same critical section as _setLastOptimeForMember.
      */
-    void _updateStateAfterRemoteOpTimeUpdates(WithLock lk, const OpTime& maxRemoteOpTime);
+    void _updateStateAfterRemoteOpTimeUpdates(LockGuard& lk, const OpTime& maxRemoteOpTime);
 
     /**
      * This function will report our position externally (like upstream) if necessary.
@@ -1191,25 +1146,25 @@ private:
      * When prioritized is set to true, the reporter will try to schedule an updatePosition request
      * even there is already one in flight.
      */
-    void _reportUpstream(std::unique_lock<ObservableMutex<std::mutex>> lock, bool prioritized);
+    void _reportUpstream(LockGuard lock, bool prioritized);
 
     /**
      * Helpers to set the last written, applied and durable OpTime.
      */
-    void _setMyLastWrittenOpTimeAndWallTime(WithLock lk,
+    void _setMyLastWrittenOpTimeAndWallTime(LockGuard& lk,
                                             const OpTimeAndWallTime& opTime,
                                             bool isRollbackAllowed);
-    void _setMyLastAppliedOpTimeAndWallTime(WithLock lk,
+    void _setMyLastAppliedOpTimeAndWallTime(LockGuard& lk,
                                             const OpTimeAndWallTime& opTime,
                                             bool isRollbackAllowed);
-    void _setMyLastDurableOpTimeAndWallTime(WithLock lk,
+    void _setMyLastDurableOpTimeAndWallTime(LockGuard& lk,
                                             const OpTimeAndWallTime& opTimeAndWallTime,
                                             bool isRollbackAllowed);
     // The return bool value means whether the corresponding timestamp is advanced in these
     // functions.
-    bool _setMyLastAppliedOpTimeAndWallTimeForward(WithLock lk,
+    bool _setMyLastAppliedOpTimeAndWallTimeForward(LockGuard& lk,
                                                    const OpTimeAndWallTime& opTimeAndWallTime);
-    bool _setMyLastDurableOpTimeAndWallTimeForward(WithLock lk,
+    bool _setMyLastDurableOpTimeAndWallTimeForward(LockGuard& lk,
                                                    const OpTimeAndWallTime& opTimeAndWallTime);
 
     /**
@@ -1509,10 +1464,9 @@ private:
      *
      * Requires "lock" to own _mutex, and returns the same unique_lock.
      */
-    std::unique_lock<ObservableMutex<std::mutex>> _handleHeartbeatResponseAction(
-        const HeartbeatResponseAction& action,
-        const StatusWith<ReplSetHeartbeatResponse>& responseStatus,
-        std::unique_lock<ObservableMutex<std::mutex>> lock);
+    void _handleHeartbeatResponseAction(const HeartbeatResponseAction& action,
+                                        const StatusWith<ReplSetHeartbeatResponse>& responseStatus,
+                                        LockGuard& lock);
 
     /**
      * Updates the last committed OpTime to be 'committedOpTime' if it is more recent than the
@@ -1524,7 +1478,7 @@ private:
      * The 'forInitiate' flag is used to force-advance our commit point during the execuction
      * of the replSetInitiate command.
      */
-    void _advanceCommitPoint(WithLock lk,
+    void _advanceCommitPoint(LockGuard& lk,
                              const OpTimeAndWallTime& committedOpTimeAndWallTime,
                              bool fromSyncSource,
                              bool forInitiate = false);
@@ -1537,7 +1491,7 @@ private:
      * Whether the last written or last durable op time is used depends on whether
      * the config getWriteConcernMajorityShouldJournal is set.
      */
-    void _updateLastCommittedOpTimeAndWallTime(WithLock lk);
+    void _updateLastCommittedOpTimeAndWallTime(LockGuard& lk);
 
     /** Terms only increase, so if an incoming term is less than or equal to our
      * current term (_termShadow), there is no need to take the mutex and call _updateTerm.
@@ -1573,7 +1527,7 @@ private:
      *
      * Returns true if the value was updated to `newCommittedSnapshot`.
      */
-    bool _updateCommittedSnapshot(WithLock lk, const OpTime& newCommittedSnapshot);
+    bool _updateCommittedSnapshot(LockGuard& lk, const OpTime& newCommittedSnapshot);
 
     /**
      * A helper method that returns the current stable optime based on the current commit point.
@@ -1586,7 +1540,7 @@ private:
      * This function may also update the topology coordinator's cached value of the storage engine's
      * recovery timestamp.
      */
-    void _setStableTimestampForStorage(WithLock lk);
+    void _setStableTimestampForStorage(LockGuard& lk);
 
     /**
      * Updates the topology coordinator's cached value of the storage engine's recovery timestamp if
@@ -2047,6 +2001,7 @@ private:
         void onBecomePrimary() {
             auto lock = _mutex.writeLock();
             invariant(!_promise);
+            _outcomePromiseIsSet.store(false);
             _promise = std::make_unique<SharedPromise<void>>();
         }
 
@@ -2058,13 +2013,14 @@ private:
         void onBecomeNonPrimary() {
             auto lock = _mutex.writeLock();
             invariant(_promise);
-            // If we already completed the promise (either with success or error) then no reads
-            // are waiting on it and we don't need to change it, as read preference validation
-            // will reject primary read preference reads going forward.
-            // However, if we have not completed the promise (this can happen if we stepped down
-            // before we managed to create a waiter to complete it) then we need to explicitly
-            // fail it here.
-            if (!_promise->getFuture().isReady()) {
+            // The outcome may already have been set (with success or error) by
+            // allowReads()/disallowReads(), in which case no reads are waiting on the promise and
+            // read-preference validation will reject primary-read-preference reads going forward.
+            // Otherwise -- e.g. we stepped down before a waiter completed it -- we take ownership
+            // of the outcome and fail it here. The flag guarantees exactly one of the three
+            // methods sets the promise, which matters now that a write-concern waiter is fulfilled
+            // after the ReplicationCoordinator mutex is released and so can race with a stepdown.
+            if (!_outcomePromiseIsSet.swap(true)) {
                 _promise->setError({ErrorCodes::PrimarySteppedDown,
                                     "Primary stepped down while waiting for majority read "
                                     "availability)"});
@@ -2077,6 +2033,11 @@ private:
          */
         void allowReads() {
             auto lock = _mutex.readLock();
+            // See onBecomeNonPrimary(): if we lose the race the node has stepped down and there is
+            // nothing left to signal.
+            if (_outcomePromiseIsSet.swap(true)) {
+                return;
+            }
             invariant(_promise);
             _promise->emplaceValue();
         }
@@ -2089,6 +2050,11 @@ private:
         void disallowReads(Status status) {
             invariant(!status.isOK());
             auto lock = _mutex.readLock();
+            // See onBecomeNonPrimary(): if we lose the race the node has stepped down and there is
+            // nothing left to signal.
+            if (_outcomePromiseIsSet.swap(true)) {
+                return;
+            }
             invariant(_promise);
             _promise->setError(status);
         }
@@ -2113,6 +2079,12 @@ private:
     private:
         // Synchronizes reads/writes of _promise.
         mutable WriteRarelyRWMutex _mutex;
+
+        // Ensures exactly one of allowReads()/disallowReads()/onBecomeNonPrimary() sets the current
+        // promise's outcome; they can run concurrently because write-concern waiters are fulfilled
+        // after the ReplicationCoordinator mutex is released. Reset under the write lock by
+        // onBecomePrimary() for each new term.
+        Atomic<bool> _outcomePromiseIsSet{false};
 
         // A promise which is fulfilled once a new primary's first write in its new term has been
         // majority committed.

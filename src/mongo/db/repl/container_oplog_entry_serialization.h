@@ -24,11 +24,17 @@ namespace mongo::repl {
 class [[MONGO_MOD_PUBLIC]] ContainerKey {
 public:
     ContainerKey() : _key(int64_t{0}) {}
-    explicit ContainerKey(std::vector<std::span<const char>> key) : _key(std::move(key)) {}
+    explicit ContainerKey(std::vector<std::span<const char>> keys) : _key(std::move(keys)) {}
     explicit ContainerKey(int64_t key) : _key(key) {}
     explicit ContainerKey(std::span<const char> key) : _key(key) {}
 
     static ContainerKey parse(const BSONElement& elem);
+
+    /**
+     * Returns true if 'elem' encodes more than one key, without parsing it. An absent element is
+     * not packed.
+     */
+    static bool isPacked(const BSONElement& elem);
 
     void serialize(std::string_view fieldName, BSONObjBuilder* builder) const;
 
@@ -44,7 +50,7 @@ public:
         return std::holds_alternative<std::span<const char>>(_key);
     }
 
-    std::vector<std::span<const char>> getArrayKey() const;
+    const std::vector<std::span<const char>>& getArrayKey() const;
 
     int64_t getIntKey() const;
 
@@ -74,7 +80,18 @@ public:
 
     static ContainerVal parse(const BSONElement& elem);
 
+    /**
+     * Returns true if 'elem' encodes more than one value, without parsing it. An absent element is
+     * not packed.
+     *
+     * Note that a container insert with an unpacked key and a packed value still writes several
+     * keys: an int key with an array of values covers the consecutive keys starting at that key.
+     */
+    static bool isPacked(const BSONElement& elem);
+
     void serialize(std::string_view fieldName, BSONObjBuilder* builder) const;
+
+    size_t count() const;
 
     bool isBytesVal() const {
         return std::holds_alternative<std::span<const char>>(_data);
@@ -84,7 +101,7 @@ public:
         return std::holds_alternative<std::vector<std::span<const char>>>(_data);
     }
 
-    std::vector<std::span<const char>> getArrayVal() const;
+    const std::vector<std::span<const char>>& getArrayVal() const;
 
     std::span<const char> data() const;
 

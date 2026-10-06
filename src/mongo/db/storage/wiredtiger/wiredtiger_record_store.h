@@ -153,8 +153,8 @@ public:
 
     bool isColdCollection() const override;
 
-    std::string_view getURI() const {
-        return std::visit([](const auto& v) -> std::string_view { return v.uri(); }, _container);
+    const std::string& getURI() const {
+        return std::visit([](const auto& v) -> const std::string& { return v.uri(); }, _container);
     }
 
     uint64_t tableId() const {
@@ -172,6 +172,8 @@ public:
                         int infoLevel = 0) const override;
 
     int64_t freeStorageSize(RecoveryUnit& ru) const override;
+
+    boost::optional<int64_t> approxNumLeafPages(RecoveryUnit& ru) const override;
 
     bool updateWithDamagesSupported() const override;
 
@@ -476,7 +478,13 @@ private:
 
     void _handleTruncateAfter(WiredTigerRecoveryUnit&, const RecordId& lastKeptId) override;
 
-    StatusWith<Timestamp> _readEarliestTimestamp(RecoveryUnit&);
+    // A non-null 'after' bounds the search, so the cursor descends to the leaf holding 'after'
+    // instead of stepping over every page an earlier truncate deleted but has not yet reclaimed.
+    StatusWith<Timestamp> _readEarliestTimestamp(RecoveryUnit&, const RecordId& after);
+
+    // The earliest record only ever moves forward within a process lifetime, so a value read
+    // through an older snapshot must not replace a newer cached one.
+    void _advanceCachedEarliestTimestamp(Timestamp ts);
 
     Atomic<int64_t> _maxSize;
     Atomic<uint64_t> _cachedEarliestTimestamp{0};
@@ -693,4 +701,9 @@ private:
 // WT failpoint to throw write conflict exceptions randomly
 extern FailPoint WTWriteConflictException;
 extern FailPoint WTWriteConflictExceptionForReads;
+
+/**
+ * Registers the fail points above as the write conflict fail points for 'engineName'.
+ */
+void registerWiredTigerWriteConflictFailPoints(std::string_view engineName);
 }  // namespace mongo

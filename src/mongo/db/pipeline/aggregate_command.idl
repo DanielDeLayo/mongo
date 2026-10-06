@@ -82,6 +82,10 @@ commands:
                 - privilege: # $planCacheStats
                       resource_pattern: exact_namespace
                       action_type: planCacheRead
+                - privilege: # $joinPlanCacheStats
+                      agg_stage: joinPlanCacheStats
+                      resource_pattern: database
+                      action_type: planCacheRead
                 - privilege: # $querySettings
                       agg_stage: querySettings
                       resource_pattern: cluster
@@ -189,6 +193,14 @@ commands:
                       agg_stage: listClusterCatalog
                       resource_pattern: database
                       action_type: listCollections
+                - privilege: # $collStats
+                      agg_stage: collStats
+                      resource_pattern: cluster
+                      action_type: getCompleteCollStats
+                - privilege: # $collStats
+                      agg_stage: collStats
+                      resource_pattern: cluster
+                      action_type: getUnfilteredMetrics
         # Note that the 'CursorInitialReply' is not the only response that an aggregate command
         # could return. With 'explain' or 'exchange', the response would not include the fields in
         # 'CursorInitialReply'. But using 'explain' or 'exchange' is unstable, but otherwise the

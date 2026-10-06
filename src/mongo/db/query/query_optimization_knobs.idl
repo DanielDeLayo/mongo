@@ -735,7 +735,12 @@ server_parameters:
         description: >-
             When true, explain output for join embedding nodes includes a 'joinCostComponents'
             sub-object with the detailed cost breakdown (docsProcessed, docsOutput,
-            sequentialIOPages, randomIOPages, localOpCost).
+            numDocsTransmitted, sequentialIOPages, randomIOPages, localOpCost, totalCost). For
+            indexed nested loop join nodes it also includes a 'cardinalityRHSBeforeJoinPred' field
+            reporting the RHS cardinality before the join predicate is applied (i.e. after the
+            RHS's own single-table predicates). Join embedding nodes additionally include an
+            'ndvEstimates' array with the NDV estimate and its provenance ('ndv' and 'ndvSource')
+            for each join edge the node applies.
         set_at: [startup, runtime]
         cpp_varname: "internalQueryExplainJoinCostComponents"
         cpp_vartype: Atomic<bool>
@@ -824,17 +829,6 @@ server_parameters:
             query_knob:
                 wire_name: maxNumberNodesConsideredForImplicitEdges
 
-    internalInferSingleTablePredicates:
-        description: "Infer and propagate single table predicates across equivalence classes. This "
-        set_at: [startup, runtime]
-        cpp_varname: "internalInferSingleTablePredicates"
-        cpp_vartype: Atomic<bool>
-        default: true
-        redact: false
-        annotations:
-            query_knob:
-                wire_name: inferSingleTablePredicates
-
     internalQueryMaxPipelineRewrites:
         mod_visibility: needs_replacement
         description: "Maximum number of pipeline rewrite rules to apply"
@@ -876,7 +870,7 @@ server_parameters:
         set_at: [startup, runtime]
         cpp_varname: "internalEnableJoinOptimizationUseIndexUniqueness"
         cpp_vartype: Atomic<bool>
-        default: false
+        default: true
         redact: false
         annotations:
             query_knob:
@@ -1224,7 +1218,6 @@ server_parameters:
             query_knob:
                 wire_name: samplingBySequentialScan
 
-    # TODO SERVER-127563: Revisit the naming and organization of CBR-related knobs
     internalQuerySamplingByStrides:
         mod_visibility: needs_replacement
         description:
@@ -1241,12 +1234,29 @@ server_parameters:
             query_knob:
                 wire_name: samplingByStrides
 
+    internalQueryEnablePersistentNDVStats:
+        description: >-
+            Enables consulting persistent NDV (number of distinct values) statistics, built by the
+            analyze command, during sampling-based cardinality estimation. Only takes effect when
+            featureFlagPersistentStats is also enabled.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryEnablePersistentNDVStats"
+        cpp_vartype: Atomic<bool>
+        default: false
+        redact: false
+        annotations:
+            query_knob:
+                wire_name: enablePersistentNDVStats
+
     internalJoinPlanSamplingSize:
         description: For queries running through join optimization, control the sample size.
         set_at: [startup, runtime]
         cpp_varname: "internalJoinPlanSamplingSize"
         cpp_vartype: Atomic<int>
-        default: 1000
+        # Derived from the Kolmogorov statistic: with critical value 1.63 (alpha = 0.01) and
+        # precision 0.05, a sample of (1.63 / 0.05)^2 ~= 1063 documents bounds the error of the
+        # sample's empirical CDF to within 5% with 99% confidence.
+        default: 1063
         validator:
             gt: 0
         redact: false
@@ -1325,7 +1335,7 @@ server_parameters:
     internalQueryMinRequiredImprovementRatioForCostBasedRankerChoice:
         description: >-
             The minimum ratio by which the cost of CBR should be better than the remaining
-            multi-planning cost while choosing between them during AutomaticCE.
+            multi-planning cost while choosing between them under the mixed plan ranker.
         set_at: [startup, runtime]
         cpp_varname: "internalQueryMinRequiredImprovementRatioForCostBasedRankerChoice"
         cpp_vartype: Atomic<double>
@@ -1474,6 +1484,24 @@ server_parameters:
         annotations:
             query_knob:
                 wire_name: enableJoinPlanCache
+
+    internalQueryJoinPlanCacheSize:
+        # Marked as public as this knob cannot be accessed via the QueryKnobConfiguration framework.
+        # It is accessed only during startup during global initialization of the server at which
+        # point there is no OperationContext available to access the QueryKnobConfiguration.
+        mod_visibility: public
+        description: >-
+            The maximum amount of memory that the system will allocate for the join plan cache.
+            It takes a value in one of the two formats:
+            1. <number>% indicates a percentage of the physical memory available to the process. E.g.: 15%. Capped at 25%.
+            2. <number>(GB|MB|KB|B), indicates the amount of memory in GB, MB, KB or bytes. E.g.: 1.5GB, 100MB. Capped at 500GB.
+        set_at: [startup]
+        cpp_varname: "internalQueryJoinPlanCacheSize"
+        cpp_vartype: synchronized_value<std::string>
+        default: "16MB"
+        validator:
+            callback: memory_util::validatePlanCacheSize
+        redact: false
 # Note for adding additional query knobs:
 #
 # When adding a new query knob, you should consider whether or not you need to add an 'on_update'

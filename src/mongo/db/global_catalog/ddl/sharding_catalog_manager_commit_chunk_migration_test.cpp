@@ -1,9 +1,6 @@
 // Copyright (c) MongoDB, Inc.
 // SPDX-License-Identifier: SSPL-1.0
 
-#include <boost/optional/optional.hpp>
-#include <fmt/format.h>
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
@@ -33,7 +30,6 @@
 #include "mongo/db/session/session_catalog_mongod.h"
 #include "mongo/db/sharding_environment/config_server_test_fixture.h"
 #include "mongo/db/sharding_environment/shard_id.h"
-#include "mongo/db/sharding_environment/shard_ref.h"
 #include "mongo/db/topology/vector_clock/vector_clock.h"
 #include "mongo/db/version_context.h"
 #include "mongo/db/versioning_protocol/chunk_version.h"
@@ -51,6 +47,10 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -116,11 +116,11 @@ TEST_F(CommitChunkMigrate, ChunksUpdatedCorrectly) {
     const auto collTimestamp = Timestamp(42);
 
     ShardType shard0;
-    shard0.setHandle(ShardHandle{ShardId("shard0"), boost::none});
+    shard0.setName("shard0");
     shard0.setHost("shard0:12");
 
     ShardType shard1;
-    shard1.setHandle(ShardHandle{ShardId("shard1"), boost::none});
+    shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
     setupShards({shard0, shard1});
@@ -132,10 +132,10 @@ TEST_F(CommitChunkMigrate, ChunksUpdatedCorrectly) {
         migratedChunk.setName(OID::gen());
         migratedChunk.setCollectionUUID(collUUID);
         migratedChunk.setVersion(origVersion);
-        migratedChunk.setShard(ShardRef{shard0.getName()});
+        migratedChunk.setShard(shard0.getName());
         migratedChunk.setOnCurrentShardSince(Timestamp(100, 0));
         migratedChunk.setHistory(
-            {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), ShardRef{shard0.getName()})});
+            {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), shard0.getName())});
         migratedChunk.setRange({BSON("a" << 1), BSON("a" << 10)});
 
         origVersion.incMinor();
@@ -143,10 +143,10 @@ TEST_F(CommitChunkMigrate, ChunksUpdatedCorrectly) {
         controlChunk.setName(OID::gen());
         controlChunk.setCollectionUUID(collUUID);
         controlChunk.setVersion(origVersion);
-        controlChunk.setShard(ShardRef{shard0.getName()});
+        controlChunk.setShard(shard0.getName());
         controlChunk.setOnCurrentShardSince(Timestamp(50, 0));
         controlChunk.setHistory(
-            {ChunkHistory(*controlChunk.getOnCurrentShardSince(), ShardRef{shard0.getName()})});
+            {ChunkHistory(*controlChunk.getOnCurrentShardSince(), shard0.getName())});
         controlChunk.setRange({BSON("a" << 10), BSON("a" << 20)});
         controlChunk.setJumbo(true);
     }
@@ -209,11 +209,11 @@ TEST_F(CommitChunkMigrate, RejectMigrationWhenChangedChunksExceedSizeLimit) {
     const auto collTimestamp = Timestamp(42);
 
     ShardType shard0;
-    shard0.setHandle(ShardHandle{ShardId("shard0"), boost::none});
+    shard0.setName("shard0");
     shard0.setHost("shard0:12");
 
     ShardType shard1;
-    shard1.setHandle(ShardHandle{ShardId("shard1"), boost::none});
+    shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
     setupShards({shard0, shard1});
@@ -231,10 +231,10 @@ TEST_F(CommitChunkMigrate, RejectMigrationWhenChangedChunksExceedSizeLimit) {
         migratedChunk.setName(OID::gen());
         migratedChunk.setCollectionUUID(collUUID);
         migratedChunk.setVersion(origVersion);
-        migratedChunk.setShard(ShardRef{shard0.getName()});
+        migratedChunk.setShard(shard0.getName());
         migratedChunk.setOnCurrentShardSince(Timestamp(100, 0));
         migratedChunk.setHistory(
-            {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), ShardRef{shard0.getName()})});
+            {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), shard0.getName())});
         // A large string sorts after every number but before MaxKey in BSON order, so it is a valid
         // interior boundary between MinKey and MaxKey.
         migratedChunk.setRange({BSON("a" << MINKEY), BSON("a" << bigValue)});
@@ -244,10 +244,10 @@ TEST_F(CommitChunkMigrate, RejectMigrationWhenChangedChunksExceedSizeLimit) {
         controlChunk.setName(OID::gen());
         controlChunk.setCollectionUUID(collUUID);
         controlChunk.setVersion(origVersion);
-        controlChunk.setShard(ShardRef{shard0.getName()});
+        controlChunk.setShard(shard0.getName());
         controlChunk.setOnCurrentShardSince(Timestamp(50, 0));
         controlChunk.setHistory(
-            {ChunkHistory(*controlChunk.getOnCurrentShardSince(), ShardRef{shard0.getName()})});
+            {ChunkHistory(*controlChunk.getOnCurrentShardSince(), shard0.getName())});
         controlChunk.setRange({BSON("a" << bigValue), BSON("a" << MAXKEY)});
     }
 
@@ -272,68 +272,17 @@ TEST_F(CommitChunkMigrate, RejectMigrationWhenChangedChunksExceedSizeLimit) {
     ASSERT_EQ(migratedChunk.getVersion(), chunkDoc.getVersion());
 }
 
-TEST_F(CommitChunkMigrate, RejectDuringFCVTransitionWithStableOperationFCV) {
-    const auto originalFCV =
-        serverGlobalParams.featureCompatibility.acquireFCVSnapshot().getVersion();
-    ScopeGuard restoreFCV([&] { serverGlobalParams.mutableFCV.setVersion(originalFCV); });
-    // (Generic FCV reference): This test intentionally verifies commitChunkMigration behavior
-    // during an FCV transition, with a stable last LTS OFCV to ensure the server FCV being in
-    // transitional state is what rejects the migration.
-    serverGlobalParams.mutableFCV.setVersion(multiversion::GenericFCV::kLastLTS);
-    VersionContext::FixedOperationFCVRegion fixedOperationFCV(operationContext());
-    serverGlobalParams.mutableFCV.setVersion(
-        multiversion::GenericFCV::kUpgradingFromLastLTSToLatest);
-
-    const auto collUUID = UUID::gen();
-    const auto collEpoch = OID::gen();
-    const auto collTimestamp = Timestamp(42);
-
-    ShardType shard0;
-    shard0.setHandle(ShardHandle{ShardId("shard0"), boost::none});
-    shard0.setHost("shard0:12");
-
-    ShardType shard1;
-    shard1.setHandle(ShardHandle{ShardId("shard1"), boost::none});
-    shard1.setHost("shard1:12");
-
-    setupShards({shard0, shard1});
-
-    ChunkType migratedChunk;
-    const auto version = ChunkVersion({collEpoch, collTimestamp}, {12, 7});
-    migratedChunk.setName(OID::gen());
-    migratedChunk.setCollectionUUID(collUUID);
-    migratedChunk.setVersion(version);
-    migratedChunk.setShard(ShardRef{shard0.getName()});
-    migratedChunk.setOnCurrentShardSince(Timestamp(100, 0));
-    migratedChunk.setHistory(
-        {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), ShardRef{shard0.getName()})});
-    migratedChunk.setRange({BSON("a" << 1), BSON("a" << 10)});
-
-    setupCollection(kNamespace, kKeyPattern, {migratedChunk});
-
-    ASSERT_THROWS_CODE(ShardingCatalogManager::get(operationContext())
-                           ->commitChunkMigration(operationContext(),
-                                                  kNamespace,
-                                                  migratedChunk,
-                                                  migratedChunk.getVersion().epoch(),
-                                                  collTimestamp,
-                                                  ShardId(shard0.getName()),
-                                                  ShardId(shard1.getName())),
-                       DBException,
-                       ErrorCodes::ConflictingOperationInProgress);
-}
-
 TEST_F(CommitChunkMigrate, RetryCommittedMigrationSucceedsDuringFCVTransition) {
     const auto collUUID = UUID::gen();
     const auto collEpoch = OID::gen();
     const auto collTimestamp = Timestamp(42);
 
     ShardType shard0;
-    shard0.setHandle(ShardHandle{ShardId("shard0"), boost::none});
+    shard0.setName("shard0");
     shard0.setHost("shard0:12");
 
     ShardType shard1;
-    shard1.setHandle(ShardHandle{ShardId("shard1"), boost::none});
+    shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
     setupShards({shard0, shard1});
@@ -343,10 +292,10 @@ TEST_F(CommitChunkMigrate, RetryCommittedMigrationSucceedsDuringFCVTransition) {
     migratedChunk.setName(OID::gen());
     migratedChunk.setCollectionUUID(collUUID);
     migratedChunk.setVersion(version);
-    migratedChunk.setShard(ShardRef{shard0.getName()});
+    migratedChunk.setShard(shard0.getName());
     migratedChunk.setOnCurrentShardSince(Timestamp(100, 0));
     migratedChunk.setHistory(
-        {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), ShardRef{shard0.getName()})});
+        {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), shard0.getName())});
     migratedChunk.setRange({BSON("a" << 1), BSON("a" << 10)});
 
     setupCollection(kNamespace, kKeyPattern, {migratedChunk});
@@ -387,11 +336,11 @@ TEST_F(CommitChunkMigrate, ChunksUpdatedCorrectlyWithoutControlChunk) {
     const auto collTimestamp = Timestamp(42);
 
     ShardType shard0;
-    shard0.setHandle(ShardHandle{ShardId("shard0"), boost::none});
+    shard0.setName("shard0");
     shard0.setHost("shard0:12");
 
     ShardType shard1;
-    shard1.setHandle(ShardHandle{ShardId("shard1"), boost::none});
+    shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
     setupShards({shard0, shard1});
@@ -403,9 +352,9 @@ TEST_F(CommitChunkMigrate, ChunksUpdatedCorrectlyWithoutControlChunk) {
     chunk0.setName(OID::gen());
     chunk0.setCollectionUUID(collUUID);
     chunk0.setVersion(origVersion);
-    chunk0.setShard(ShardRef{shard0.getName()});
+    chunk0.setShard(shard0.getName());
     chunk0.setOnCurrentShardSince(Timestamp(100, 0));
-    chunk0.setHistory({ChunkHistory(*chunk0.getOnCurrentShardSince(), ShardRef{shard0.getName()})});
+    chunk0.setHistory({ChunkHistory(*chunk0.getOnCurrentShardSince(), shard0.getName())});
 
     // apportion
     auto chunkMin = BSON("a" << 1);
@@ -453,11 +402,11 @@ TEST_F(CommitChunkMigrate, CheckCorrectOpsCommandNoCtlTrimHistory) {
     const auto collTimestamp = Timestamp(42);
 
     ShardType shard0;
-    shard0.setHandle(ShardHandle{ShardId("shard0"), boost::none});
+    shard0.setName("shard0");
     shard0.setHost("shard0:12");
 
     ShardType shard1;
-    shard1.setHandle(ShardHandle{ShardId("shard1"), boost::none});
+    shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
     setupShards({shard0, shard1});
@@ -469,9 +418,9 @@ TEST_F(CommitChunkMigrate, CheckCorrectOpsCommandNoCtlTrimHistory) {
     chunk0.setName(OID::gen());
     chunk0.setCollectionUUID(collUUID);
     chunk0.setVersion(origVersion);
-    chunk0.setShard(ShardRef{shard0.getName()});
+    chunk0.setShard(shard0.getName());
     chunk0.setOnCurrentShardSince(Timestamp(100, 0));
-    chunk0.setHistory({ChunkHistory(*chunk0.getOnCurrentShardSince(), ShardRef{shard0.getName()})});
+    chunk0.setHistory({ChunkHistory(*chunk0.getOnCurrentShardSince(), shard0.getName())});
 
     // apportion
     auto chunkMin = BSON("a" << 1);
@@ -518,11 +467,11 @@ TEST_F(CommitChunkMigrate, RejectOutOfOrderHistory) {
     const auto collUUID = UUID::gen();
 
     ShardType shard0;
-    shard0.setHandle(ShardHandle{ShardId("shard0"), boost::none});
+    shard0.setName("shard0");
     shard0.setHost("shard0:12");
 
     ShardType shard1;
-    shard1.setHandle(ShardHandle{ShardId("shard1"), boost::none});
+    shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
     setupShards({shard0, shard1});
@@ -534,9 +483,9 @@ TEST_F(CommitChunkMigrate, RejectOutOfOrderHistory) {
     chunk0.setName(OID::gen());
     chunk0.setCollectionUUID(collUUID);
     chunk0.setVersion(origVersion);
-    chunk0.setShard(ShardRef{shard0.getName()});
+    chunk0.setShard(shard0.getName());
     chunk0.setOnCurrentShardSince(Timestamp(100, 1));
-    chunk0.setHistory({ChunkHistory(*chunk0.getOnCurrentShardSince(), ShardRef{shard0.getName()})});
+    chunk0.setHistory({ChunkHistory(*chunk0.getOnCurrentShardSince(), shard0.getName())});
 
     // apportion
     auto chunkMin = BSON("a" << 1);
@@ -566,11 +515,11 @@ TEST_F(CommitChunkMigrate, RejectWrongCollectionEpoch0) {
     const auto collUUID = UUID::gen();
 
     ShardType shard0;
-    shard0.setHandle(ShardHandle{ShardId("shard0"), boost::none});
+    shard0.setName("shard0");
     shard0.setHost("shard0:12");
 
     ShardType shard1;
-    shard1.setHandle(ShardHandle{ShardId("shard1"), boost::none});
+    shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
     setupShards({shard0, shard1});
@@ -582,7 +531,7 @@ TEST_F(CommitChunkMigrate, RejectWrongCollectionEpoch0) {
     chunk0.setName(OID::gen());
     chunk0.setCollectionUUID(collUUID);
     chunk0.setVersion(origVersion);
-    chunk0.setShard(ShardRef{shard0.getName()});
+    chunk0.setShard(shard0.getName());
 
     // apportion
     auto chunkMin = BSON("a" << 1);
@@ -593,7 +542,7 @@ TEST_F(CommitChunkMigrate, RejectWrongCollectionEpoch0) {
     chunk1.setName(OID::gen());
     chunk1.setCollectionUUID(collUUID);
     chunk1.setVersion(origVersion);
-    chunk1.setShard(ShardRef{shard0.getName()});
+    chunk1.setShard(shard0.getName());
 
     auto chunkMaxax = BSON("a" << 20);
     chunk1.setRange({chunkMax, chunkMaxax});
@@ -617,11 +566,11 @@ TEST_F(CommitChunkMigrate, RejectWrongCollectionEpoch1) {
     const auto collUUID = UUID::gen();
 
     ShardType shard0;
-    shard0.setHandle(ShardHandle{ShardId("shard0"), boost::none});
+    shard0.setName("shard0");
     shard0.setHost("shard0:12");
 
     ShardType shard1;
-    shard1.setHandle(ShardHandle{ShardId("shard1"), boost::none});
+    shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
     setupShards({shard0, shard1});
@@ -634,7 +583,7 @@ TEST_F(CommitChunkMigrate, RejectWrongCollectionEpoch1) {
     chunk0.setName(OID::gen());
     chunk0.setCollectionUUID(collUUID);
     chunk0.setVersion(origVersion);
-    chunk0.setShard(ShardRef{shard0.getName()});
+    chunk0.setShard(shard0.getName());
 
     // apportion
     auto chunkMin = BSON("a" << 1);
@@ -645,7 +594,7 @@ TEST_F(CommitChunkMigrate, RejectWrongCollectionEpoch1) {
     chunk1.setName(OID::gen());
     chunk1.setCollectionUUID(collUUID);
     chunk1.setVersion(otherVersion);
-    chunk1.setShard(ShardRef{shard0.getName()});
+    chunk1.setShard(shard0.getName());
 
     auto chunkMaxax = BSON("a" << 20);
     chunk1.setRange({chunkMax, chunkMaxax});
@@ -671,11 +620,11 @@ TEST_F(CommitChunkMigrate, CommitWithLastChunkOnShardShouldNotAffectOtherChunks)
     const auto collTimestamp = Timestamp(42);
 
     ShardType shard0;
-    shard0.setHandle(ShardHandle{ShardId("shard0"), boost::none});
+    shard0.setName("shard0");
     shard0.setHost("shard0:12");
 
     ShardType shard1;
-    shard1.setHandle(ShardHandle{ShardId("shard1"), boost::none});
+    shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
     setupShards({shard0, shard1});
@@ -687,9 +636,9 @@ TEST_F(CommitChunkMigrate, CommitWithLastChunkOnShardShouldNotAffectOtherChunks)
     chunk0.setName(OID::gen());
     chunk0.setCollectionUUID(collUUID);
     chunk0.setVersion(origVersion);
-    chunk0.setShard(ShardRef{shard0.getName()});
+    chunk0.setShard(shard0.getName());
     chunk0.setOnCurrentShardSince(Timestamp(100, 0));
-    chunk0.setHistory({ChunkHistory(*chunk0.getOnCurrentShardSince(), ShardRef{shard0.getName()})});
+    chunk0.setHistory({ChunkHistory(*chunk0.getOnCurrentShardSince(), shard0.getName())});
 
     // apportion
     auto chunkMin = BSON("a" << 1);
@@ -700,14 +649,14 @@ TEST_F(CommitChunkMigrate, CommitWithLastChunkOnShardShouldNotAffectOtherChunks)
     chunk1.setName(OID::gen());
     chunk1.setCollectionUUID(collUUID);
     chunk1.setVersion(origVersion);
-    chunk1.setShard(ShardRef{shard1.getName()});
+    chunk1.setShard(shard1.getName());
 
     auto chunkMaxax = BSON("a" << 20);
     chunk1.setRange({chunkMax, chunkMaxax});
 
     Timestamp ctrlChunkValidAfter = Timestamp(50, 0);
     chunk1.setOnCurrentShardSince(ctrlChunkValidAfter);
-    chunk1.setHistory({ChunkHistory(*chunk1.getOnCurrentShardSince(), ShardRef{shard1.getName()})});
+    chunk1.setHistory({ChunkHistory(*chunk1.getOnCurrentShardSince(), shard1.getName())});
 
     setupCollection(kNamespace, kKeyPattern, {chunk0, chunk1});
 
@@ -757,11 +706,11 @@ TEST_F(CommitChunkMigrate, RejectMissingChunkVersion) {
     const auto collUUID = UUID::gen();
 
     ShardType shard0;
-    shard0.setHandle(ShardHandle{ShardId("shard0"), boost::none});
+    shard0.setName("shard0");
     shard0.setHost("shard0:12");
 
     ShardType shard1;
-    shard1.setHandle(ShardHandle{ShardId("shard1"), boost::none});
+    shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
     setupShards({shard0, shard1});
@@ -772,20 +721,20 @@ TEST_F(CommitChunkMigrate, RejectMissingChunkVersion) {
     ChunkType migratedChunk;
     migratedChunk.setName(OID::gen());
     migratedChunk.setCollectionUUID(collUUID);
-    migratedChunk.setShard(ShardRef{shard0.getName()});
+    migratedChunk.setShard(shard0.getName());
     migratedChunk.setOnCurrentShardSince(Timestamp(100, 0));
     migratedChunk.setHistory(
-        {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), ShardRef{shard0.getName()})});
+        {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), shard0.getName())});
     migratedChunk.setRange({BSON("a" << 1), BSON("a" << 10)});
 
     ChunkType currentChunk;
     currentChunk.setName(OID::gen());
     currentChunk.setCollectionUUID(collUUID);
     currentChunk.setVersion(origVersion);
-    currentChunk.setShard(ShardRef{shard0.getName()});
+    currentChunk.setShard(shard0.getName());
     currentChunk.setOnCurrentShardSince(Timestamp(100, 0));
     currentChunk.setHistory(
-        {ChunkHistory(*currentChunk.getOnCurrentShardSince(), ShardRef{shard0.getName()})});
+        {ChunkHistory(*currentChunk.getOnCurrentShardSince(), shard0.getName())});
     currentChunk.setRange({BSON("a" << 1), BSON("a" << 10)});
 
     setupCollection(kNamespace, kKeyPattern, {currentChunk});
@@ -806,11 +755,11 @@ TEST_F(CommitChunkMigrate, RejectOlderChunkVersion) {
     const auto collUUID = UUID::gen();
 
     ShardType shard0;
-    shard0.setHandle(ShardHandle{ShardId("shard0"), boost::none});
+    shard0.setName("shard0");
     shard0.setHost("shard0:12");
 
     ShardType shard1;
-    shard1.setHandle(ShardHandle{ShardId("shard1"), boost::none});
+    shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
     setupShards({shard0, shard1});
@@ -822,10 +771,10 @@ TEST_F(CommitChunkMigrate, RejectOlderChunkVersion) {
     migratedChunk.setName(OID::gen());
     migratedChunk.setCollectionUUID(collUUID);
     migratedChunk.setVersion(origVersion);
-    migratedChunk.setShard(ShardRef{shard0.getName()});
+    migratedChunk.setShard(shard0.getName());
     migratedChunk.setOnCurrentShardSince(Timestamp(100, 0));
     migratedChunk.setHistory(
-        {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), ShardRef{shard0.getName()})});
+        {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), shard0.getName())});
     migratedChunk.setRange({BSON("a" << 1), BSON("a" << 10)});
 
     ChunkVersion currentChunkVersion({epoch, Timestamp(42)}, {14, 7});
@@ -834,10 +783,10 @@ TEST_F(CommitChunkMigrate, RejectOlderChunkVersion) {
     currentChunk.setName(OID::gen());
     currentChunk.setCollectionUUID(collUUID);
     currentChunk.setVersion(currentChunkVersion);
-    currentChunk.setShard(ShardRef{shard0.getName()});
+    currentChunk.setShard(shard0.getName());
     currentChunk.setOnCurrentShardSince(Timestamp(100, 0));
     currentChunk.setHistory(
-        {ChunkHistory(*currentChunk.getOnCurrentShardSince(), ShardRef{shard0.getName()})});
+        {ChunkHistory(*currentChunk.getOnCurrentShardSince(), shard0.getName())});
     currentChunk.setRange({BSON("a" << 1), BSON("a" << 10)});
 
     setupCollection(kNamespace, kKeyPattern, {currentChunk});
@@ -859,11 +808,11 @@ TEST_F(CommitChunkMigrate, RejectMismatchedEpoch) {
     const auto collUUID = UUID::gen();
 
     ShardType shard0;
-    shard0.setHandle(ShardHandle{ShardId("shard0"), boost::none});
+    shard0.setName("shard0");
     shard0.setHost("shard0:12");
 
     ShardType shard1;
-    shard1.setHandle(ShardHandle{ShardId("shard1"), boost::none});
+    shard1.setName("shard1");
     shard1.setHost("shard1:12");
 
     setupShards({shard0, shard1});
@@ -874,10 +823,10 @@ TEST_F(CommitChunkMigrate, RejectMismatchedEpoch) {
     migratedChunk.setName(OID::gen());
     migratedChunk.setCollectionUUID(collUUID);
     migratedChunk.setVersion(origVersion);
-    migratedChunk.setShard(ShardRef{shard0.getName()});
+    migratedChunk.setShard(shard0.getName());
     migratedChunk.setOnCurrentShardSince(Timestamp(100, 0));
     migratedChunk.setHistory(
-        {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), ShardRef{shard0.getName()})});
+        {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), shard0.getName())});
     migratedChunk.setRange({BSON("a" << 1), BSON("a" << 10)});
 
     ChunkVersion currentChunkVersion({OID::gen(), Timestamp(42)}, {12, 7});
@@ -886,10 +835,10 @@ TEST_F(CommitChunkMigrate, RejectMismatchedEpoch) {
     currentChunk.setName(OID::gen());
     currentChunk.setCollectionUUID(collUUID);
     currentChunk.setVersion(currentChunkVersion);
-    currentChunk.setShard(ShardRef{shard0.getName()});
+    currentChunk.setShard(shard0.getName());
     currentChunk.setOnCurrentShardSince(Timestamp(100, 0));
     currentChunk.setHistory(
-        {ChunkHistory(*currentChunk.getOnCurrentShardSince(), ShardRef{shard0.getName()})});
+        {ChunkHistory(*currentChunk.getOnCurrentShardSince(), shard0.getName())});
     currentChunk.setRange({BSON("a" << 1), BSON("a" << 10)});
 
     setupCollection(kNamespace, kKeyPattern, {currentChunk});
@@ -1171,11 +1120,11 @@ private:
         CommitChunkMigrate::setUp();
 
         ShardType shard0;
-        shard0.setHandle(ShardHandle{ShardId("shard0"), boost::none});
+        shard0.setName("shard0");
         shard0.setHost("shard0:12");
 
         ShardType shard1;
-        shard1.setHandle(ShardHandle{ShardId("shard1"), boost::none});
+        shard1.setName("shard1");
         shard1.setHost("shard1:12");
 
         setupShards({shard0, shard1});

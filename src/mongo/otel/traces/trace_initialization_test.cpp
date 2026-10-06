@@ -3,10 +3,14 @@
 
 #include "mongo/otel/traces/trace_initialization.h"
 
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/otel/traces/trace_settings.h"
+#include "mongo/otel/traces/trace_settings_gen.h"
 #include "mongo/otel/traces/tracer_provider_service.h"
 #include "mongo/otel/traces/tracer_provider_service_factory.h"
 #include "mongo/unittest/server_parameter_guard.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/scopeguard.h"
 
 #include <gmock/gmock.h>
 #include <opentelemetry/trace/noop.h>
@@ -23,7 +27,7 @@ public:
         // Initialize TracerProviderService with no-op provider
         auto tracerProviderService = createNoOpTracerProviderService();
         tracerProviderService->setTracerProvider_ForTest(
-            std::make_shared<opentelemetry::trace::NoopTracerProvider>());
+            std::make_unique<opentelemetry::trace::NoopTracerProvider>());
         setGlobalTracerProviderService(std::move(tracerProviderService));
     }
 
@@ -41,7 +45,7 @@ TEST_F(TraceInitializationTest, NoTraceProvider) {
 
     auto tracerProviderService = getGlobalTracerProviderService();
     ASSERT_TRUE(tracerProviderService);
-    EXPECT_FALSE(tracerProviderService->isEnabled());
+    EXPECT_FALSE(tracerProviderService->getTracerProvider());
 }
 
 TEST_F(TraceInitializationTest, Shutdown) {
@@ -49,14 +53,14 @@ TEST_F(TraceInitializationTest, Shutdown) {
 
     auto tracerProviderService = getGlobalTracerProviderService();
     ASSERT_TRUE(tracerProviderService);
-    EXPECT_FALSE(tracerProviderService->isEnabled());
+    EXPECT_FALSE(tracerProviderService->getTracerProvider());
 
     unittest::ServerParameterGuard directoryParam{"opentelemetryTraceDirectory", "/tmp/"};
     shutdown();
 
     tracerProviderService = getGlobalTracerProviderService();
     ASSERT_TRUE(tracerProviderService);
-    EXPECT_FALSE(tracerProviderService->isEnabled());
+    EXPECT_FALSE(tracerProviderService->getTracerProvider());
 }
 
 TEST_F(TraceInitializationTest, FileTraceProvider) {
@@ -65,8 +69,9 @@ TEST_F(TraceInitializationTest, FileTraceProvider) {
 
     auto tracerProviderService = getGlobalTracerProviderService();
     ASSERT_TRUE(tracerProviderService);
-    EXPECT_TRUE(tracerProviderService->isEnabled());
-    EXPECT_FALSE(isNoop(tracerProviderService->getTracerProvider().get()));
+    auto* provider = tracerProviderService->getTracerProvider();
+    ASSERT_NE(provider, nullptr);
+    EXPECT_FALSE(isNoop(provider));
 }
 
 TEST_F(TraceInitializationTest, HttpTraceProvider) {
@@ -76,8 +81,9 @@ TEST_F(TraceInitializationTest, HttpTraceProvider) {
 
     auto tracerProviderService = getGlobalTracerProviderService();
     ASSERT_TRUE(tracerProviderService);
-    EXPECT_TRUE(tracerProviderService->isEnabled());
-    EXPECT_FALSE(isNoop(tracerProviderService->getTracerProvider().get()));
+    auto* provider = tracerProviderService->getTracerProvider();
+    ASSERT_NE(provider, nullptr);
+    EXPECT_FALSE(isNoop(provider));
 }
 
 TEST_F(TraceInitializationTest, HttpAndDirectorySetSimultaneouslyFails) {
@@ -88,8 +94,9 @@ TEST_F(TraceInitializationTest, HttpAndDirectorySetSimultaneouslyFails) {
 
     auto tracerProviderService = getGlobalTracerProviderService();
     ASSERT_TRUE(tracerProviderService);
-    EXPECT_TRUE(tracerProviderService->isEnabled());
-    EXPECT_TRUE(isNoop(tracerProviderService->getTracerProvider().get()));
+    auto* provider = tracerProviderService->getTracerProvider();
+    ASSERT_NE(provider, nullptr);
+    EXPECT_TRUE(isNoop(provider));
 }
 
 TEST_F(TraceInitializationTest, InvalidCompressionFails) {
@@ -119,6 +126,26 @@ TEST_F(TraceInitializationTest, MaxBatchSizeEqualToMaxQueueSizeSucceeds) {
     unittest::ServerParameterGuard batchSizeParam{"openTelemetryTracingMaxBatchSize", 512};
     unittest::ServerParameterGuard queueSizeParam{"openTelemetryTracingMaxQueueSize", 512};
     ASSERT_OK(initialize(kServiceName));
+}
+
+TEST_F(TraceInitializationTest, HeadersWithoutHttpExporterLogsWarning) {
+    // Configure HTTP export headers while only the file exporter is enabled. The headers cannot be
+    // sent without the HTTP exporter, so initialization must log a warning.
+    unittest::ServerParameterGuard directoryParam{"opentelemetryTraceDirectory", "/tmp/"};
+
+    OpenTelemetryTracingHttpExportHeaders headersParam{"openTelemetryTracingHttpExportHeaders",
+                                                       ServerParameterType::kStartupOnly};
+    auto setHeaders = [&](BSONObj doc) {
+        auto storage = BSON("v" << doc);
+        return headersParam.set(storage.firstElement(), /*tenantId=*/boost::none);
+    };
+    ASSERT_OK(setHeaders(BSON("Authorization" << "Bearer ignored-token")));
+    ON_BLOCK_EXIT([&] { invariant(setHeaders(BSONObj{})); });
+
+    unittest::LogCaptureGuard logs;
+    ASSERT_OK(initialize(kServiceName));
+    logs.stop();
+    ASSERT_EQ(logs.countBSONContainingSubset(BSON("id" << 12877900)), 1);
 }
 
 }  // namespace

@@ -25,6 +25,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
+#include "mongo/db/repl/replication_coordinator_impl_gen.h"
 #include "mongo/db/repl/replication_metrics.h"
 #include "mongo/db/repl/replication_metrics_gen.h"
 #include "mongo/db/repl/replication_process.h"
@@ -84,6 +85,7 @@ MONGO_FAIL_POINT_DEFINE(hangAfterTrackingNewHandleInHandleHeartbeatResponseForTe
 MONGO_FAIL_POINT_DEFINE(waitForPostActionCompleteInHbReconfig);
 MONGO_FAIL_POINT_DEFINE(pauseInHandleHeartbeatResponse);
 MONGO_FAIL_POINT_DEFINE(hangHeartbeatReconfigStore);
+MONGO_FAIL_POINT_DEFINE(pauseSendingOutgoingHeartbeats);
 
 }  // namespace
 
@@ -121,6 +123,20 @@ void ReplicationCoordinatorImpl::_doMemberHeartbeat(executor::TaskExecutor::Call
     }
 
     const Date_t now = _replExecutor->now();
+
+    // Simulates a node that is unable to initiate any work (e.g. host-level CPU starvation) while
+    // its network stack still replies to inbound heartbeats.
+    if (MONGO_unlikely(pauseSendingOutgoingHeartbeats.shouldFail())) {
+        LOGV2_FOR_HEARTBEATS(13034801,
+                             2,
+                             "Not sending heartbeat because pauseSendingOutgoingHeartbeats "
+                             "failpoint is enabled",
+                             "target"_attr = target);
+        _scheduleHeartbeatToTarget(
+            lk, target, now + _rsConfig.unsafePeek().getHeartbeatInterval(), replSetName);
+        return;
+    }
+
     BSONObj heartbeatObj;
     Milliseconds timeout(0);
     const std::pair<ReplSetHeartbeatArgsV1, Milliseconds> hbRequest =
@@ -199,7 +215,7 @@ void ReplicationCoordinatorImpl::handleHeartbeatResponse_forTest(BSONObj respons
 
     _handleHeartbeatResponse(cbData, replSetNameString);
     {
-        std::unique_lock lk(_mutex);
+        LockGuard lk(_mutex);
         invariant(!_heartbeatHandles.contains(handle));
     }
 }
@@ -212,7 +228,7 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
             std::string_view dtarget = data["target"].valueStringDataSafe();
             return dtarget == cbData.request.target.toString();
         });
-    std::unique_lock lk(_mutex);
+    LockGuard lk(_mutex);
 
     // remove handle from queued heartbeats
     _untrackHeartbeatHandle(lk, cbData.myHandle);
@@ -344,9 +360,26 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
         // Postpone election timeout if we have a successful heartbeat response from the primary.
         if (hbResponse.hasState() && hbResponse.getState().primary() &&
             hbResponse.getTerm() == _topCoord->getTerm()) {
-            LOGV2_FOR_ELECTION(
-                4615659, 4, "Postponing election timeout due to heartbeat from primary");
-            _cancelAndRescheduleElectionTimeout(lk);
+            // A heartbeat response only proves that the primary's network stack is alive. When the
+            // strict check is enabled, additionally require that the primary has recently sent us a
+            // heartbeat *request*, which proves it is still initiating work. The response that
+            // first reveals the primary arrives before we have identified it, so postpone that one;
+            // from the next response on, a primary that has never sent us a request reads as
+            // arbitrarily stale and no longer postpones the election timeout.
+            const auto lastHbRecvFromPrimary = _topCoord->getLastHeartbeatRecvFromPrimary();
+            const bool primaryRecentlyInitiatedHeartbeat = !lastHbRecvFromPrimary ||
+                now - *lastHbRecvFromPrimary < _rsConfig.unsafePeek().getElectionTimeoutPeriod();
+            if (!enableStrictPrimaryLivenessCheck.load() || primaryRecentlyInitiatedHeartbeat) {
+                LOGV2_FOR_ELECTION(
+                    4615659, 4, "Postponing election timeout due to heartbeat from primary");
+                _cancelAndRescheduleElectionTimeout(lk);
+            } else {
+                LOGV2_FOR_ELECTION(13034800,
+                                   4,
+                                   "Not postponing election timeout: received a heartbeat response "
+                                   "from the primary, but no heartbeat request from it recently",
+                                   "lastHeartbeatRecvFromPrimary"_attr = *lastHbRecvFromPrimary);
+            }
         }
     } else {
         LOGV2_FOR_HEARTBEATS(4615621,
@@ -436,14 +469,13 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
     _scheduleHeartbeatToTarget(
         lk, target, std::max(now, action.getNextHeartbeatStartDate()), setName);
 
-    _handleHeartbeatResponseAction(action, hbStatusResponse, std::move(lk));
+    _handleHeartbeatResponseAction(action, hbStatusResponse, lk);
 }
 
-std::unique_lock<ObservableMutex<std::mutex>>
-ReplicationCoordinatorImpl::_handleHeartbeatResponseAction(
+void ReplicationCoordinatorImpl::_handleHeartbeatResponseAction(
     const HeartbeatResponseAction& action,
     const StatusWith<ReplSetHeartbeatResponse>& responseStatus,
-    std::unique_lock<ObservableMutex<std::mutex>> lock) {
+    LockGuard& lock) {
     invariant(lock.owns_lock());
     auto rsc = *_rsConfig.makeSnapshot();
     switch (action.getAction()) {
@@ -525,7 +557,6 @@ ReplicationCoordinatorImpl::_handleHeartbeatResponseAction(
         _externalState->notifyOtherMemberDataChanged();
         lock.lock();
     }
-    return lock;
 }
 
 executor::TaskExecutor::EventHandle ReplicationCoordinatorImpl::_stepDownStart() {
@@ -918,7 +949,7 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
     auto opCtx = cc().makeOperationContext();
     boost::optional<rss::consensus::ReplicationStateTransitionGuard> rstg;
     boost::optional<AutoGetRstlForStepUpStepDown> arsd;
-    std::unique_lock lk(_mutex);
+    LockGuard lk(_mutex);
     auto rsc = *_rsConfig.makeSnapshot();
     if (_shouldStepDownOnReconfig(lk, newConfig, myIndex)) {
         _topCoord->prepareForUnconditionalStepDown();
@@ -1138,7 +1169,7 @@ void ReplicationCoordinatorImpl::_startHeartbeats(WithLock lk) {
 
 void ReplicationCoordinatorImpl::_handleLivenessTimeout(
     const executor::TaskExecutor::CallbackArgs& cbData) {
-    std::unique_lock lk(_mutex);
+    LockGuard lk(_mutex);
     if (!cbData.status.isOK()) {
         return;
     }
@@ -1147,8 +1178,7 @@ void ReplicationCoordinatorImpl::_handleLivenessTimeout(
     HeartbeatResponseAction action = _topCoord->checkMemberTimeouts(_replExecutor->now());
     // Don't mind potential asynchronous stepdown as this is the last step of
     // liveness check.
-    lk = _handleHeartbeatResponseAction(
-        action, StatusWith(ReplSetHeartbeatResponse()), std::move(lk));
+    _handleHeartbeatResponseAction(action, StatusWith(ReplSetHeartbeatResponse()), lk);
 
     _scheduleNextLivenessUpdate(lk, /* reschedule = */ false);
 }

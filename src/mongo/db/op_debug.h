@@ -12,8 +12,9 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/profile_filter.h"
 #include "mongo/db/query/client_cursor/cursor_response_gen.h"
+#include "mongo/db/query/compiler/optimizer/join/fallback_reason.h"
 #include "mongo/db/query/plan_executor.h"
-#include "mongo/db/query/plan_ranking/plan_ranker_method.h"
+#include "mongo/db/query/plan_ranking/plan_selection_strategy.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_shape/query_shape_hash.h"
 #include "mongo/db/query/query_stats/data_bearing_node_metrics.h"
@@ -403,6 +404,115 @@ public:
     };
     boost::optional<VectorSearchMetrics> vectorSearchMetrics = boost::none;
 
+    // Join optimization statistics captured per query shape for reporting by query stats. Populated
+    // only when a query appears to be join-optimizable (though we may still bail out).
+    struct JoinOptimizationMetrics {
+        // Was this query eligible for join optimization.
+        bool joinOptimizable = false;
+        // Why join optimization stopped doing more than it did, if it stopped early. Read together
+        // with 'joinOptimizable': when false, this is why we bailed out entirely; when true, this
+        // is why the join-graph prefix stopped growing and the query was only optimized over that
+        // prefix.
+        boost::optional<join_ordering::JoinFallbackReason> fallbackReason;
+        // Number of unique namespaces that were pushed into the join model.
+        int numNamespaces = 0;
+        // Number of $lookup stages that remained in the non-join-reorderable query suffix.
+        int numLookupsInSuffix = 0;
+        // Number of suffix document sources we were able to lower into SBE after the
+        // join-optimizable prefix.
+        int numSuffixSourcesPushedToSbe = 0;
+        // Number of "residual" document sources that had to execute in classic DocumentSource land.
+        int numResidualClassicSources = 0;
+        // Number of nodes in the join graph. Note: this is the same as the number of $lookup stages
+        // that were pushed down into the join-reorderable query prefix.
+        int numJoinGraphNodes = 0;
+        // Number of edges in the join graph before inference.
+        int numSyntacticEdges = 0;
+        // Number of inferred edges.
+        int numInferredEdges = 0;
+        // Number of $expr equality join predicates in the join graph (before inference).
+        int numSyntacticExprJoinPredicates = 0;
+        // Number of simple equality ($eq) join predicates in the join graph (before inference).
+        int numSyntacticEqJoinPredicates = 0;
+        // Number of simple equality ($eq) join predicates that were inferred- note that these are
+        // the only type of join predicates we infer.
+        int numInferredEqJoinPredicates = 0;
+        // Number of inferred single-table predicates (one per predicate per table).
+        int numInferredSingleTablePredicates = 0;
+
+        // Whether the join graph is complete, i.e. every pair of nodes is joined (post-inference).
+        bool isClique = false;
+        // Whether one hub node is joined to every other node, and there are no other edges
+        // (post-inference).
+        bool isStar = false;
+        // Whether the join graph contains at least one cycle between nodes (post-inference).
+        bool isCycle = false;
+        // Whether the nodes form a single path, each joined to at most two others (post-inference).
+        bool isChain = false;
+
+        // Time taken to extract a join model from the query.
+        int64_t joinModelingTimeMicros = 0;
+        // Time taken to lower the chosen QSN to SBE.
+        int64_t sbeLoweringTimeMicros = 0;
+
+        // Metrics gathered while enumerating join plans. We only populate these fields if we have a
+        // cache miss.
+        struct PlanEnumerationMetrics {
+            // Number of plans considered in the final subset during plan enumeration.
+            int numPlansEnumerated = 0;
+            // Number of hash joins enumerated across all levels.
+            int numHashJoins = 0;
+            // Number of indexed nested loop joins enumerated across all levels.
+            int numIndexedNestedLoopJoins = 0;
+            // Number of nested loop joins enumerated across all levels.
+            int numNestedLoopJoins = 0;
+            // Number of hash joins in the best (winning) plan.
+            int numFinalPlanHashJoins = 0;
+            // Number of indexed nested loop joins in the best (winning) plan.
+            int numFinalPlanIndexedNestedLoopJoins = 0;
+            // Number of nested loop joins in the best (winning) plan.
+            int numFinalPlanNestedLoopJoins = 0;
+            // Number of join nodes considered but rejected due to cost.
+            int numJoinNodesRejectedByCost = 0;
+            // Number of nodes memoized during plan enumeration.
+            int numMemoizedNodes = 0;
+            // Cost of the best (winning) plan.
+            double winningPlanCost = 0.0;
+            // Number of times we generated a sample during join optimization (one per distinct
+            // namespace in the join graph).
+            int numSamplingCalls = 0;
+            // Number of those samples that were served from a persistent sample rather than freshly
+            // scanned.
+            int numPersistentSamplesUsed = 0;
+            // Number of join edges whose NDV came from index uniqueness metadata instead of
+            // sampling.
+            int numUniqueIndexesUsedForNDV = 0;
+            // Number of distinct persisted NDV statistics (analyze mode "ndv") served during
+            // plan enumeration, for edge selectivity estimation or costing. Repeated requests
+            // for the same statistics are memoized and counted once.
+            int numPersistentNDVStatsUsed = 0;
+            // Number of join-graph collections for which the storage engine did not report a
+            // usable approximate leaf page count (see RecordStore::approxNumLeafPages()), forcing
+            // cost estimation to fall back to a size-based estimate. 'boost::none' until catalog
+            // statistics are collected, so a planning failure reads as "never measured" rather
+            // than as a measured zero.
+            boost::optional<int> numApproxLeafPagesUnavailable;
+
+            // Time spent acquiring samples for CE.
+            int64_t samplingTimeMicros = 0;
+            // Time spent generating single-table access plans in CBR.
+            int64_t cbrPlanningTimeMicros = 0;
+            // Time taken to enumerate plans and pick a winning plan.
+            int64_t planEnumerationTimeMicros = 0;
+            // Time spent evaluating CE for join optimization: up-front edge selectivity estimation
+            // plus the per-subset cardinality estimates computed lazily during enumeration. This
+            // is separate from the CE performed inside CBR.
+            int64_t ceTimeMicros = 0;
+        };
+        boost::optional<PlanEnumerationMetrics> planEnumerationMetrics = boost::none;
+    };
+    boost::optional<JoinOptimizationMetrics> joinOptimizationMetrics = boost::none;
+
     /**
      * Tracks the number of documents seen and returned by the $_internalSearchIdLookup
      * stage. Used for batch size tuning.
@@ -649,10 +759,13 @@ public:
     // The query framework that this operation used. Will be unknown for non query operations.
     PlanExecutor::QueryFramework queryFramework{PlanExecutor::QueryFramework::kUnknown};
 
-    // The plan ranker (multi-planner or cost-based ranker) that selected the winning plan for this
-    // operation. Will be unknown when no ranking took place (single solution, plan cache hit, or a
-    // non-query operation).
-    PlanRankerMethod planRankerMethod{PlanRankerMethod::kNone};
+    // The strategy that selected the winning plan. Written by setPlanSummaryMetrics.
+    // Reported as "none" when no plan selection took place.
+    boost::optional<PlanSelectionStrategy> planSelectionStrategy;
+
+    // Whether the winning plan was produced by the join optimizer. Written by
+    // setPlanSummaryMetrics. Only ever true when join optimization is enabled.
+    bool usedJoinOptimization{false};
 
     // Tracks the amount of dynamic indexed loop joins in a pushed down stage.
     int lookupDynamicIndexedLoopJoin{0};
@@ -705,6 +818,12 @@ public:
     // Tracks whether a non leading $replaceRoot was pushed down to SBE in the trySbeRestricted
     // mode. This is a bool to ensure it's set only once per query.
     bool nlpReplaceRoot{false};
+
+    // 'true' if the query has a leading match filter.
+    bool pathArraynessLeadingFilter{false};
+    // 'true' if the query has simplified a leading match filter by leveraging path arrayness
+    // information.
+    bool pathArraynessSimplified{false};
 
     // Tracks the number of spilled bytes by hash lookup in a pushed down lookup stage. The spilled
     // storage size after compression might be different from the bytes spilled.

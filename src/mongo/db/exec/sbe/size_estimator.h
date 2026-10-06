@@ -2,6 +2,20 @@
 // SPDX-License-Identifier: SSPL-1.0
 #pragma once
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/values/row.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/exec/sbe/values/value_size.h"
+#include "mongo/db/query/compiler/physical_model/index_bounds/index_bounds.h"
+#include "mongo/db/query/compiler/physical_model/interval/interval.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/util/modules.h"
+#include "mongo/util/string_listset.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <memory>
@@ -13,23 +27,7 @@
 
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/inlined_vector.h>
-
 // IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
-
-#include "mongo/bson/bsonobj.h"
-#include "mongo/bson/util/builder.h"
-#include "mongo/db/exec/plan_stats.h"
-#include "mongo/db/exec/sbe/expressions/expression.h"
-#include "mongo/db/exec/sbe/stages/stages.h"
-#include "mongo/db/exec/sbe/stages/window.h"
-#include "mongo/db/exec/sbe/values/row.h"
-#include "mongo/db/exec/sbe/values/value.h"
-#include "mongo/db/exec/sbe/values/value_size.h"
-#include "mongo/db/query/compiler/physical_model/index_bounds/index_bounds.h"
-#include "mongo/db/query/compiler/physical_model/interval/interval.h"
-#include "mongo/db/storage/index_entry_comparison.h"
-#include "mongo/util/modules.h"
-#include "mongo/util/string_listset.h"
 
 /**
  * Contains a set of functions for shallow estimating the size of allocated on the heap objects
@@ -99,28 +97,6 @@ inline size_t estimate(const BlockAggExprTuple& tuple) {
 
     size += tuple.agg->estimateSize();
 
-    return size;
-}
-
-inline size_t estimate(const WindowStage::Window& window) {
-    size_t size = sizeof(window);
-    if (window.lowBoundExpr) {
-        size += size_estimator::estimate(window.lowBoundExpr);
-    }
-    if (window.highBoundExpr) {
-        size += size_estimator::estimate(window.highBoundExpr);
-    }
-    for (size_t i = 0; i < window.initExprs.size(); ++i) {
-        if (window.initExprs[i]) {
-            size += size_estimator::estimate(window.initExprs[i]);
-        }
-        if (window.addExprs[i]) {
-            size += size_estimator::estimate(window.addExprs[i]);
-        }
-        if (window.removeExprs[i]) {
-            size += size_estimator::estimate(window.removeExprs[i]);
-        }
-    }
     return size;
 }
 

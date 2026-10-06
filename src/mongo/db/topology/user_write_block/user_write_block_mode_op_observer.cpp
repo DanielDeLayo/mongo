@@ -24,7 +24,7 @@ void UserWriteBlockModeOpObserver::onInserts(OperationContext* opCtx,
                                              std::vector<InsertStatement>::const_iterator first,
                                              std::vector<InsertStatement>::const_iterator last,
                                              const std::vector<RecordId>& recordIds,
-                                             std::vector<bool> fromMigrate,
+                                             const std::vector<bool>& fromMigrate,
                                              bool defaultFromMigrate,
                                              OpStateAccumulator* opAccumulator) {
     const auto& nss = coll->ns();
@@ -130,7 +130,7 @@ void UserWriteBlockModeOpObserver::onReplicationRollback(OperationContext* opCtx
                                                          const RollbackObserverInfo& rbInfo) {
     if (rbInfo.rollbackNamespaces.find(NamespaceString::kUserWritesCriticalSectionsNamespace) !=
         rbInfo.rollbackNamespaces.end()) {
-        UserWritesRecoverableCriticalSectionService::get(opCtx)->recoverRecoverableCriticalSections(
+        UserWritesRecoverableCriticalSectionService::get(opCtx)->recoverUserWritesCriticalSection(
             opCtx);
     }
 }

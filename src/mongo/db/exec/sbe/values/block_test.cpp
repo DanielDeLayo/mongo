@@ -32,11 +32,10 @@ using ColumnOpType = value::ColumnOpType;
 TEST(SbeBlockTest, SbeValueBlockTypeIsCopyable) {
     value::MonoBlock block(1, TypeTags::NumberInt32, value::bitcastFrom<int32_t>(123));
 
-    auto [cpyTag, cpyValue] =
-        value::copyValue(TypeTags::valueBlock, value::bitcastFrom<value::MonoBlock*>(&block));
-    value::ValueGuard cpyGuard(cpyTag, cpyValue);
-    ASSERT_EQ(cpyTag, TypeTags::valueBlock);
-    auto cpy = value::getValueBlock(cpyValue);
+    value::TagValueOwned cpyOwned = value::TagValueOwned::fromRaw(
+        value::copyValue(TypeTags::valueBlock, value::bitcastFrom<value::MonoBlock*>(&block)));
+    ASSERT_EQ(cpyOwned.tag(), TypeTags::valueBlock);
+    auto cpy = value::getValueBlock(cpyOwned.value());
 
     auto extracted = cpy->extract();
     ASSERT_EQ(extracted.count(), 1);
@@ -47,11 +46,10 @@ TEST(SbeBlockTest, SbeValueBlockTypeIsCopyable) {
 TEST(SbeBlockTest, SbeCellBlockTypeIsCopyable) {
     value::ScalarMonoCellBlock block(1, TypeTags::NumberInt32, value::bitcastFrom<int32_t>(123));
 
-    auto [cpyTag, cpyValue] = value::copyValue(
-        TypeTags::cellBlock, value::bitcastFrom<value::ScalarMonoCellBlock*>(&block));
-    value::ValueGuard cpyGuard(cpyTag, cpyValue);
-    ASSERT_EQ(cpyTag, TypeTags::cellBlock);
-    auto cpy = value::getCellBlock(cpyValue);
+    value::TagValueOwned cpyOwned = value::TagValueOwned::fromRaw(value::copyValue(
+        TypeTags::cellBlock, value::bitcastFrom<value::ScalarMonoCellBlock*>(&block)));
+    ASSERT_EQ(cpyOwned.tag(), TypeTags::cellBlock);
+    auto cpy = value::getCellBlock(cpyOwned.value());
 
     auto& vals = cpy->getValueBlock();
     auto extracted = vals.extract();
@@ -1022,6 +1020,39 @@ TEST_F(ValueBlockTest, TestBlockMapFast) {
     // Verify that the fast path won't be taken if the block isn't dense.
     block->push_back(makeNothing());
     ASSERT_EQ(block->mapMonotonicFastPath(testOp5), nullptr);
+}
+
+// A monotonic "less than 50" comparison, mirroring the block operation generated for a
+// {$lt: 50} predicate on a measurement field.
+static const auto testOpLtFifty =
+    value::makeColumnOp<ColumnOpType::kMonotonic>([](TypeTags tag, Value val) {
+        return value::genericLt(tag, val, TypeTags::NumberDouble, value::bitcastFrom<double>(50.0));
+    });
+
+// NaN sorts as a block's lower bound but compares false against everything, so the monotonic map
+// fast path must not fire when a bound is NaN. Otherwise a matching value in the block (e.g. one
+// less than the target that sorts above NaN) would be incorrectly dropped.
+TEST_F(ValueBlockTest, TestBlockMapFastNaNBound) {
+    auto block = std::make_unique<TestBlock>();
+
+    block->push_back(TypeTags::NumberDouble, value::bitcastFrom<double>(1.0));
+    block->push_back(TypeTags::NumberDouble,
+                     value::bitcastFrom<double>(std::numeric_limits<double>::quiet_NaN()));
+    block->push_back(TypeTags::NumberDouble, value::bitcastFrom<double>(100.0));
+
+    // The block reports NaN as its lower bound (NaN sorts smallest) and 100 as its upper bound.
+    block->setMin(TypeTags::NumberDouble,
+                  value::bitcastFrom<double>(std::numeric_limits<double>::quiet_NaN()));
+    block->setMax(TypeTags::NumberDouble, value::bitcastFrom<double>(100.0));
+
+    // The fast path must bail out because a bound is NaN, leaving the actual per-value comparison
+    // to the general map path.
+    ASSERT_EQ(block->mapMonotonicFastPath(testOpLtFifty), nullptr);
+
+    // The full map correctly matches only the value that is less than 50.
+    auto outBlock = block->map(testOpLtFifty);
+    auto output = blockToBsonArr(*outBlock);
+    ASSERT_BSONOBJ_EQ(output, fromjson("{result: [true, false, false]}"));
 }
 
 // Tests for getApproximateSize() on ValueBlock and CellBlock implementations.

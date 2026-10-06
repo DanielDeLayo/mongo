@@ -15,11 +15,12 @@
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
 #include "mongo/db/query/engine_selection.h"
+#include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/get_executor_fast_paths.h"
 #include "mongo/db/query/get_executor_helpers.h"
 #include "mongo/db/query/plan_cache/plan_cache_key_factory.h"
 #include "mongo/db/query/plan_ranking/plan_ranker.h"
-#include "mongo/db/query/plan_ranking/plan_ranker_method.h"
+#include "mongo/db/query/plan_ranking/plan_selection_strategy.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_planner_params_diagnostic_printer.h"
@@ -171,6 +172,7 @@ StatusWith<std::unique_ptr<PlannerInterface>> planWithCBR(
         return std::make_unique<SingleSolutionPassthroughPlanner>(
             makePlannerData(),
             std::move(rankerResult.solutions[0]),
+            rankerResult.planSelectionStrategy,
             std::move(rankerResult.maybeExplainData));
     }
 
@@ -180,7 +182,8 @@ StatusWith<std::unique_ptr<PlannerInterface>> planWithCBR(
     return std::make_unique<MultiPlanner>(makePlannerData(),
                                           std::move(rankerResult.solutions),
                                           rankerResult.needsWorksMeasuredForPlanCache,
-                                          std::move(rankerResult.maybeExplainData));
+                                          std::move(rankerResult.maybeExplainData),
+                                          rankerResult.planSelectionStrategy);
 }
 }  // namespace
 
@@ -205,8 +208,10 @@ StatusWith<std::unique_ptr<PlannerInterface>> preparePlanner(
     };
     auto buildSingleSolutionPlanner = [&](std::unique_ptr<QuerySolution> solution,
                                           boost::optional<size_t> cachedPlanHash) {
-        return std::make_unique<SingleSolutionPassthroughPlanner>(makePlannerData(cachedPlanHash),
-                                                                  std::move(solution));
+        return std::make_unique<SingleSolutionPassthroughPlanner>(
+            makePlannerData(cachedPlanHash),
+            std::move(solution),
+            PlanSelectionStrategy::kSinglePlan);
     };
 
     const auto& mainColl = collections.getMainCollection();
@@ -277,44 +282,76 @@ StatusWith<std::unique_ptr<PlannerInterface>> preparePlanner(
     // If there's no plan in the cache for this query, we invoke planning.
     incrementPlannerInvocationCount();
 
-    // TODO SERVER-120492: Investigate if we can remove the replanning restriction on
-    // subplanning. If not, add a descriptive comment here about why.
-    if (!replanning && SubplanStage::needsSubplanning(*cq)) {
-        LOGV2_DEBUG(12507600,
-                    2,
-                    "Running query as sub-queries",
-                    "query"_attr = redact(cq->toStringShort()));
+    auto result = [&]() -> StatusWith<std::unique_ptr<PlannerInterface>> {
+        // TODO SERVER-120492: Investigate if we can remove the replanning restriction on
+        // subplanning. If not, add a descriptive comment here about why.
+        if (!replanning && SubplanStage::needsSubplanning(*cq)) {
+            // The V3 explain verbosity modes (planSummary, plannerChoice, plannerStats, execStats)
+            // are not yet supported for rooted $or queries.
+            if (auto verbosity = cq->getExplain()) {
+                uassert(13145001,
+                        "V3 explain verbosity is not supported for rooted $or queries",
+                        !ExplainOptions::isV3Verbosity(*verbosity));
+            }
 
-        // Forced plan solution hash doesn't make sense to be accessed in QueryPlanner::plan()
-        // during subplanning. It would need to be applicable to all branches.
-        uassert(ErrorCodes::IllegalOperation,
-                "Use of forcedPlanSolutionHash not permitted for rooted $or queries.",
-                !cq->getForcedPlanSolutionHash());
-        return std::make_unique<SubPlanner>(makePlannerData(cachedPlanHash));
-    }
+            LOGV2_DEBUG(12507600,
+                        2,
+                        "Running query as sub-queries",
+                        "query"_attr = redact(cq->toStringShort()));
 
-    if (plannerParams->isCBREnabled()) {
-        return planWithCBR(opCtx, cq, plannerParams, yieldPolicy, collections, cachedPlanHash);
-    }
+            // Forced plan solution hash doesn't make sense to be accessed in QueryPlanner::plan()
+            // during subplanning. It would need to be applicable to all branches.
+            uassert(ErrorCodes::IllegalOperation,
+                    "Use of forcedPlanSolutionHash not permitted for rooted $or queries.",
+                    !cq->getForcedPlanSolutionHash());
+            return std::make_unique<SubPlanner>(makePlannerData(cachedPlanHash));
+        }
 
-    auto solutions = uassertStatusOK(QueryPlanner::plan(*cq, *plannerParams));
-    // The planner should have returned an error status if there are no solutions.
-    tassert(11742305, "Expected at least one solution to answer query", !solutions.empty());
+        if (plannerParams->isCBREnabled()) {
+            return planWithCBR(opCtx, cq, plannerParams, yieldPolicy, collections, cachedPlanHash);
+        }
 
-    // If there is a single solution, we can return that plan.
-    // Force multiplanning (and therefore caching) if forcePlanCache is set. We could
-    // manually update the plan cache instead without multiplanning but this is simpler.
-    if (1 == solutions.size() && !cq->getExpCtxRaw()->getForcePlanCache() &&
-        !cq->getExpCtxRaw()->getQueryKnobConfiguration().getUseMultiplannerForSingleSolutions()) {
-        // Only one possible plan. Build the stages from the solution.
-        solutions[0]->indexFilterApplied = plannerParams->indexFiltersApplied;
-        return buildSingleSolutionPlanner(std::move(solutions[0]), cachedPlanHash);
+        auto solutions = uassertStatusOK(QueryPlanner::plan(*cq, *plannerParams));
+        // The planner should have returned an error status if there are no solutions.
+        tassert(11742305, "Expected at least one solution to answer query", !solutions.empty());
+
+        // If there is a single solution, we can return that plan.
+        // Force multiplanning (and therefore caching) if forcePlanCache is set. We could
+        // manually update the plan cache instead without multiplanning but this is simpler.
+        if (1 == solutions.size() && !cq->getExpCtxRaw()->getForcePlanCache() &&
+            !cq->getExpCtxRaw()
+                 ->getQueryKnobConfiguration()
+                 .getUseMultiplannerForSingleSolutions()) {
+            // Only one possible plan. Build the stages from the solution.
+            solutions[0]->indexFilterApplied = plannerParams->indexFiltersApplied;
+            return buildSingleSolutionPlanner(std::move(solutions[0]), cachedPlanHash);
+        }
+        // CBR is disabled, so the classic multi-planner ranks the candidates. With a sole candidate
+        // it is only measuring work for the plan cache, so no ranking takes place.
+        const auto strategy = solutions.size() > 1 ? PlanSelectionStrategy::kMultiPlanner
+                                                   : PlanSelectionStrategy::kSinglePlan;
+        boost::optional<PlanExplainerData> maybeExplainData;
+        if (solutions.size() > 1) {
+            // Mirrors MPPlanRankingStrategy on the non-deferred path; see the comment there.
+            if (cq->getExplain()) {
+                const auto reason = plannerParams->getPlanRankerReasonFromConfig();
+                if (reason.has_value()) {
+                    maybeExplainData.emplace();
+                    maybeExplainData->planRankerReason = reason;
+                }
+            }
+        }
+        return std::make_unique<MultiPlanner>(makePlannerData(cachedPlanHash),
+                                              std::move(solutions),
+                                              false /* addingCBRChosenPlanToPlanCache */,
+                                              std::move(maybeExplainData),
+                                              strategy);
+    }();
+    // Check for interrupt after running the sophisticated planners.
+    if (auto interruptCheck = opCtx->checkForInterruptNoAssert(); !interruptCheck.isOK()) {
+        return interruptCheck;
     }
-    // CBR is disabled; multiple candidate plans will be ranked by the classic multi-planner.
-    if (solutions.size() > 1) {
-        CurOp::get(opCtx)->debug().planRankerMethod = PlanRankerMethod::kMultiPlanner;
-    }
-    return std::make_unique<MultiPlanner>(makePlannerData(cachedPlanHash), std::move(solutions));
+    return result;
 }
 
 PlanRankingResult planRanking(OperationContext* opCtx,

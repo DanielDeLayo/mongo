@@ -11,6 +11,7 @@
 #include "mongo/db/exec/sbe/vm/vm.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/represent_as.h"
+#include "mongo/util/str.h"
 
 #include <algorithm>
 #include <utility>
@@ -53,8 +54,8 @@ value::TagValueOwned ByteCode::builtinValueBlockExists(ArityType arity) {
 
     auto out = valueBlockIn->exists();
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(out.release()));
+    return value::TagValueOwned::fromRaw(value::TypeTags::valueBlock,
+                                         value::bitcastFrom<value::ValueBlock*>(out.release()));
 }
 
 /*
@@ -103,8 +104,49 @@ value::TagValueOwned ByteCode::builtinValueBlockIsNullish(ArityType arity) {
 
     auto valueBlockOut = valueBlockIn->map(cmpOp);
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(valueBlockOut.release()));
+    return value::TagValueOwned::fromRaw(
+        value::TypeTags::valueBlock,
+        value::bitcastFrom<value::ValueBlock*>(valueBlockOut.release()));
+}
+
+/*
+ * Given a ValueBlock as input, returns a ValueBlock of Int32 ranks describing each value's position
+ * relative to a missing value in the MQL comparison order: MinKey (0) < Nothing/missing/undefined
+ * (1) < any other value (2). This never produces Nothing, even for a Nothing input.
+ */
+value::TagValueOwned ByteCode::builtinValueBlockMqlComparisonRank(ArityType arity) {
+    tassert(13154401, "Unexpected arity value", arity == 1);
+    auto input = viewFromStack(0);
+
+    tassert(13154400,
+            "Expected argument to be of valueBlock type",
+            input.tag == value::TypeTags::valueBlock);
+    auto* valueBlockIn = value::bitcastTo<value::ValueBlock*>(input.value);
+
+    auto rankOf = [](value::TypeTags tag) -> value::TagValueView {
+        return {value::TypeTags::NumberInt32,
+                value::bitcastFrom<int32_t>(ByteCode::mqlComparisonRank(tag))};
+    };
+
+    const auto rankOp = value::makeColumnOp<ColumnOpType::kMonotonic>(
+        [&](value::TypeTags tag, value::Value val) -> value::TagValueView { return rankOf(tag); },
+        [&](value::TypeTags inTag,
+            const value::Value* inVals,
+            value::TypeTags* outTags,
+            value::Value* outVals,
+            size_t count) {
+            // The rank depends only on the type tag, so a homogeneous input has a uniform rank.
+            auto [outTag, outVal] = rankOf(inTag);
+
+            std::fill(outTags, outTags + count, outTag);
+            std::fill(outVals, outVals + count, outVal);
+        });
+
+    auto valueBlockOut = valueBlockIn->map(rankOp);
+
+    return value::TagValueOwned::fromRaw(
+        value::TypeTags::valueBlock,
+        value::bitcastFrom<value::ValueBlock*>(valueBlockOut.release()));
 }
 
 /* This instruction takes as input a ValueBlock and a type mask and returns a ValueBlock indicating
@@ -123,7 +165,7 @@ value::TagValueOwned ByteCode::builtinValueBlockTypeMatch(ArityType arity) {
 
     auto typeMaskView = viewFromStack(1);
     if (typeMaskView.tag != value::TypeTags::NumberInt32) {
-        return value::TagValueOwned(
+        return value::TagValueOwned::fromRaw(
             value::TypeTags::valueBlock,
             value::bitcastFrom<value::ValueBlock*>(
                 value::MonoBlock::makeNothingBlock(valueBlockIn->count()).release()));
@@ -161,8 +203,9 @@ value::TagValueOwned ByteCode::builtinValueBlockTypeMatch(ArityType arity) {
 
     auto valueBlockOut = valueBlockIn->map(cmpOp);
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(valueBlockOut.release()));
+    return value::TagValueOwned::fromRaw(
+        value::TypeTags::valueBlock,
+        value::bitcastFrom<value::ValueBlock*>(valueBlockOut.release()));
 }
 
 /* This instruction takes as input a timezoneDB and a ValueBlock and returns a ValueBlock indicating
@@ -182,8 +225,9 @@ value::TagValueOwned ByteCode::builtinValueBlockIsTimezone(ArityType arity) {
     if (timezoneDBView.tag != value::TypeTags::timeZoneDB) {
         auto nothingBlock =
             std::make_unique<value::MonoBlock>(valueBlockIn->count(), value::TypeTags::Nothing, 0);
-        return value::TagValueOwned(value::TypeTags::valueBlock,
-                                    value::bitcastFrom<value::ValueBlock*>(nothingBlock.release()));
+        return value::TagValueOwned::fromRaw(
+            value::TypeTags::valueBlock,
+            value::bitcastFrom<value::ValueBlock*>(nothingBlock.release()));
     }
     auto timezoneDB = value::getTimeZoneDBView(timezoneDBView.value);
 
@@ -199,8 +243,9 @@ value::TagValueOwned ByteCode::builtinValueBlockIsTimezone(ArityType arity) {
 
     auto valueBlockOut = valueBlockIn->map(cmpOp);
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(valueBlockOut.release()));
+    return value::TagValueOwned::fromRaw(
+        value::TypeTags::valueBlock,
+        value::bitcastFrom<value::ValueBlock*>(valueBlockOut.release()));
 }
 
 /**
@@ -324,13 +369,13 @@ value::TagValueOwned ByteCode::valueBlockMinMaxImpl(value::ValueBlock* inputBloc
             auto [minTag, minVal] = inputBlock->tryMin();
             if (minTag != value::TypeTags::Nothing) {
                 auto [minTagCpy, minValCpy] = value::copyValue(minTag, minVal);
-                return value::TagValueOwned(minTagCpy, minValCpy);
+                return value::TagValueOwned::fromRaw(minTagCpy, minValCpy);
             }
         } else {
             auto [maxTag, maxVal] = inputBlock->tryMax();
             if (maxTag != value::TypeTags::Nothing) {
                 auto [maxTagCpy, maxValCpy] = value::copyValue(maxTag, maxVal);
-                return value::TagValueOwned(maxTagCpy, maxValCpy);
+                return value::TagValueOwned::fromRaw(maxTagCpy, maxValCpy);
             }
         }
     }
@@ -362,7 +407,7 @@ value::TagValueOwned ByteCode::valueBlockMinMaxImpl(value::ValueBlock* inputBloc
     }
 
     auto [retTag, retVal] = value::copyValue(accTag, accVal);
-    return value::TagValueOwned(retTag, retVal);
+    return value::TagValueOwned::fromRaw(retTag, retVal);
 }
 
 template <bool less>
@@ -563,7 +608,7 @@ value::TagValueOwned ByteCode::builtinValueBlockAggSum(ArityType arity) {
         genericAdd(acc.tag(), acc.value(), blockRes.tag(), blockRes.value()).releaseToOwnedRaw();
 
     // Return 'result' as the updated accumulator state.
-    return value::TagValueOwned(resultTag, resultVal);
+    return value::TagValueOwned::fromRaw(resultTag, resultVal);
 }  // builtinValueBlockAggSum
 
 value::TagValueOwned ByteCode::builtinValueBlockAggDoubleDoubleSum(ArityType arity) {
@@ -680,7 +725,7 @@ int addNewPair(value::Array* mergeArr,
                const PairKeyComp<Comp>& keyLess) {
     int memDelta = memAdded({keyTag, keyVal}, {outTag, outVal});
 
-    value::TagValueOwned pairArr{value::makeNewArray()};
+    value::TagValueOwned pairArr = value::TagValueOwned::fromRaw(value::makeNewArray());
     auto* pairArrView = value::getArrayView(pairArr.value());
     pairArrView->reserve(2);
 
@@ -1021,7 +1066,7 @@ value::TagValueOwned ByteCode::blockNativeAggTopBottomNImpl(value::TagValueOwned
             valBlockView.tag == value::TypeTags::valueBlock);
     auto* valBlock = value::getValueBlock(valBlockView.value);
 
-    MultiAccState stateTuple = getMultiAccState(state.tag(), state.value());
+    MultiAccState stateTuple = getMultiAccState(state.view());
     auto [stateArray, mergeArr, startIdx, maxSize, memUsage, memLimit, isGroupAccum] = stateTuple;
     tassert(11093700, "maxSize must be greater than zero", maxSize > 0);
 
@@ -1154,10 +1199,8 @@ public:
 
         if (_sense == TopBottomSense::kTop) {
             for (size_t i = 0; i < sortPattern.size(); i++) {
-                auto [keyTag, keyVal] = _keys[i][_blockIndex];
-                auto itemTagVal = itemArray->getAt(i);
                 int32_t cmp =
-                    compare<TopBottomSense::kTop>(keyTag, keyVal, itemTagVal.tag, itemTagVal.value);
+                    compare<TopBottomSense::kTop>(_keys[i][_blockIndex], itemArray->getAt(i));
 
                 if (cmp != 0) {
                     return sortPattern[i].isAscending ? cmp < 0 : cmp > 0;
@@ -1165,10 +1208,8 @@ public:
             }
         } else {
             for (size_t i = 0; i < sortPattern.size(); i++) {
-                auto [keyTag, keyVal] = _keys[i][_blockIndex];
-                auto itemTagVal = itemArray->getAt(i);
-                int32_t cmp = compare<TopBottomSense::kBottom>(
-                    keyTag, keyVal, itemTagVal.tag, itemTagVal.value);
+                int32_t cmp =
+                    compare<TopBottomSense::kBottom>(_keys[i][_blockIndex], itemArray->getAt(i));
 
                 if (cmp != 0) {
                     return sortPattern[i].isAscending ? cmp < 0 : cmp > 0;
@@ -1262,7 +1303,7 @@ value::TagValueOwned ByteCode::builtinValueBlockAggTopBottomNImpl(ArityType arit
     }
 
     auto [stateArray, array, startIdx, maxSize, memUsage, memLimit, isGroupAccum] =
-        getMultiAccState(state.tag(), state.value());
+        getMultiAccState(state.view());
     tassert(11093703, "maxSize must be greater than zero", maxSize > 0);
 
     value::DeblockedTagVals bitset = bitsetBlock->extract();
@@ -1385,8 +1426,8 @@ value::TagValueOwned ByteCode::builtinBlockBlockArithmeticOperation(
 
     auto resBlock = buildBlockFromStorage(std::move(tagsOut), std::move(valuesOut));
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(resBlock.release()));
+    return value::TagValueOwned::fromRaw(
+        value::TypeTags::valueBlock, value::bitcastFrom<value::ValueBlock*>(resBlock.release()));
 }
 
 template <int op>
@@ -1429,8 +1470,8 @@ value::TagValueOwned ByteCode::builtinBlockBlockArithmeticOperation(
 
     auto resBlock = buildBlockFromStorage(std::move(tagsOut), std::move(valuesOut));
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(resBlock.release()));
+    return value::TagValueOwned::fromRaw(
+        value::TypeTags::valueBlock, value::bitcastFrom<value::ValueBlock*>(resBlock.release()));
 }
 
 template <int op>
@@ -1479,8 +1520,8 @@ value::TagValueOwned ByteCode::builtinScalarBlockArithmeticOperation(
 
     auto resBlock = buildBlockFromStorage(std::move(tagsOut), std::move(valuesOut));
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(resBlock.release()));
+    return value::TagValueOwned::fromRaw(
+        value::TypeTags::valueBlock, value::bitcastFrom<value::ValueBlock*>(resBlock.release()));
 }
 
 template <int op>
@@ -1523,8 +1564,8 @@ value::TagValueOwned ByteCode::builtinScalarBlockArithmeticOperation(value::TagV
 
     auto resBlock = buildBlockFromStorage(std::move(tagsOut), std::move(valuesOut));
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(resBlock.release()));
+    return value::TagValueOwned::fromRaw(
+        value::TypeTags::valueBlock, value::bitcastFrom<value::ValueBlock*>(resBlock.release()));
 }
 
 template <int op>
@@ -1573,8 +1614,8 @@ value::TagValueOwned ByteCode::builtinBlockScalarArithmeticOperation(
 
     auto resBlock = buildBlockFromStorage(std::move(tagsOut), std::move(valuesOut));
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(resBlock.release()));
+    return value::TagValueOwned::fromRaw(
+        value::TypeTags::valueBlock, value::bitcastFrom<value::ValueBlock*>(resBlock.release()));
 }
 
 template <int op>
@@ -1617,8 +1658,8 @@ value::TagValueOwned ByteCode::builtinBlockScalarArithmeticOperation(value::Valu
 
     auto resBlock = buildBlockFromStorage(std::move(tagsOut), std::move(valuesOut));
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(resBlock.release()));
+    return value::TagValueOwned::fromRaw(
+        value::TypeTags::valueBlock, value::bitcastFrom<value::ValueBlock*>(resBlock.release()));
 }
 
 template <int op>
@@ -1654,8 +1695,8 @@ value::TagValueOwned ByteCode::builtinScalarScalarArithmeticOperation(
         resBlock = std::make_unique<value::MonoBlock>(valsNum, value::TypeTags::Nothing, 0);
     }
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(resBlock.release()));
+    return value::TagValueOwned::fromRaw(
+        value::TypeTags::valueBlock, value::bitcastFrom<value::ValueBlock*>(resBlock.release()));
 }
 
 template <int op>
@@ -1829,13 +1870,13 @@ value::TagValueOwned ByteCode::builtinValueBlockDiv(ArityType arity) {
     return builtinValueBlockArithmeticOperation<static_cast<int>(ArithmeticOp::Division)>(arity);
 }
 
-value::TagValueMaybeOwned ByteCode::blockRoundTrunc(std::string funcName,
+value::TagValueMaybeOwned ByteCode::blockRoundTrunc(std::string_view funcName,
                                                     Decimal128::RoundingMode roundingMode,
                                                     ArityType arity) {
     tassert(11079912, "Unexpected arity value", arity == 1 || arity == 2);
     auto input = viewFromStack(0);
     tassert(8333100,
-            "First argument of " + funcName + " must be block of values.",
+            str::stream() << "First argument of " << funcName << " must be block of values.",
             input.tag == value::TypeTags::valueBlock);
     auto* valueBlockIn = value::bitcastTo<value::ValueBlock*>(input.value);
 
@@ -1954,8 +1995,8 @@ value::TagValueOwned blockCompareGeneric(value::ValueBlock* blockView,
 
     auto res = blockView->map(cmpOp);
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(res.release()));
+    return value::TagValueOwned::fromRaw(value::TypeTags::valueBlock,
+                                         value::bitcastFrom<value::ValueBlock*>(res.release()));
 }
 }  // namespace
 
@@ -2003,8 +2044,8 @@ value::TagValueOwned ByteCode::builtinValueBlockNeqScalar(ArityType arity) {
             equalResult.tag() == value::TypeTags::valueBlock);
 
     auto res = value::getValueBlock(equalResult.value())->map(notOp);
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(res.release()));
+    return value::TagValueOwned::fromRaw(value::TypeTags::valueBlock,
+                                         value::bitcastFrom<value::ValueBlock*>(res.release()));
 }
 
 value::TagValueOwned ByteCode::builtinValueBlockLtScalar(ArityType arity) {
@@ -2032,8 +2073,8 @@ value::TagValueOwned ByteCode::builtinValueBlockCmp3wScalar(ArityType arity) {
 
     auto res = blockView->map(cmpOp);
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(res.release()));
+    return value::TagValueOwned::fromRaw(value::TypeTags::valueBlock,
+                                         value::bitcastFrom<value::ValueBlock*>(res.release()));
 }
 
 /*
@@ -2274,11 +2315,10 @@ value::TagValueOwned ByteCode::builtinValueBlockNewFill(ArityType arity) {
             count.tag() == value::TypeTags::NumberInt32);
 
     // Take ownership of the value, we are transferring it to the block.
-    auto [leftTag, leftVal] = moveRawOwnedFromStack(0);
-    auto blockOut = std::make_unique<value::MonoBlock>(
-        value::bitcastTo<int32_t>(count.value()), leftTag, leftVal);
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(blockOut.release()));
+    auto blockOut = std::make_unique<value::MonoBlock>(value::bitcastTo<int32_t>(count.value()),
+                                                       moveOwnedFromStack(0));
+    return value::TagValueOwned::fromRaw(
+        value::TypeTags::valueBlock, value::bitcastFrom<value::ValueBlock*>(blockOut.release()));
 }
 
 value::TagValueMaybeOwned ByteCode::builtinValueBlockSize(ArityType arity) {
@@ -2335,8 +2375,8 @@ value::TagValueOwned ByteCode::builtinValueBlockLogicalNot(ArityType arity) {
 
     auto res = bitmapView->map(cmpOp);
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(res.release()));
+    return value::TagValueOwned::fromRaw(value::TypeTags::valueBlock,
+                                         value::bitcastFrom<value::ValueBlock*>(res.release()));
 }
 
 value::TagValueMaybeOwned ByteCode::builtinCellFoldValues_F(ArityType arity) {
@@ -2466,8 +2506,9 @@ value::TagValueOwned ByteCode::builtinValueBlockIsMember(ArityType arity) {
     if (!value::isArray(arr.tag) && arr.tag != value::TypeTags::inList) {
         auto blockOut = std::make_unique<value::MonoBlock>(
             valueBlockView->count(), value::TypeTags::Nothing, 0);
-        return value::TagValueOwned(value::TypeTags::valueBlock,
-                                    value::bitcastFrom<value::ValueBlock*>(blockOut.release()));
+        return value::TagValueOwned::fromRaw(
+            value::TypeTags::valueBlock,
+            value::bitcastFrom<value::ValueBlock*>(blockOut.release()));
     }
 
     auto res = [&]() {
@@ -2506,8 +2547,8 @@ value::TagValueOwned ByteCode::builtinValueBlockIsMember(ArityType arity) {
         }
     }();
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(res.release()));
+    return value::TagValueOwned::fromRaw(value::TypeTags::valueBlock,
+                                         value::bitcastFrom<value::ValueBlock*>(res.release()));
 }
 
 value::TagValueOwned ByteCode::builtinValueBlockCoerceToBool(ArityType arity) {
@@ -2521,8 +2562,8 @@ value::TagValueOwned ByteCode::builtinValueBlockCoerceToBool(ArityType arity) {
     auto res = valueBlockView->map(value::makeColumnOp<ColumnOpType::kNoFlags>(
         [&](value::TypeTags tag, value::Value val) { return value::coerceToBool(tag, val); }));
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(res.release()));
+    return value::TagValueOwned::fromRaw(value::TypeTags::valueBlock,
+                                         value::bitcastFrom<value::ValueBlock*>(res.release()));
 }
 
 value::TagValueOwned ByteCode::builtinValueBlockMod(ArityType arity) {
@@ -2538,8 +2579,9 @@ value::TagValueOwned ByteCode::builtinValueBlockMod(ArityType arity) {
     if (!value::isNumber(mod.tag)) {
         auto nothingBlock =
             std::make_unique<value::MonoBlock>(valueBlockIn->count(), value::TypeTags::Nothing, 0);
-        return value::TagValueOwned(value::TypeTags::valueBlock,
-                                    value::bitcastFrom<value::ValueBlock*>(nothingBlock.release()));
+        return value::TagValueOwned::fromRaw(
+            value::TypeTags::valueBlock,
+            value::bitcastFrom<value::ValueBlock*>(nothingBlock.release()));
     }
 
     const auto cmpOp = value::makeColumnOp<ColumnOpType::kNoFlags>(
@@ -2551,8 +2593,8 @@ value::TagValueOwned ByteCode::builtinValueBlockMod(ArityType arity) {
 
     auto res = valueBlockIn->map(cmpOp);
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(res.release()));
+    return value::TagValueOwned::fromRaw(value::TypeTags::valueBlock,
+                                         value::bitcastFrom<value::ValueBlock*>(res.release()));
 }
 
 value::TagValueOwned ByteCode::builtinValueBlockConvert(ArityType arity) {
@@ -2578,8 +2620,8 @@ value::TagValueOwned ByteCode::builtinValueBlockConvert(ArityType arity) {
 
     auto res = valueBlockIn->map(cmpOp);
 
-    return value::TagValueOwned(value::TypeTags::valueBlock,
-                                value::bitcastFrom<value::ValueBlock*>(res.release()));
+    return value::TagValueOwned::fromRaw(value::TypeTags::valueBlock,
+                                         value::bitcastFrom<value::ValueBlock*>(res.release()));
 }
 
 template <bool IsAscending>

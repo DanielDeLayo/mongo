@@ -35,6 +35,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
@@ -2885,6 +2886,10 @@ protected:
 TEST_F(TransactionsMetricsTest, IncrementTotalStartedUponStartTransaction) {
     unsigned long long beforeTransactionStart =
         ServerTransactionsMetrics::get(opCtx())->getTotalStarted();
+    unsigned long long beforeStartedInternal =
+        ServerTransactionsMetrics::get(opCtx())->getTotalStartedInternal();
+    unsigned long long beforeStartedExternal =
+        ServerTransactionsMetrics::get(opCtx())->getTotalStartedExternal();
 
     auto sessionCheckout = checkOutSession();
 
@@ -2892,6 +2897,13 @@ TEST_F(TransactionsMetricsTest, IncrementTotalStartedUponStartTransaction) {
     // is started.
     ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalStarted(),
               beforeTransactionStart + 1U);
+
+    // The test fixture's client has no transport session, so the transaction is classified as
+    // server-initiated and only the internal counter moves.
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalStartedInternal(),
+              beforeStartedInternal + 1U);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalStartedExternal(),
+              beforeStartedExternal);
 }
 
 TEST_F(TransactionsMetricsTest, IncrementPreparedTransaction) {
@@ -2912,11 +2924,22 @@ TEST_F(TransactionsMetricsTest, IncrementTotalCommittedOnCommit) {
 
     unsigned long long beforeCommitCount =
         ServerTransactionsMetrics::get(opCtx())->getTotalCommitted();
+    unsigned long long beforeCommittedInternal =
+        ServerTransactionsMetrics::get(opCtx())->getTotalCommittedInternal();
+    unsigned long long beforeCommittedExternal =
+        ServerTransactionsMetrics::get(opCtx())->getTotalCommittedExternal();
 
     txnParticipant.commitUnpreparedTransaction(opCtx());
 
     // Assert that the committed counter is incremented by 1.
     ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalCommitted(), beforeCommitCount + 1U);
+
+    // The test fixture's client has no transport session, so the transaction was classified as
+    // server-initiated when it started and must be counted out of the same bucket on commit.
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalCommittedInternal(),
+              beforeCommittedInternal + 1U);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalCommittedExternal(),
+              beforeCommittedExternal);
 }
 
 TEST_F(TransactionsMetricsTest, IncrementTotalPreparedThenCommitted) {
@@ -2944,11 +2967,22 @@ TEST_F(TransactionsMetricsTest, IncrementTotalAbortedUponAbort) {
 
     unsigned long long beforeAbortCount =
         ServerTransactionsMetrics::get(opCtx())->getTotalAborted();
+    unsigned long long beforeAbortedInternal =
+        ServerTransactionsMetrics::get(opCtx())->getTotalAbortedInternal();
+    unsigned long long beforeAbortedExternal =
+        ServerTransactionsMetrics::get(opCtx())->getTotalAbortedExternal();
 
     txnParticipant.abortTransaction(opCtx());
 
     // Assert that the aborted counter is incremented by 1.
     ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalAborted(), beforeAbortCount + 1U);
+
+    // The test fixture's client has no transport session, so the transaction was classified as
+    // server-initiated when it started and must be counted out of the same bucket on abort.
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalAbortedInternal(),
+              beforeAbortedInternal + 1U);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalAbortedExternal(),
+              beforeAbortedExternal);
 }
 
 TEST_F(TransactionsMetricsTest, IncrementTotalPreparedThenAborted) {
@@ -4801,7 +4835,7 @@ TEST_F(TransactionsMetricsTest, TransactionLogAggregatesQueueStats) {
         "execution" << BSON("admissions" << expectedVal << "totalTimeQueuedMicros" << expectedVal)
                     << "ingress"
                     << BSON("admissions" << expectedVal << "totalTimeQueuedMicros" << expectedVal)
-                    << "writeThrottle" << BSONObj());
+                    << "ingress_request" << BSONObj() << "writeThrottle" << BSONObj());
     ASSERT_BSONOBJ_EQ_UNORDERED(queueBsonStats, expectedBson);
 }
 
@@ -7443,7 +7477,7 @@ TEST_F(TxnParticipantTest, CommitSplitPreparedTransaction) {
         auto swStableTimestamp =
             opCtx->getServiceContext()->getStorageEngine()->recoverToStableTimestamp(opCtx);
         ASSERT_OK(swStableTimestamp);
-        catalog::openCatalog(opCtx, state, swStableTimestamp.getValue());
+        catalog::openCatalogAfterRollbackToStable(opCtx, state, swStableTimestamp.getValue());
     }
     opCtx->setLogicalSessionId(lsid);
     opCtx->setTxnNumber(txnNum);
@@ -8396,6 +8430,19 @@ TEST_F(TxnParticipantStartupRecoveryTest, CanRecoverPreparedInternalTxnFromSessi
 
     // We should have stashed in the "secondary" style and released the locks taken above.
     ASSERT_FALSE(txnParticipant.getTxnResourceStashLockerForTest()->isLocked());
+}
+
+TEST_F(TxnParticipantStartupRecoveryTest,
+       RecoverPreparedTransactionsFromPreciseCheckpointThrowsOnShutdown) {
+    setUpPreparedTransaction(_sessionId, _txnNumber);
+
+    // Simulate a shutdown racing with recovery: the opCtx is killed before recovery gets a
+    // chance to run. This must throw the interruption rather than crash.
+    opCtx()->markKilled(ErrorCodes::InterruptedAtShutdown);
+
+    ASSERT_THROWS_CODE(recoverPreparedTransactionsFromPreciseCheckpoint(opCtx()),
+                       DBException,
+                       ErrorCodes::InterruptedAtShutdown);
 }
 
 using TxnParticipantStartupRecoveryDeathTest = TxnParticipantStartupRecoveryTest;

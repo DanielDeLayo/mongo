@@ -12,6 +12,7 @@
 #include "mongo/db/query/compiler/stats/collection_statistics.h"
 #include "mongo/db/query/index_hint.h"
 #include "mongo/db/query/multiple_collection_accessor.h"
+#include "mongo/db/query/plan_ranking/plan_ranker_reason.h"
 #include "mongo/db/query/query_execution_knobs_gen.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/query_integration_knobs_gen.h"
@@ -230,6 +231,7 @@ struct [[MONGO_MOD_NEEDS_REPLACEMENT]] QueryPlannerParams {
         size_t plannerOptions = DEFAULT;
         boost::optional<TraversalPreference> traversalPreference = boost::none;
         QueryPlanRankerEnum planRanker = QueryPlanRankerEnum::kMixed;
+        bool alwaysFillOutCollectionInfo = false;
     };
 
     /**
@@ -277,10 +279,12 @@ struct [[MONGO_MOD_NEEDS_REPLACEMENT]] QueryPlannerParams {
     explicit QueryPlannerParams(ArgsForSingleCollectionQuery&& args)
         : providedOptions(args.plannerOptions),
           traversalPreference(std::move(args.traversalPreference)),
-          planRanker(args.planRanker) {
+          planRanker(args.planRanker),
+          alwaysFillOutCollectionInfo(args.alwaysFillOutCollectionInfo) {
         // TODO: SERVER-129697: Remove when the featureFlagCostBasedRanker is removed.
         if (!feature_flags::gFeatureFlagCostBasedRanker.checkEnabled()) {
             planRanker = QueryPlanRankerEnum::kMultiPlanner;
+            planRankerOverwriteReason = PlanRankerReason::kCBRFeatureFlagDisabled;
         }
         mainCollectionInfo.options = args.plannerOptions;
         if (!args.collections.hasMainCollection()) {
@@ -295,6 +299,7 @@ struct [[MONGO_MOD_NEEDS_REPLACEMENT]] QueryPlannerParams {
                 QueryCBRCEModeEnum::kHistogramCE &&
             args.canonicalQuery.nss().dbName().isInternalDb()) {
             planRanker = QueryPlanRankerEnum::kMultiPlanner;
+            planRankerOverwriteReason = PlanRankerReason::kHistogramCEInternalColl;
         }
         fillOutPlannerParamsForExpressQuery(
             args.opCtx, args.canonicalQuery, args.collections.getMainCollection());
@@ -407,6 +412,31 @@ struct [[MONGO_MOD_NEEDS_REPLACEMENT]] QueryPlannerParams {
 
     QueryPlanRankerEnum planRanker{QueryPlanRankerEnum::kMixed};
 
+    // Set when construction overwrites 'planRanker' to a value other than the one the
+    // internalQueryPlanRanker knob requested (feature flag off, histogramCE on an internal
+    // database). After such an overwrite the source of the knob's value is not recoverable from
+    // 'planRanker' alone, so the reason for the value change is recorded here and emitted as
+    // rankerChoice.reason V3 explain field.
+    boost::optional<PlanRankerReason> planRankerOverwriteReason;
+
+    /**
+     * The reason dictated by configuration alone, when configuration alone dictates the ranker
+     * choice. Three possible outcomes:
+     * - the overwrite reason if QueryPlannerParams constructor overrode the query knob,
+     * - kQueryPlanRankerKnob if the knob explicitly picked a ranker
+     * - none when the choice is deferred to a planning-time decision (mixed)
+     */
+    boost::optional<PlanRankerReason> getPlanRankerReasonFromConfig() const {
+        if (planRankerOverwriteReason) {
+            return planRankerOverwriteReason;
+        }
+        if (planRanker == QueryPlanRankerEnum::kMultiPlanner ||
+            planRanker == QueryPlanRankerEnum::kCostBased) {
+            return PlanRankerReason::kQueryPlanRankerKnob;
+        }
+        return boost::none;
+    }
+
     bool isCBREnabled() const {
         return planRanker != QueryPlanRankerEnum::kMultiPlanner;
     }
@@ -418,6 +448,12 @@ struct [[MONGO_MOD_NEEDS_REPLACEMENT]] QueryPlannerParams {
     };
     // Populated if we are replanning.
     boost::optional<ReplanningData> replanningData = boost::none;
+
+    // If true, the planner will always fill out collection info for the main collection, even if it
+    // is an _id hack query which would normally skip getting collection info from the catalog. This
+    // is used for the SbeSingleDocumentLookupExecutor which invokes the QueryPlanner on an _id hack
+    // eligible query but still expects the planner to construct a plan.
+    bool alwaysFillOutCollectionInfo = false;
 
 private:
     bool requiresShardFiltering(const CanonicalQuery& canonicalQuery,

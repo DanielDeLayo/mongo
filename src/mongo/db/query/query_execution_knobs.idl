@@ -86,6 +86,7 @@ server_parameters:
                     min: "9.0"
 
     internalQueryMaxSingleExpressionMemoryUsageBytes:
+        mod_visibility: needs_replacement
         description: >-
             Maximum amount of memory in bytes that a single expression evaluation may use when no
             stage-level tracker has been wired to the EvaluationContext. If an OperationContext is
@@ -365,6 +366,19 @@ server_parameters:
                 pqs_settable: true
                 fcv:
                     min: "9.0"
+
+    internalQueryMaxMemoryIntensiveExpressions:
+        mod_visibility: needs_replacement
+        description: >-
+            Limits the number of memory-intensive aggregation expressions that can appear in a single query.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryMaxMemoryIntensiveExpressions"
+        cpp_vartype: AtomicWord<int>
+        default:
+            expr: std::numeric_limits<int>::max()
+        validator:
+            gte: 0
+        redact: false
 
     internalQueryMaxPercentileAccumulatorBytes:
         description: "The maximum amount of memory that can be used by an individual $percentile accumulator."
@@ -977,6 +991,8 @@ server_parameters:
         default: 0
         redact: false
 
+    # TODO SERVER-135771: Remove this parameter. It has been unused since the SBE window stage
+    # was deleted.
     internalQuerySlotBasedExecutionWindowBufferMemorySamplingAtLeast:
         mod_visibility: needs_replacement
         description: >-
@@ -990,6 +1006,8 @@ server_parameters:
             gt: 0
         redact: false
 
+    # TODO SERVER-135771: Remove this parameter. It has been unused since the SBE window stage
+    # was deleted.
     internalQuerySlotBasedExecutionWindowStateMemorySamplingAtLeast:
         mod_visibility: needs_replacement
         description: >-
@@ -1180,80 +1198,68 @@ server_parameters:
         mod_visibility: needs_replacement
         description: >-
             Enables behavior where the query engine will release resources before sleeping for write
-            conflicts.
+            conflicts. With the exponential write-conflict backoff (whose jittered sleeps can reach
+            twice internalQueryWriteConflictBackoffCapMs), holding a ticket through the sleep
+            starves the pool. Set to false to sleep while holding the ticket, on the legacy
+            stepped schedule.
         set_at: [startup, runtime]
         cpp_varname: internalQueryEnableWriteConflictBackoffWithoutTicket
         cpp_vartype: Atomic<bool>
-        default: false
+        default: true
         redact: false
 
-    internalQueryWriteConflictBackoffMaxReleaseTicketCycles:
+    internalQueryWriteConflictBackoffRampStartMs:
         mod_visibility: needs_replacement
         description: >-
-            When internalQueryEnableWriteConflictBackoffWithoutTicket is true, release-ticket WCE
-            backoff is used for up to this many WriteConflicts-in-a-row per operation. After the
-            threshold is crossed, the operation falls back to sleeping while holding its ticket.
-            Holding the ticket throttles concurrent writers in a write-conflict storm. A very
-            large value disables the fallback (pure release-ticket behavior). When
-            internalQueryWriteConflictRetryLimitMax is enabled with a smaller value than this knob,
-            the limit fires first and this fallback becomes dead code for limit-enabled ops; that
-            is intentional and not a misconfiguration.
+            First sleep of the plan executor's exponential write-conflict backoff ramp, applied
+            at the 4th consecutive attempt. Attempts 1-3 sleep 0/1/2ms regardless, so short
+            contention resolves without a meaningful wait. 0 disables the exponential backoff
+            entirely and falls back to the legacy stepped schedule.
         set_at: [startup, runtime]
-        cpp_varname: gInternalQueryWriteConflictBackoffMaxReleaseTicketCycles
-        cpp_vartype: Atomic<int>
-        default: 2147483647
+        cpp_varname: internalQueryWriteConflictBackoffRampStartMs
+        cpp_vartype: Atomic<long long>
+        default: 8
         validator:
             gte: 0
+            # One hour; also keeps the geometric ramp far from int64 overflow.
+            lte: 3600000
         redact: false
 
-    internalQueryWriteConflictRetryLimitMax:
+    internalQueryWriteConflictBackoffCapMs:
         mod_visibility: needs_replacement
         description: >-
-            Maximum consecutive WriteConflictException retries per plan execution. 0 disables
-            the limit. limitMax = N means "shed on retry N+1". Recommended floor when enabled:
-            limitMax >= 5. Clients must retry the resulting WriteConflictRetryLimitExceeded
-            with backoff -- zero-delay retry re-enters the limit.
+            Upper bound on a single write-conflict backoff sleep. The actual sleep is jittered
+            to [cap, 2*cap], so it's not strictly a hard upper bound.
         set_at: [startup, runtime]
-        cpp_varname: internalQueryWriteConflictRetryLimitMax
-        cpp_vartype: Atomic<int>
-        default: 0
-        validator:
-            gte: 0
-        redact: false
-
-    internalQueryWriteConflictRetryLimitMin:
-        mod_visibility: needs_replacement
-        description: >-
-            Floor on the adaptive consecutive WCE retry limit when adaptive scaling is fully
-            engaged (i.e. when the concurrent-waiter count reaches
-            internalQueryWriteConflictRetryLimitWaitersThreshold). Only used when the limit is
-            enabled and the threshold knob is non-zero. Must be >= 1: a value of 0 would cause
-            the effective limit to collapse to "no limit at all" under saturated pressure
-            (the throw site short-circuits when effectiveLimit == 0). 3 is a sensible default
-            that still absorbs single-doc transient conflicts.
-        set_at: [startup, runtime]
-        cpp_varname: internalQueryWriteConflictRetryLimitMin
-        cpp_vartype: Atomic<int>
-        default: 3
+        cpp_varname: internalQueryWriteConflictBackoffCapMs
+        cpp_vartype: Atomic<long long>
+        default: 256
         validator:
             gte: 1
+            # One hour; also keeps the geometric ramp far from int64 overflow.
+            lte: 3600000
         redact: false
 
-    internalQueryWriteConflictRetryLimitWaitersThreshold:
-        mod_visibility: needs_replacement
+    internalQueryEnableChangeStreamMatchExpressionReordering:
         description: >-
-            Concurrent-waiter count at which the adaptive retry limit reaches its minimum.
-            Linear interpolation between limitMax (at 0 waiters) and limitMin (at this value
-            or higher). 0 disables adaptive scaling (the effective limit stays at limitMax
-            regardless of pressure). A "waiter" is an operation currently in a WCE streak in
-            its plan executor.
+            If true, change stream match expressions dynamically reorder the child predicates of
+            their $and/$or/$nor nodes at runtime, so that the predicate observed to terminate
+            evaluation earliest is evaluated first. Set to false to keep the predicates in the order
+            in which they were generated.
+            The value is read when a change stream cursor is created, so changing it at runtime
+            affects change stream cursors opened from that point on and not cursors that are already
+            open.
         set_at: [startup, runtime]
-        cpp_varname: internalQueryWriteConflictRetryLimitWaitersThreshold
-        cpp_vartype: Atomic<int>
-        default: 0
-        validator:
-            gte: 0
+        cpp_varname: "internalQueryEnableChangeStreamMatchExpressionReordering"
+        cpp_vartype: Atomic<bool>
+        default: true
         redact: false
+        annotations:
+            query_knob:
+                wire_name: enableChangeStreamMatchExpressionReordering
+                pqs_settable: true
+                fcv:
+                    min: "9.0"
 
     internalChangeStreamRespectsReadPreference:
         description: "Enables change stream cursors to respect readPreference after replica set elections."
@@ -1333,12 +1339,15 @@ server_parameters:
     internalQueryLegacyDottedPathNullSemantics:
         mod_visibility: needs_replacement
         description: >-
-            If true, disables the SERVER-36681 fix for null equality semantics on nonexistent
-            dotted paths and reverts to the pre-fix behavior.
+            If true (the default), uses the legacy semantics for null equality on nonexistent
+            dotted paths. If false, enables the SERVER-36681 fix, under which a nonexistent
+            dotted path is treated as null when a non-leaf component of the path is an array.
+            The fix is disabled by default because it changes the set of documents matched by
+            a partial filter expression, and index contents are not rebuilt on upgrade.
         set_at: [startup, runtime]
         cpp_varname: "internalQueryLegacyDottedPathNullSemantics"
         cpp_vartype: Atomic<bool>
-        default: false
+        default: true
         redact: false
 
     internalSearchIdLookupMaxBatchSize:
@@ -1429,6 +1438,41 @@ server_parameters:
                 pqs_settable: true
                 fcv:
                     min: "9.0"
+
+    internalQueryMaxBitTestIntermediatePositions:
+        # Read directly from the BitTestMatchExpression constructor in the matcher module, like the
+        # neighboring internalQueryRegex* knobs. TODO SERVER-129580 burn-down: migrate to
+        # QueryKnobConfiguration.
+        mod_visibility: needs_replacement
+        description: >-
+            Maximum number of bit positions that a $bitTest expression (bitsAllSet, bitsAllClear,
+            bitsAnySet, bitsAnyClear) may accumulate when constructed from a BinData mask. This
+            limits peak memory usage when parsing queries with very large binary bitmasks.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryMaxBitTestIntermediatePositions"
+        cpp_vartype: AtomicWord<int>
+        default:
+            expr: std::numeric_limits<int>::max()
+        validator:
+            gte: 64
+        redact: false
+
+    internalQueryBitTestPositionsLogThreshold:
+        # Read directly from the BitTestMatchExpression constructor in the matcher module, like the
+        # neighboring internalQueryRegex* knobs. TODO SERVER-129580 burn-down: migrate to
+        # QueryKnobConfiguration.
+        mod_visibility: needs_replacement
+        description: >-
+            When a $bitTest expression (bitsAllSet, bitsAllClear, bitsAnySet, bitsAnyClear)
+            accumulates this many bit positions while being constructed from a BinData mask, a
+            warning is logged.
+        set_at: [startup, runtime]
+        cpp_varname: "internalQueryBitTestPositionsLogThreshold"
+        cpp_vartype: AtomicWord<int>
+        default: 100000
+        validator:
+            gte: 1
+        redact: false
 # Note for adding additional query knobs:
 #
 # When adding a new query knob, you should consider whether or not you need to add an 'on_update'

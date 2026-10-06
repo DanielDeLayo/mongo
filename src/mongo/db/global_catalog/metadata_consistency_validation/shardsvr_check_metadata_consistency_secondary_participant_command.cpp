@@ -9,6 +9,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/global_catalog/ddl/sharded_ddl_commands_gen.h"
+#include "mongo/db/global_catalog/metadata_consistency_validation/check_metadata_consistency_gen.h"
 #include "mongo/db/global_catalog/metadata_consistency_validation/metadata_consistency_util.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
@@ -49,11 +50,15 @@ public:
     }
 
     std::string help() const override {
-        return "Internal command. Do not call directly.";
+        return "Test-only internal command. Do not call directly.";
     }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
+    }
+
+    bool maintenanceOk() const override {
+        return false;
     }
 
     class Invocation final : public InvocationBase {
@@ -61,12 +66,12 @@ public:
         using InvocationBase::InvocationBase;
 
         Response typedRun(OperationContext* opCtx) {
-            ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
             opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             tassert(12922000,
-                    fmt::format("{} is a test-only command", Request::kCommandName),
-                    TestingProctor::instance().isEnabled());
+                    fmt::format("Cannot run {} on a node started without --shardsvr",
+                                Request::kCommandName),
+                    serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
 
             const auto hostAndPort = repl::ReplicationCoordinator::get(opCtx)->getMyHostAndPort();
             uassert(ErrorCodes::NotYetInitialized,
@@ -101,6 +106,7 @@ public:
                     primaryShardId,
                     checkRangeDeletionIndexes,
                     checkIndexes,
+                    request().getPerformStrictChunkChecksIfBelowThreshold(),
                     checkSecondariesMode ==
                             CheckMetadataConsistencySecondaryModeEnum::kCheckAtPrimaryTimestamp
                         ? metadata_consistency_util::RSNodeMode::kSecondary
@@ -126,6 +132,12 @@ public:
             return false;
         }
 
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
+                                                     bool isImplicitDefault) const override {
+            return {Status::OK(),
+                    Status{ErrorCodes::InvalidOptions, "default read concern not permitted"}};
+        }
+
         void doCheckAuthorization(OperationContext* opCtx) const override {
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
@@ -136,7 +148,9 @@ public:
         }
     };
 };
-MONGO_REGISTER_COMMAND(ShardsvrCheckMetadataConsistencySecondaryParticipantCommand).forShard();
+MONGO_REGISTER_COMMAND(ShardsvrCheckMetadataConsistencySecondaryParticipantCommand)
+    .testOnly()
+    .forShard();
 
 }  // namespace
 }  // namespace mongo

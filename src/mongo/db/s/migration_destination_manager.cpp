@@ -2,10 +2,8 @@
 // SPDX-License-Identifier: SSPL-1.0
 
 
-#include <boost/move/utility_core.hpp>
-#include <boost/none.hpp>
-#include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "cxxabi.h"
+#include "mongo/db/s/migration_destination_manager.h"
+
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
@@ -44,7 +42,6 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/router_role/cluster_commands_helpers.h"
 #include "mongo/db/s/migration_batch_fetcher.h"
-#include "mongo/db/s/migration_destination_manager.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/move_timing_helper.h"
 #include "mongo/db/s/range_deletion_task_gen.h"
@@ -78,6 +75,7 @@
 #include "mongo/db/sharding_environment/client/shard.h"
 #include "mongo/db/sharding_environment/grid.h"
 #include "mongo/db/sharding_environment/sharding_feature_flags_gen.h"
+#include "mongo/db/sharding_environment/sharding_runtime_d_params_gen.h"
 #include "mongo/db/sharding_environment/sharding_statistics.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/write_unit_of_work.h"
@@ -111,6 +109,11 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kShardingMigration
 
@@ -2438,8 +2441,18 @@ bool MigrationDestinationManager::migrationWouldDropPITHistory(OperationContext*
                                                                const ChunkRange& enclosingChunk) {
     // Oldest timestamp the storage engine still retains a snapshot for. A point-in-time read below
     // it is rejected with SnapshotTooOld, so it is the exact lower bound of PIT reachability.
-    const auto oldestTimestamp =
-        opCtx->getServiceContext()->getStorageEngine()->getOldestTimestamp();
+    auto oldestTimestamp = opCtx->getServiceContext()->getStorageEngine()->getOldestTimestamp();
+
+    const auto overriddenPitWindowToPreserveInSecs =
+        gMigrationRecipientPITHistoryToPreserveInSecs.load();
+    boost::optional<uint32_t> overriddenOldestTimestampInSecs;
+    if (MONGO_unlikely(overriddenPitWindowToPreserveInSecs >= 0)) {
+        const auto currTime = VectorClock::get(opCtx)->getTime();
+        const auto currTimeSeconds = currTime.clusterTime().asTimestamp().getSecs();
+        const auto preserveSecs = static_cast<unsigned>(overriddenPitWindowToPreserveInSecs);
+        overriddenOldestTimestampInSecs =
+            (currTimeSeconds > preserveSecs) ? (currTimeSeconds - preserveSecs) : 0U;
+    }
 
     // A stored chunk drops PIT history when it is owned by another shard, is not fully covered by
     // 'enclosingChunk', and its most recent ownership transition is still reachable by PIT reads.
@@ -2452,14 +2465,17 @@ bool MigrationDestinationManager::migrationWouldDropPITHistory(OperationContext*
     // recipient therefore records it as a past owner, and onCurrentShardSince (the newest ownership
     // transition) bounds the reachability of that past ownership, so history need not be scanned.
     const auto isConflict = [&](const ChunkType& chunk) {
-        if (chunk.getShard() == ShardRef(recipientShardId)) {
+        if (chunk.getShard() == recipientShardId) {
             return false;
         }
         if (!enclosingChunk.overlaps(chunk.getRange())) {
             return false;
         }
         const auto& onCurrentShardSince = chunk.getOnCurrentShardSince();
-        if (!onCurrentShardSince || *onCurrentShardSince <= oldestTimestamp) {
+        if (!onCurrentShardSince ||
+            (!overriddenOldestTimestampInSecs && *onCurrentShardSince <= oldestTimestamp) ||
+            (overriddenOldestTimestampInSecs &&
+             onCurrentShardSince->getSecs() <= *overriddenOldestTimestampInSecs)) {
             return false;
         }
         return !enclosingChunk.covers(chunk.getRange());
@@ -2468,29 +2484,27 @@ bool MigrationDestinationManager::migrationWouldDropPITHistory(OperationContext*
     DBDirectClient client(opCtx);
 
     const auto findsConflict = [&](FindCommandRequest findOp) {
-        auto cursor = client.find(std::move(findOp));
-        while (cursor->more()) {
-            const auto chunk = uassertStatusOK(
-                ChunkType::parseFromConfigBSON(cursor->nextSafe().getOwned(), OID(), Timestamp()));
-            if (isConflict(chunk)) {
-                return true;
-            }
+        auto bson = client.findOne(std::move(findOp));
+        if (bson.isEmpty()) {
+            return false;
         }
-        return false;
+        const auto chunk =
+            uassertStatusOK(ChunkType::parseFromConfigBSON(bson, OID(), Timestamp()));
+        return isConflict(chunk);
     };
 
-    // Stored chunks are non-overlapping and indexed by {collectionUUID, min}, so only the few
-    // chunks near 'enclosingChunk' can overlap it. Read them with two bounded queries instead of
-    // scanning the whole collection (mirrors reconcileOverlappingChunks()): the single chunk whose
-    // min is below the enclosingChunk but whose range may extend into it, and every chunk whose min
-    // falls within the enclosingChunk.
+    // Stored chunks are non-overlapping and indexed by {collectionUUID, min}, so at most two chunks
+    // could be "broken" by the given `enclosingChunk`: one broken by the lower boundary and one by
+    // the upper boundary. Read them with two bounded queries instead of scanning the whole
+    // collection (mirrors reconcileOverlappingChunks()): the single chunk whose `min` is below the
+    // enclosingChunk but whose range may extend into it, and the chunk with the greatest `min`
+    // falling within 'enclosingChunk', which is the only one of those that may extend past its max.
     {
         FindCommandRequest findOp{NamespaceString::kConfigShardCatalogChunksNamespace};
         findOp.setFilter(BSON(ChunkType::collectionUUID()
                               << collUuid << ChunkType::min()
                               << BSON("$lt" << enclosingChunk.getMin())));
         findOp.setSort(BSON(ChunkType::min() << -1));
-        findOp.setLimit(1);
         if (findsConflict(std::move(findOp))) {
             return true;
         }
@@ -2502,6 +2516,7 @@ bool MigrationDestinationManager::migrationWouldDropPITHistory(OperationContext*
             BSON(ChunkType::collectionUUID()
                  << collUuid << ChunkType::min()
                  << BSON("$gte" << enclosingChunk.getMin() << "$lt" << enclosingChunk.getMax())));
+        findOp.setSort(BSON(ChunkType::min() << -1));
         if (findsConflict(std::move(findOp))) {
             return true;
         }

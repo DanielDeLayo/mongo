@@ -64,21 +64,22 @@ void generateServerParameters(const boost::intrusive_ptr<ExpressionContext>& exp
                            internalLookupStageIntermediateDocumentMaxSizeBytes.load());
     serverBob.appendNumber("internalQueryProhibitBlockingMergeOnMongoS",
                            internalQueryProhibitBlockingMergeOnMongoS.load());
-    auto queryControl = expCtx->getQueryKnobConfiguration().getInternalQueryFrameworkControlForOp();
-    serverBob.append("internalQueryFrameworkControl", idl::serialize(queryControl));
+    const auto& knobs = expCtx->getQueryKnobConfiguration();
+    serverBob.append("internalQueryFrameworkControl",
+                     idl::serialize(knobs.getInternalQueryFrameworkControlForOp()));
     serverBob.appendNumber("internalQueryPlannerIgnoreIndexWithCollationForRegex",
                            internalQueryPlannerIgnoreIndexWithCollationForRegex.load());
+    serverBob.append("internalQueryPlanRanker", idl::serialize(knobs.getPlanRanker()));
+    serverBob.append("internalQueryCBRCEMode", idl::serialize(knobs.getCBRCEMode()));
+    serverBob.append("internalQueryMixedPlanRankingStrategy",
+                     idl::serialize(knobs.getMixedPlanRankingStrategy()));
+    serverBob.appendBool("featureFlagCostBasedRanker",
+                         feature_flags::gFeatureFlagCostBasedRanker.checkEnabled());
     serverBob.doneFast();
 }
 
 void generateQueryKnobs(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                         BSONObjBuilder* out) {
-    auto* opCtx = expCtx->getOperationContext();
-    if (!feature_flags::gFeatureFlagPqsQueryKnobs.isEnabledUseLatestFCVWhenUninitialized(
-            VersionContext::getDecoration(opCtx),
-            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
-        return;
-    }
     auto serializedKnobs = expCtx->getQueryKnobConfiguration().serializeForExplain();
     if (!serializedKnobs.isEmpty()) {
         appendIfRoom(serializedKnobs, "queryKnobs", out);
@@ -86,6 +87,8 @@ void generateQueryKnobs(const boost::intrusive_ptr<ExpressionContext>& expCtx,
 }
 
 void generateQueryShapeHash(OperationContext* opCtx, BSONObjBuilder* out) {
+    // TODO SERVER-132079: source the hash from the query itself instead of the per-operation
+    // diagnostics state.
     if (auto&& queryShapeHash = mongo::CurOp::get(opCtx)->debug().getQueryShapeHash()) {
         out->append("queryShapeHash", queryShapeHash->toHexString());
     }

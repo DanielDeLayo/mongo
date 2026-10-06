@@ -8,12 +8,23 @@
 #include "mongo/db/query/compiler/optimizer/join/join_reordering_context.h"
 #include "mongo/db/query/util/bitset_util.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/timer.h"
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQueryCE
+#include <algorithm>
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQueryJoin
 
 namespace mongo::join_ordering {
 
 using namespace cost_based_ranker;
+
+// Sleeps for {ms: <millis>} while computing a cardinality estimate, so that tests can verify that
+// 'ceTimeMicros' measures this phase. Note this fires once per computed estimate, not once per
+// query, since only estimates that are not served from the memo are charged to 'ceTimeMicros'.
+MONGO_FAIL_POINT_DEFINE(sleepWhileEstimatingJoinCardinality);
 
 JoinCardinalityEstimator::JoinCardinalityEstimator(const JoinReorderingContext& ctx,
                                                    EdgeSelectivities edgeSelectivities)
@@ -26,23 +37,33 @@ JoinCardinalityEstimator::JoinCardinalityEstimator(const JoinReorderingContext& 
             _edgeSelectivities.size() == _ctx.joinGraph.numEdges());
     tassert(11514701,
             "Missing node cardinalities",
-            _ctx.singleTableAccess.nodeCardinalities.size() == _ctx.joinGraph.numNodes());
+            _ctx.singleTableAccess.nodeCardinalitiesOriginalFilter.size() ==
+                _ctx.joinGraph.numNodes());
 }
 
 JoinCardinalityEstimator JoinCardinalityEstimator::make(
-    const JoinReorderingContext& ctx, const SamplingEstimatorMap& samplingEstimators) {
-    return JoinCardinalityEstimator(
-        ctx, JoinCardinalityEstimator::estimateEdgeSelectivities(ctx, samplingEstimators));
+    const JoinReorderingContext& ctx,
+    const SamplingEstimatorMap& samplingEstimators,
+    OpDebug::JoinOptimizationMetrics::PlanEnumerationMetrics& metrics) {
+    Timer timer;
+    auto edgeSelectivities =
+        JoinCardinalityEstimator::estimateEdgeSelectivities(ctx, samplingEstimators, metrics);
+    auto estimator = JoinCardinalityEstimator(ctx, std::move(edgeSelectivities));
+    // Time the up-front edge selectivity estimation.
+    estimator._estimationTimeMicros = timer.micros();
+    return estimator;
 }
 
 EdgeSelectivities JoinCardinalityEstimator::estimateEdgeSelectivities(
-    const JoinReorderingContext& ctx, const SamplingEstimatorMap& samplingEstimators) {
+    const JoinReorderingContext& ctx,
+    const SamplingEstimatorMap& samplingEstimators,
+    OpDebug::JoinOptimizationMetrics::PlanEnumerationMetrics& metrics) {
     EdgeSelectivities edgeSelectivities;
     edgeSelectivities.reserve(ctx.joinGraph.numEdges());
     for (size_t edgeId = 0; edgeId < ctx.joinGraph.numEdges(); edgeId++) {
         const auto& edge = ctx.joinGraph.getEdge(edgeId);
         edgeSelectivities.push_back(
-            JoinCardinalityEstimator::joinPredicateSel(ctx, samplingEstimators, edge));
+            JoinCardinalityEstimator::joinPredicateSel(ctx, samplingEstimators, edge, metrics));
     }
     return edgeSelectivities;
 }
@@ -88,10 +109,11 @@ EdgeSelectivities JoinCardinalityEstimator::estimateEdgeSelectivities(
 //
 // If we are in case (2), we again can estimate Card(P) via NDV(FK) on either side, since we assume
 // both sides reference the primary key. Again, we use the side with the smaller CE for simplicity.
-cost_based_ranker::SelectivityEstimate JoinCardinalityEstimator::joinPredicateSel(
+JoinEdgeSelectivityEstimate JoinCardinalityEstimator::joinPredicateSel(
     const JoinReorderingContext& ctx,
     const SamplingEstimatorMap& samplingEstimators,
-    const JoinEdge& edge) {
+    const JoinEdge& edge,
+    OpDebug::JoinOptimizationMetrics::PlanEnumerationMetrics& metrics) {
 
     auto& leftNode = ctx.joinGraph.getNode(edge.left);
     auto& rightNode = ctx.joinGraph.getNode(edge.right);
@@ -129,19 +151,27 @@ cost_based_ranker::SelectivityEstimate JoinCardinalityEstimator::joinPredicateSe
     // estimation for the "primary key".
     bool ndvFieldsAreUnique = ctx.uniqueFieldInfo.contains(primaryKeyNode.collectionName) &&
         fieldsAreUnique(fieldNames, ctx.uniqueFieldInfo.at(primaryKeyNode.collectionName));
-    CardinalityEstimate ndv = [&samplingEstimator, &fields, &ndvFieldsAreUnique]() {
-        if (ndvFieldsAreUnique) {
-            return CardinalityEstimate(samplingEstimator->getCollCard().cardinality(),
-                                       EstimationSource::Metadata);
-        }
-        return samplingEstimator->estimateNDV(fields);
-    }();
 
-    cost_based_ranker::SelectivityEstimate res{cost_based_ranker::oneSel};
+    JoinNdvEstimateSource source = JoinNdvEstimateSource::kSampling;
+    CardinalityEstimate ndv =
+        [&samplingEstimator, &fields, &ndvFieldsAreUnique, &metrics, &source]() {
+            if (ndvFieldsAreUnique) {
+                source = JoinNdvEstimateSource::kUniqueIndex;
+                ++metrics.numUniqueIndexesUsedForNDV;
+                return CardinalityEstimate(samplingEstimator->getCollCard().cardinality(),
+                                           EstimationSource::Metadata);
+            }
+
+            // TODO SERVER-135494: report HLL when used/available.
+            return samplingEstimator->estimateNDV(fields);
+        }();
+
+    cost_based_ranker::SelectivityEstimate sel{cost_based_ranker::oneSel};
     // Ensure we don't accidentally produce a selectivity > 1
     if (cost_based_ranker::exactGt(ndv, cost_based_ranker::oneCE)) {
-        res = cost_based_ranker::oneCE / ndv;
+        sel = cost_based_ranker::oneCE / ndv;
     }
+
     LOGV2_DEBUG(11352504,
                 5,
                 "Performed estimation of selectivity of join edge",
@@ -152,8 +182,13 @@ cost_based_ranker::SelectivityEstimate JoinCardinalityEstimator::joinPredicateSe
                 "fields"_attr = fields,
                 "ndvEstimate"_attr = ndv,
                 "ndvFieldsAreUnique"_attr = ndvFieldsAreUnique,
-                "selectivityEstimate"_attr = res);
-    return res;
+                "selectivityEstimate"_attr = sel,
+                "source"_attr = toStringData(source));
+
+    return {.assumedPkSide = primaryKeyNode.collectionName,
+            .ndv = ndv,
+            .selectivity = sel,
+            .source = source};
 }
 
 cost_based_ranker::CardinalityEstimate JoinCardinalityEstimator::getOrEstimateSubsetCardinality(
@@ -161,6 +196,12 @@ cost_based_ranker::CardinalityEstimate JoinCardinalityEstimator::getOrEstimateSu
     if (auto it = _subsetCardinalities.find(nodes); it != _subsetCardinalities.end()) {
         return it->second;
     }
+
+    // Only charge 'ceTimeMicros' for estimates we actually compute, not for memo hits.
+    Timer timer;
+    ON_BLOCK_EXIT([&]() { _estimationTimeMicros += timer.micros(); });
+    sleepWhileEstimatingJoinCardinality.execute(
+        [](const BSONObj& data) { sleepmillis(data["ms"].numberInt()); });
 
     // This method assumes that all predicates (join and and single-table) are independent from each
     // other, allowing us to combine them with simple multiplication below.
@@ -192,12 +233,13 @@ cost_based_ranker::CardinalityEstimate JoinCardinalityEstimator::getOrEstimateSu
     // Finally, note that we have the pre-computed combination of (2) and (3) in '_nodeCEs'.
     cost_based_ranker::CardinalityEstimate ce = cost_based_ranker::oneCE;
     for (auto nodeIdx : iterable(nodes, _ctx.joinGraph.numNodes())) {
-        ce = cost_based_ranker::product(ce, _ctx.singleTableAccess.nodeCardinalities[nodeIdx]);
+        ce = cost_based_ranker::product(
+            ce, _ctx.singleTableAccess.nodeCardinalitiesOriginalFilter[nodeIdx]);
     }
 
     auto edges = _cycleBreaker.breakCycles(_ctx.joinGraph.getEdgesForSubgraph(nodes));
     for (const auto& edgeId : edges) {
-        ce = ce * _edgeSelectivities.at(edgeId);
+        ce = ce * _edgeSelectivities.at(edgeId).selectivity;
     }
 
     LOGV2_DEBUG(11514603,
@@ -212,7 +254,7 @@ cost_based_ranker::CardinalityEstimate JoinCardinalityEstimator::getOrEstimateSu
 }
 
 SelectivityEstimate JoinCardinalityEstimator::getEdgeSelectivity(EdgeId edge) const {
-    return _edgeSelectivities[edge];
+    return _edgeSelectivities[edge].selectivity;
 }
 
 

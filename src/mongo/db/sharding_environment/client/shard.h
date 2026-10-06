@@ -20,7 +20,6 @@
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/sharding_environment/client/shard_gen.h"
-#include "mongo/db/sharding_environment/shard_handle.h"
 #include "mongo/db/sharding_environment/shard_id.h"
 #include "mongo/db/sharding_environment/shard_shared_state_cache.h"
 #include "mongo/executor/remote_command_response.h"
@@ -299,13 +298,8 @@ public:
 
     virtual ~Shard() = default;
 
-    // TODO (SERVER-127200): remove and update all callers to rely on getHandle.
     const ShardId& getId() const {
-        return _handle.name();
-    }
-
-    const ShardHandle& getHandle() const {
-        return _handle;
+        return _id;
     }
 
     /**
@@ -515,7 +509,7 @@ public:
     AdaptiveRetryStrategy::RetryBudget& getRetryBudget_forTest() const;
 
 protected:
-    Shard(const ShardHandle& handle, std::shared_ptr<ShardSharedStateCache::State> sharedState);
+    Shard(const ShardId& id, std::shared_ptr<ShardSharedStateCache::State> sharedState);
 
     std::shared_ptr<ShardSharedStateCache::State> getSharedState() const;
 
@@ -582,7 +576,10 @@ private:
         std::function<bool(const std::vector<BSONObj>& batch,
                            const boost::optional<BSONObj>& postBatchResumeToken)> callback) = 0;
 
-    const ShardHandle _handle;
+    /**
+     * Identifier of the shard as obtained from the configuration data (i.e. shard0000).
+     */
+    const ShardId _id;
     std::shared_ptr<ShardSharedStateCache::State> _sharedState;
 
     friend class ConfigShardWrapper;

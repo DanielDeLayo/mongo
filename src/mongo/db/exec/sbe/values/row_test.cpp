@@ -93,7 +93,7 @@ public:
         RowType row(N);
         for (size_t i = 0; i < row.size(); i++) {
             auto expected = value::makeNewString(longStrings[i % longStringsSize]);
-            value::ValueGuard expectedGuard(expected);
+            value::TagValueOwned expectedOwner = value::TagValueOwned::fromRaw(expected);
 
             setValue(row, i, true, value::makeNewString(longStrings[i % longStringsSize]));
 
@@ -106,6 +106,27 @@ public:
             ASSERT_THAT(p2.raw(), ValueEq(expected));
             verifyValue(row, i, copyValue(expected));
         }
+    }
+
+    void testResetView() {
+        RowType row(N);
+        for (size_t i = 0; i < row.size(); i++) {
+            // Own the string here; hand the row only a non-owning *view* of it.
+            auto owned = value::makeNewString(longStrings[i % longStringsSize]);
+            value::TagValueOwned guard = value::TagValueOwned::fromRaw(owned);
+            // Ensure pointer comparisons are meaningful (i.e. we're not in the small-string inline
+            // representation).
+            ASSERT_GT(value::getStringLength(owned.first, owned.second),
+                      value::kSmallStringMaxLength);
+            row.reset(i, value::TagValueView{owned.first, owned.second});
+            auto copied = row.copyOrMoveValue(i);
+            ASSERT_NE(value::getRawStringView(owned.first, owned.second),
+                      value::getRawStringView(copied.tag(), copied.value()));
+            verifyValue(row, i, copyValue(owned));
+        }
+        // 'row' holds only views, so its destructor must NOT free the strings;
+        // the ValueGuards free each string exactly once (a wrongful own would also
+        // trip ASAN here as a double-free).
     }
 
     void testResize() {
@@ -139,6 +160,7 @@ public:
         testMove();
         testAssign();
         testCopyOrMoveValue();
+        testResetView();
 
         if (allowResize) {
             testResize();
@@ -155,11 +177,11 @@ private:
     }
 
     void setValue(RowType& row, int idx, bool owned, TypedValue p) {
-        row.reset(idx, owned, p.first, p.second);
+        row.reset(idx, value::TagValueMaybeOwned::fromRaw(owned, p.first, p.second));
     }
 
     void verifyValue(RowType& row, int idx, TypedValue p) {
-        value::ValueGuard guard(p);
+        value::TagValueOwned pOwner = value::TagValueOwned::fromRaw(p);
         ASSERT_THAT(row.getViewOfValue(idx), ValueEq(p));
     }
 

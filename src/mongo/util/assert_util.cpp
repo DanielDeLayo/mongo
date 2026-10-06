@@ -16,6 +16,7 @@
 #include "mongo/util/str.h"
 
 #include <csignal>
+#include <cstdio>
 #include <exception>
 #include <ostream>
 #include <string_view>
@@ -70,7 +71,8 @@ MONGO_COMPILER_NORETURN void callAbort() {
     if (reentry++)
         endProcessWithSignal(SIGABRT);
 
-    [[maybe_unused]] static auto initOnce = (std::abort(), 0);
+    [[maybe_unused]] static auto initOnce =
+        (std::fflush(stdout), std::fflush(stderr), std::abort(), 0);
     MONGO_COMPILER_UNREACHABLE;
 }
 }  // namespace
@@ -88,8 +90,6 @@ bool getScopedDebugInfoStackEnabled() {
 }
 
 AssertionCount assertionCount;
-
-AssertionCount::AssertionCount() : regular(0), warning(0), msg(0), user(0), rollovers(0) {}
 
 namespace {
 Atomic<AssertionIncrementObserver> gAssertionIncrementObserver{nullptr};
@@ -314,12 +314,16 @@ void iassertFailed(const Status& status, SourceLocation loc) {
     error_details::throwExceptionForStatus(status);
 }
 
-void tassertFailed(const Status& status, SourceLocation loc) {
+void tassertNoThrowFailed(const Status& status, SourceLocation loc) {
     bumpAssertion(AssertionKind::kTripwire);
     LOGV2_ERROR(
         TRIPWIRE_ASSERTION_ID, "Tripwire assertion", "error"_attr = status, "location"_attr = loc);
     logErrorBlock();
     breakpoint();
+}
+
+void tassertFailed(const Status& status, SourceLocation loc) {
+    tassertNoThrowFailed(status, loc);
     error_details::throwExceptionForStatus(status);
 }
 

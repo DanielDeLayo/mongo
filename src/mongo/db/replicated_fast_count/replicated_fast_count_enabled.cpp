@@ -10,35 +10,45 @@
 #include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/version_context.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
+
+// TODO(SERVER-135231): Remove the failpoint.
+MONGO_FAIL_POINT_DEFINE(disableReplicatedFastCount);
+
 bool isReplicatedFastCountEnabled(OperationContext* opCtx) {
+    if (auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        !replCoord || !replCoord->getSettings().isReplSet()) {
+        return false;
+    }
+
+    if (rss::ReplicatedStorageService::get(opCtx)
+            .getPersistenceProvider()
+            .shouldUseReplicatedFastCount()) {
+        return true;
+    }
+
+    if (MONGO_unlikely(disableReplicatedFastCount.shouldFail())) {
+        return false;
+    }
+
     // TODO(SERVER-117326): Remove feature flag check.
-    return (rss::ReplicatedStorageService::get(opCtx)
-                .getPersistenceProvider()
-                .shouldUseReplicatedFastCount() ||
-            gFeatureFlagReplicatedFastCount.isEnabledUseLatestFCVWhenUninitialized(
-                VersionContext::getDecoration(opCtx),
-                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) &&
-        repl::ReplicationCoordinator::get(opCtx)->getSettings().isReplSet();
+    return gFeatureFlagReplicatedFastCount.isEnabledUseLatestFCVWhenUninitialized(
+        VersionContext::getDecoration(opCtx),
+        serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
 }
 
 bool isReplicatedFastCountEligible(const NamespaceString& nss) {
-    if (nss.isOplog()) {
+    if (nss.isOplog() && gFeatureFlagSizeBasedOplogTruncationForDisagg.isEnabled()) {
         return true;
     }
     if (nss.isLocalDB() || nss.isImplicitlyReplicated() || nss.isServerConfigurationCollection() ||
         nss.isSystemDotProfile()) {
         return false;
     }
-    // Exclude the fast count store collections themselves to avoid circular tracking.
-    const auto fastCountStoreNss =
-        NamespaceString::makeGlobalConfigCollection(NamespaceString::kReplicatedFastCountStore);
-    const auto fastCountTimestampsNss = NamespaceString::makeGlobalConfigCollection(
-        NamespaceString::kReplicatedFastCountStoreTimestamps);
-    return nss != fastCountStoreNss && nss != fastCountTimestampsNss;
+    return true;
 }
 
 bool shouldReadFromReplicatedFastCount(OperationContext* opCtx, const NamespaceString& nss) {
@@ -52,6 +62,10 @@ bool shouldReadFromReplicatedFastCount(OperationContext* opCtx, const NamespaceS
         return true;
     }
 
+    if (MONGO_unlikely(disableReplicatedFastCount.shouldFail())) {
+        return false;
+    }
+
     if (!gFeatureFlagReplicatedFastCount.isEnabledUseLatestFCVWhenUninitialized(
             VersionContext::getDecoration(opCtx),
             serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
@@ -63,30 +77,25 @@ bool shouldReadFromReplicatedFastCount(OperationContext* opCtx, const NamespaceS
     return repl::ReplicationCoordinator::get(opCtx)->getSettings().isReplSet() && !nss.isOplog();
 }
 
-bool shouldUseReplicatedFastCountContainers(OperationContext* opCtx) {
-    return rss::ReplicatedStorageService::get(opCtx)
-               .getPersistenceProvider()
-               .mustUseContainerWrites() ||
-        feature_flags::gContainerWrites.isEnabledUseLatestFCVWhenUninitialized(
-            VersionContext::getDecoration(opCtx),
-            serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
-}
-
 bool isReplicatedFastCountListCollectionsEnabled(OperationContext* opCtx) {
     if (!getTestCommandsEnabled()) {
         return false;
     }
-    const auto vCtx = VersionContext::getDecoration(opCtx);
-    const auto fcvSnapshot = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
-    // We don't consult the mustUseContainerWrites or shouldUseReplicatedFastCount persistence
-    // provider fields since this is test only functionality.
-    return gFeatureFlagReplicatedFastCount.isEnabledUseLatestFCVWhenUninitialized(vCtx,
-                                                                                  fcvSnapshot) &&
-        feature_flags::gContainerWrites.isEnabledUseLatestFCVWhenUninitialized(vCtx, fcvSnapshot);
+    if (MONGO_unlikely(disableReplicatedFastCount.shouldFail())) {
+        return false;
+    }
+    // We don't consult the shouldUseReplicatedFastCount persistence provider field since this is
+    // test only functionality.
+    return gFeatureFlagReplicatedFastCount.isEnabledUseLatestFCVWhenUninitialized(
+        VersionContext::getDecoration(opCtx),
+        serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
 }
 
 bool isReplicatedFastCountInitialSyncEnabled(OperationContext* opCtx) {
     if (!getTestCommandsEnabled()) {
+        return false;
+    }
+    if (MONGO_unlikely(disableReplicatedFastCount.shouldFail())) {
         return false;
     }
     const auto vCtx = VersionContext::getDecoration(opCtx);

@@ -23,6 +23,23 @@ using ProjectionParams = std::variant<NoProjection, TopLevelFieldsProjection>;
 using CardinalityEstimate = mongo::cost_based_ranker::CardinalityEstimate;
 using SamplingMetadata = mongo::cost_based_ranker::SamplingMetadata;
 
+/**
+ * One persisted NDV statistic (analyze mode "ndv") that served an estimate: the (sorted) field
+ * paths it describes and the statistics document's creation time. Deliberately not part of
+ * SamplingMetadata: NDV statistics are field statistics, unrelated to the sample, even though
+ * the sampling estimator serves both.
+ */
+struct PersistedNDVEntry {
+    std::vector<std::string> sortedFieldPaths;
+    // When 'analyze' built this statistic; one namespace may serve several NDV statistics, each
+    // analyzed at its own time.
+    Date_t createdAt;
+    // The NDV of each persisted sketch variant, in the persisted order (see NdvStats in
+    // field_stats.idl). Lets the reader cache a loaded statistic compactly, without the
+    // 16KB-per-sketch registers.
+    std::vector<long long> ndvPerSketch;
+};
+
 class SamplingEstimator {
 public:
     virtual ~SamplingEstimator() {}
@@ -32,13 +49,6 @@ public:
      * sample.
      */
     virtual CardinalityEstimate estimateCardinality(const MatchExpression* expr) const = 0;
-
-    /**
-     * Batch Estimates the Cardinality of a vector of filter/MatchExpression by running the given
-     * MEs against the sample.
-     */
-    virtual std::vector<CardinalityEstimate> estimateCardinality(
-        const std::vector<const MatchExpression*>& expr) const = 0;
 
     /**
      * Estimates the number of keys scanned for the given IndexBounds.
@@ -75,6 +85,12 @@ public:
      * Does not support estimating NDV over array-valued fields.
      * 'fields' specifies which fields should follow strict, $expr-style equality (null !=
      * missing) vs. regular equality semantics (null == missing).
+     *
+     * Note: when the estimate is served from persisted NDV statistics (no bounds, at most
+     * kNdvMaxFields fields), the semantics select the persisted folding variant. A single-field
+     * statistic carries only the strict ($expr) sketch and serves both semantics, off by at most
+     * one; a composite statistic carries one variant per folded field, and requests folding
+     * several fields fall back to the sample.
      */
     virtual CardinalityEstimate estimateNDV(
         const std::vector<FieldPathAndEqSemantics>& fields,
@@ -110,6 +126,22 @@ public:
      * Returns metadata about the sample used for cardinality estimation.
      */
     virtual SamplingMetadata getSamplingMetadata() const = 0;
+
+    /**
+     * Returns one entry per persisted NDV statistic (analyze mode "ndv") that served an
+     * estimate, sorted by field paths. Kept apart from getSamplingMetadata(): these are field
+     * statistics, not derived from the sample, even though this estimator serves both.
+     */
+    virtual std::vector<PersistedNDVEntry> getPersistedNDVMetadata() const = 0;
+
+    /**
+     * Returns the number of distinct persisted NDV statistics (analyze mode "ndv") this estimator
+     * has served so far. Repeated NDV requests for the same field path are memoized and counted
+     * once. Cheaper than getPersistedNDVMetadata() when only the count is needed.
+     */
+    virtual size_t getNumPersistedNDVStatsUsed() const {
+        return 0;
+    }
 };
 
 }  // namespace mongo::ce

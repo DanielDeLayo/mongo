@@ -2,9 +2,14 @@
  * White box tests for $changeStream v2 in a sharded cluster.
  *
  * @tags: [
+ *   # Whitebox test asserts on the exact command shape for a specific scope; forcing
+ *   # whole-db/whole-cluster upconversion would change what's under test.
+ *   do_not_run_in_whole_db_passthrough,
+ *   do_not_run_in_whole_cluster_passthrough,
  *   assumes_balancer_off,
  *   does_not_support_stepdowns,
  *   featureFlagChangeStreamPreciseShardTargeting,
+ *   featureFlagChangeStreamReaderV2,
  *   requires_fcv_90,
  *   requires_sharding,
  *   uses_change_streams,
@@ -228,7 +233,9 @@ describe("$changeStream v2", function () {
         });
 
         csTest.getNextChanges(csCursor, 2);
-        csTest.assertNoChange(csCursor);
+        awaitLogMessageCodes(st.s, [kPlacementRefresh], () => {
+            csTest.assertNoChange(csCursor);
+        });
 
         assertOpenCursors(st, [st.shard0.shardName, st.shard1.shardName], true, commentFilter);
 

@@ -70,6 +70,7 @@
 #include "mongo/db/sharding_environment/cluster_identity_loader.h"
 #include "mongo/db/sharding_environment/grid.h"
 #include "mongo/db/sharding_environment/router_uptime_reporter.h"
+#include "mongo/db/sharding_environment/shard_id.h"
 #include "mongo/db/sharding_environment/shard_local.h"
 #include "mongo/db/sharding_environment/sharding_feature_flags_gen.h"
 #include "mongo/db/sharding_environment/sharding_initialization.h"
@@ -322,33 +323,28 @@ void _initializeGlobalShardingState(OperationContext* opCtx,
 
     ShardFactory::BuildersMap buildersMap{
         {ConnectionString::ConnectionType::kReplicaSet,
-         [targeterFactoryPtr, serviceContext](const ShardHandle& handle,
+         [targeterFactoryPtr, serviceContext](const ShardId& shardId,
                                               const ConnectionString& connStr) {
-             // TODO (SERVER-127201) Update the ShardSharedStateCache to operate via ShardUUID
              auto& shardSharedStateCache = ShardSharedStateCache::get(serviceContext);
-             return std::make_unique<ShardRemote>(
-                 handle,
-                 connStr,
-                 targeterFactoryPtr->create(connStr),
-                 shardSharedStateCache.getShardState(handle.name()));
+             return std::make_unique<ShardRemote>(shardId,
+                                                  connStr,
+                                                  targeterFactoryPtr->create(connStr),
+                                                  shardSharedStateCache.getShardState(shardId));
          }},
         {ConnectionString::ConnectionType::kLocal,
-         [serviceContext](const ShardHandle& handle, const ConnectionString& connStr) {
-             // TODO (SERVER-127201) Update the ShardSharedStateCache to operate via ShardUUID
+         [serviceContext](const ShardId& shardId, const ConnectionString& connStr) {
              auto& shardSharedStateCache = ShardSharedStateCache::get(serviceContext);
-             return std::make_unique<ShardLocal>(
-                 handle, shardSharedStateCache.getShardState(handle.name()));
+             return std::make_unique<ShardLocal>(shardId,
+                                                 shardSharedStateCache.getShardState(shardId));
          }},
         {ConnectionString::ConnectionType::kStandalone,
-         [targeterFactoryPtr, serviceContext](const ShardHandle& handle,
+         [targeterFactoryPtr, serviceContext](const ShardId& shardId,
                                               const ConnectionString& connStr) {
-             // TODO (SERVER-127201) Update the ShardSharedStateCache to operate via ShardUUID
              auto& shardSharedStateCache = ShardSharedStateCache::get(serviceContext);
-             return std::make_unique<ShardRemote>(
-                 handle,
-                 connStr,
-                 targeterFactoryPtr->create(connStr),
-                 shardSharedStateCache.getShardState(handle.name()));
+             return std::make_unique<ShardRemote>(shardId,
+                                                  connStr,
+                                                  targeterFactoryPtr->create(connStr),
+                                                  shardSharedStateCache.getShardState(shardId));
          }},
     };
 
@@ -588,12 +584,10 @@ void ShardingInitializationMongoD::initializeFromShardIdentity(
 
     try {
         _initFunc(opCtx, shardIdentity);
-        shardingState->setRecoveryCompleted(
-            {shardIdentity.getClusterId(),
-             serverGlobalParams.clusterRole,
-             shardIdentity.getConfigsvrConnectionString(),
-             ShardHandle(ShardId(std::string{shardIdentity.getShardName()}),
-                         shardIdentity.getUuid())});
+        shardingState->setRecoveryCompleted({shardIdentity.getClusterId(),
+                                             serverGlobalParams.clusterRole,
+                                             shardIdentity.getConfigsvrConnectionString(),
+                                             ShardId(std::string{shardIdentity.getShardName()})});
     } catch (const DBException& ex) {
         shardingState->setRecoveryFailed(ex.toStatus());
     }
@@ -756,49 +750,20 @@ void ShardingInitializationMongoD::onStepUpComplete(OperationContext* opCtx, lon
             // meaningfully. Still resolve the legacy migration recovery job registered in
             // onStepUpBegin, so it doesn't block RangeDeleterService recovery for the rest of the
             // term.
-            RangeDeleterService::get(opCtx)->notifyRecoveryJobComplete(term);
+            RangeDeleterService::get(opCtx)->notifyRecoveryJobComplete(
+                term, RecoveryJob::kLegacyMigration);
         }
 
         // The code above will only be executed after a stepdown happens, however the code below
         // needs to be executed also on startup, and the enabled check might fail in shards during
-        // startup. Create uuid index on config.rangeDeletions if needed
-        const auto minKeyFieldName = std::string{RangeDeletionTask::kRangeFieldName} + "." +
-            std::string{ChunkRange::kMinFieldName};
-        const auto maxKeyFieldName = std::string{RangeDeletionTask::kRangeFieldName} + "." +
-            std::string{ChunkRange::kMaxFieldName};
-        Status indexStatus = createIndexOnConfigCollection(
-            opCtx,
-            NamespaceString::kRangeDeletionNamespace,
-            BSON(RangeDeletionTask::kCollectionUuidFieldName << 1 << minKeyFieldName << 1
-                                                             << maxKeyFieldName << 1),
-            false);
-        if (!indexStatus.isOK()) {
-            // If the node is shutting down or it lost quorum just as it was becoming primary,
-            // don't run the sharding onStepUp machinery. The onStepDown counterpart to these
-            // methods is already idempotent, so the machinery will remain in the stepped down
-            // state.
-            if (ErrorCodes::isShutdownError(indexStatus.code()) ||
-                ErrorCodes::isNotPrimaryError(indexStatus.code())) {
+        // startup.
+        auto status = ensureShardServerIndexes(opCtx);
+        if (!status.isOK()) {
+            if (ErrorCodes::isShutdownError(status.code()) ||
+                ErrorCodes::isNotPrimaryError(status.code())) {
                 return;
             }
-            fassertFailedWithStatus(
-                64285,
-                indexStatus.withContext("Failed to create index on config.rangeDeletions on "
-                                        "shard's first transition to primary"));
-        }
-
-        // Create shard catalog collections and indexes if they do not yet exist.
-        auto fcvSnapshot = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
-        if (feature_flags::gAuthoritativeShardsDDL.isEnabled(VersionContext::getDecoration(opCtx),
-                                                             fcvSnapshot)) {
-            auto status = ensureShardLocalCatalogIndexes(opCtx);
-            if (!status.isOK()) {
-                if (ErrorCodes::isShutdownError(status.code()) ||
-                    ErrorCodes::isNotPrimaryError(status.code())) {
-                    return;
-                }
-                fassertFailedWithStatus(11961000, status);
-            }
+            fassertFailedWithStatus(13252509, status);
         }
     }
 
@@ -1087,23 +1052,54 @@ boost::optional<ShardIdentity> ShardingInitializationMongoD::getShardIdentityDoc
     }
 }
 
-Status ensureShardLocalCatalogIndexes(OperationContext* opCtx) {
-    /* Creating _id is a no-op but ensures the collection is created if it doesn't exist. */
-    Status result = sharding_util::createIndexOnCollection(
+Status ensureShardServerIndexes(OperationContext* opCtx) {
+    // Continue attempting every required index build so every missing index is reported.
+    Status returnStatus = Status::OK();
+    auto recordFailure = [&](const Status& result) {
+        if (returnStatus.isOK() && !result.isOK()) {
+            returnStatus = result;
+        }
+    };
+
+    // Create uuid index on config.rangeDeletions if needed
+    const auto minKeyFieldName = std::string{RangeDeletionTask::kRangeFieldName} + "." +
+        std::string{ChunkRange::kMinFieldName};
+    const auto maxKeyFieldName = std::string{RangeDeletionTask::kRangeFieldName} + "." +
+        std::string{ChunkRange::kMaxFieldName};
+    Status indexStatus = sharding_util::createIndexesOnCollectionAtStepUp(
         opCtx,
-        NamespaceString::kConfigShardCatalogCollectionsNamespace,
-        BSON("_id" << 1),
-        true /* unique */);
-    if (!result.isOK()) {
-        return result.withContext(
+        NamespaceString::kRangeDeletionNamespace,
+        {IndexSpec_ForCatalog{BSON(RangeDeletionTask::kCollectionUuidFieldName
+                                   << 1 << minKeyFieldName << 1 << maxKeyFieldName << 1),
+                              false}});
+    recordFailure(indexStatus.withContext(
+        "Failed to create index on config.rangeDeletions on shard's first transition to primary"));
+
+    // Create shard catalog collections and indexes if they do not yet exist.
+    auto fcvSnapshot = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
+    if (feature_flags::gAuthoritativeShardsDDL.isEnabled(VersionContext::getDecoration(opCtx),
+                                                         fcvSnapshot)) {
+        /* Creating _id is a no-op but ensures the collection is created if it doesn't exist. */
+        Status result = sharding_util::createIndexesOnCollectionAtStepUp(
+            opCtx,
+            NamespaceString::kConfigShardCatalogCollectionsNamespace,
+            {IndexSpec_ForCatalog{BSON("_id" << 1), true /* unique */}});
+        recordFailure(result.withContext(
             str::stream()
             << "couldn't create _id index on "
-            << NamespaceString::kConfigShardCatalogCollectionsNamespace.toStringForErrorMsg());
-    }
+            << NamespaceString::kConfigShardCatalogCollectionsNamespace.toStringForErrorMsg()));
 
-    /* The shard catalog chunks collection and its indexes. */
-    return ensureCollectionIndexes(
-        opCtx, NamespaceString::kConfigShardCatalogChunksNamespace, getChunkCollectionIndexSpecs());
+        result = sharding_util::createIndexesOnCollectionAtStepUp(
+            opCtx,
+            NamespaceString::kConfigShardCatalogChunksNamespace,
+            getChunkCollectionIndexSpecs());
+
+        recordFailure(result.withContext(
+            str::stream()
+            << "Failed to create indexes on "
+            << NamespaceString::kConfigShardCatalogChunksNamespace.toStringForErrorMsg()));
+    }
+    return returnStatus;
 }
 
 }  // namespace mongo

@@ -1,19 +1,23 @@
 load("//bazel/install_rules:install_rules.bzl", "extensions_with_config")
-load("@poetry//:dependencies.bzl", "dependency")
+load("//bazel/uv:defs.bzl", "dependency")
 load("//bazel/config:render_template.bzl", "render_template")
 load("//bazel:signing.bzl", "signed_mongo_cc_extension_shared_library")
 
 package(default_visibility = ["//visibility:public"])
 
 exports_files(
-    glob([
-        "*.h",
-    ]),
+    glob(
+        [
+            "*.h",
+        ],
+        allow_empty = True,
+    ),
 )
 
 filegroup(
     name = "resmoke_data",
     srcs = [
+        "aggregation_stage_fallback_parsers.json",
         "configurations.yml",
         "//src/mongo/db/extension/test_examples/test_extensions_signing_keys:test_extensions_signing_public_key.asc",
     ],

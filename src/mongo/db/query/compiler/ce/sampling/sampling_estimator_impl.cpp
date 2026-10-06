@@ -5,6 +5,8 @@
 
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/db/commands/server_status/histogram_server_status_metric.h"
+#include "mongo/db/commands/server_status/server_status_metric.h"
 #include "mongo/db/exec/matcher/matcher.h"
 #include "mongo/db/exec/sbe/expressions/sbe_fn_names.h"
 #include "mongo/db/exec/sbe/makeobj_spec.h"
@@ -19,9 +21,12 @@
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/namespace_string_util.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/expression_context_builder.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/compiler/ce/ce_common.h"
+#include "mongo/db/query/compiler/ce/ndv/field_stats.h"
+#include "mongo/db/query/compiler/ce/ndv/field_stats_loader.h"
 #include "mongo/db/query/compiler/ce/sampling/math.h"
 #include "mongo/db/query/compiler/ce/sampling/persistent_sample_loader.h"
 #include "mongo/db/query/compiler/dependency_analysis/match_expression_dependencies.h"
@@ -29,15 +34,19 @@
 #include "mongo/db/query/find_command.h"
 #include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/query_knobs/query_knob_configuration.h"
 #include "mongo/db/query/query_optimization_knobs_gen.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/stage_builder/sbe/builder.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/db/version_context.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
 
+#include <algorithm>
 #include <cmath>
 #include <string_view>
 
@@ -83,7 +92,11 @@ void validateTopLevelSampleFieldNames(const StringSet& topLevelSampleFieldNames)
 void checkSampleContainsMatchExpressionFields(const StringSet& topLevelSampleFieldNames,
                                               const MatchExpression* expr) {
     const auto matchExpressionFields = extractTopLevelFieldsFromMatchExpression(expr);
-    for (const auto& matchField : matchExpressionFields) {
+    tassert(13452601,
+            "MatchExpression needs the whole document but the sample doesn't contain all fields",
+            !matchExpressionFields.needsAllFields());
+
+    for (const auto& matchField : matchExpressionFields.fieldNames()) {
         tassert(10670301,
                 "MatchExpression contains fields not present in topLevelSampleFieldNames. "
                 "MatchExpression: " +
@@ -98,18 +111,6 @@ void checkSampleContainsIndexBoundsFields(const StringSet& topLevelSampleFieldNa
         tassert(10770101,
                 "Field in index bounds should be included in the set of sampled fields.",
                 topLevelSampleFieldNames.contains(stage_builder::getTopLevelField(oil.name)));
-    }
-}
-
-/**
- * Helper function to determine if a given set of MatchExpresions contains only fields present in
- * the sample.
- */
-void checkSampleContainsMatchExpressionFields(
-    const StringSet& topLevelSampleFieldNames,
-    const std::vector<const MatchExpression*>& expressions) {
-    for (const auto& expr : expressions) {
-        checkSampleContainsMatchExpressionFields(topLevelSampleFieldNames, expr);
     }
 }
 
@@ -233,8 +234,6 @@ CardinalityEstimate makeScaledEstimate(double matchCount,
     // Tagging these as Code prevents CardinalityEstimator::clampZeroEstimates from inflating
     // the estimates.
 
-    // TODO SERVER-127501: Revisit for a persisted sample of size 0 should be
-    // treated as authoritative.
     if (wasSamplePersisted) {
         return CardinalityEstimate{CardinalityType{estimate}, EstimationSource::Sampling};
     }
@@ -285,15 +284,43 @@ std::unique_ptr<sbe::PlanStage> makeProjectStage(std::unique_ptr<sbe::PlanStage>
 }
 }  // namespace
 
-StringSet extractTopLevelFieldsFromMatchExpression(const MatchExpression* expr) {
+TopLevelSampleFields extractTopLevelFieldsFromMatchExpression(const MatchExpression* expr) {
     DepsTracker deps;
     dependency_analysis::addDependencies(expr, &deps);
+    if (deps.needWholeDocument) {
+        return TopLevelSampleFields::allFields();
+    }
+
     StringSet topLevelFieldsSet;
     for (auto&& path : deps.fields) {
         const auto field = stage_builder::getTopLevelField(path);
         topLevelFieldsSet.emplace(std::string(field));
     }
-    return topLevelFieldsSet;
+    return TopLevelSampleFields{std::move(topLevelFieldsSet)};
+}
+
+const StringSet& TopLevelSampleFields::fieldNames() const {
+    tassert(13452602, "All fields are needed", !needsAllFields());
+    return _fieldNames.value();
+}
+
+void TopLevelSampleFields::merge(TopLevelSampleFields other) {
+    if (needsAllFields() || other.needsAllFields()) {
+        _fieldNames = kAllFields;
+    } else {
+        _fieldNames->merge(other._fieldNames.value());
+    }
+}
+
+boost::optional<StringSet&> TopLevelSampleFields::relevantIndexOutput() {
+    return !needsAllFields() ? boost::optional<StringSet&>(_fieldNames.value()) : boost::none;
+}
+
+ProjectionParams TopLevelSampleFields::toProjectionParams() && {
+    if (needsAllFields() || _fieldNames->empty()) {
+        return NoProjection{};
+    }
+    return TopLevelFieldsProjection{std::move(_fieldNames.value())};
 }
 
 std::unique_ptr<CanonicalQuery> SamplingEstimatorImpl::makeEmptyCanonicalQuery(
@@ -316,17 +343,19 @@ std::unique_ptr<CanonicalQuery> SamplingEstimatorImpl::makeEmptyCanonicalQuery(
 }
 
 
-size_t SamplingEstimatorImpl::calculateSampleSize(SamplingConfidenceIntervalEnum ci,
-                                                  double marginOfError,
-                                                  int32_t sampleSizeOverride) {
+size_t SamplingEstimatorImpl::calculateSampleSize(const QueryKnobConfiguration& qkc) {
+    const int sampleSizeOverride = qkc.getSamplingSizeOverride();
     if (sampleSizeOverride > 0) {
         return static_cast<size_t>(sampleSizeOverride);
     }
+
+    SamplingConfidenceIntervalEnum ci = qkc.getConfidenceInterval();
+    double marginOfError = qkc.getSamplingMarginOfError();
     uassert(9406301, "Margin of error should be larger than 0.", marginOfError > 0);
     double z = getZScore(ci);
     double ciWidth = 2 * marginOfError / 100.0;
     size_t sampleSize = static_cast<size_t>(std::lround((z * z) / (ciWidth * ciWidth)));
-    tassert(sampleSize > 0, "Sample size should be larger than 0.", 113010001);
+    tassert(11301000, "Sample size should be larger than 0.", sampleSize > 0);
 
     return sampleSize;
 }
@@ -864,40 +893,6 @@ CardinalityEstimate SamplingEstimatorImpl::estimateCardinality(const MatchExpres
     return estimate;
 }
 
-std::vector<CardinalityEstimate> SamplingEstimatorImpl::estimateCardinality(
-    const std::vector<const MatchExpression*>& expressions) const {
-    tassert(10981501,
-            "Sample must be generated before calling estimateCardinality()",
-            _isSampleGenerated);
-    if (!_topLevelSampleFieldNames.empty()) {
-        checkSampleContainsMatchExpressionFields(_topLevelSampleFieldNames, expressions);
-    }
-    std::vector<double> counts(expressions.size(), 0);
-    std::vector<size_t> errorCounts(expressions.size(), 0);
-    // Experiment showed that this batch process performs better than calling
-    // 'estimateCardinality(const MatchExpression* expr)' over and over.
-    for (const auto& doc : _sample) {
-        for (size_t i = 0; i < expressions.size(); i++) {
-            auto result = tryMatchesBSON(expressions[i], doc);
-            if (!result) {
-                errorCounts[i]++;
-                continue;
-            }
-            if (*result) {
-                counts[i] += 1;
-            }
-        }
-    }
-
-    std::vector<CardinalityEstimate> estimates;
-    estimates.reserve(counts.size());
-    for (size_t i = 0; i < counts.size(); i++) {
-        estimates.push_back(makeScaledEstimate(
-            counts[i], errorCounts[i], _sampleSize, getCollCard(), _wasSamplePersisted));
-    }
-
-    return estimates;
-}
 
 CardinalityEstimate SamplingEstimatorImpl::estimateKeysScanned(const IndexBounds& bounds) const {
     tassert(10981502,
@@ -1043,31 +1038,6 @@ SamplingEstimatorImpl::SamplingEstimatorImpl(
     const MultipleCollectionAccessor& collections,
     const NamespaceString& nss,
     PlanYieldPolicy::YieldPolicy yieldPolicy,
-    SamplingCEMethodEnum samplingStyle,
-    CardinalityEstimate collectionCard,
-    SamplingConfidenceIntervalEnum ci,
-    double marginOfError,
-    boost::optional<int> numChunks,
-    boost::intrusive_ptr<const ExpressionContext> customerQueryExpCtx,
-    SamplingSourceEnum samplingSource,
-    SamplingCEMethodEnum persistentSampleMethod)
-    : SamplingEstimatorImpl(opCtx,
-                            collections,
-                            nss,
-                            yieldPolicy,
-                            calculateSampleSize(ci, marginOfError),
-                            samplingStyle,
-                            numChunks,
-                            collectionCard,
-                            std::move(customerQueryExpCtx),
-                            samplingSource,
-                            persistentSampleMethod) {}
-
-SamplingEstimatorImpl::SamplingEstimatorImpl(
-    OperationContext* opCtx,
-    const MultipleCollectionAccessor& collections,
-    const NamespaceString& nss,
-    PlanYieldPolicy::YieldPolicy yieldPolicy,
     size_t sampleSize,
     SamplingCEMethodEnum samplingStyle,
     boost::optional<int> numChunks,
@@ -1088,6 +1058,32 @@ SamplingEstimatorImpl::SamplingEstimatorImpl(
 
 SamplingEstimatorImpl::~SamplingEstimatorImpl() {}
 
+namespace {
+// Hit = found and used a persisted sample. Miss = fell back to on-the-fly sampling.
+auto& persistentSampleHits = *MetricBuilder<Counter64>{"query.sampling.persistentSample.hits"};
+auto& persistentSampleMisses = *MetricBuilder<Counter64>{"query.sampling.persistentSample.misses"};
+
+// Hit = served an NDV from persisted field statistics. Miss = fell back to the sample-based
+// estimate although persisted NDV statistics were enabled and requested. Counted once per
+// estimator, canonical path set and folding variant; memoized re-reads within one estimator do
+// not count again.
+auto& persistentNDVHits = *MetricBuilder<Counter64>{"query.sampling.persistentNdv.hits"};
+auto& persistentNDVMisses = *MetricBuilder<Counter64>{"query.sampling.persistentNdv.misses"};
+
+// Latency of attempting to load a persistent sample
+auto& persistentSampleLoadMicros =
+    *MetricBuilder<DurationCounter64<Microseconds>>{"query.sampling.persistentSample.loadMicros"};
+// Histogram produces a vector bounds from 0.256 ms to 268000 ms (268 s)
+auto& persistentSampleLoadMicrosHistogram =
+    *MetricBuilder<HistogramServerStatusMetric>{
+        "query.sampling.persistentSample.histograms.loadMicros"}
+         .bind(HistogramServerStatusMetric::pow(11, 256, 4));
+
+// Docs loaded on a hit.
+auto& persistentSampleDocsLoaded =
+    *MetricBuilder<Counter64>{"query.sampling.persistentSample.docsLoaded"};
+}  // namespace
+
 Status SamplingEstimatorImpl::tryLoadPersistentSample(SamplingTechniqueEnum method) {
     if (!feature_flags::gFeatureFlagPersistentStats.isEnabled(
             VersionContext::getDecoration(_opCtx),
@@ -1106,18 +1102,32 @@ Status SamplingEstimatorImpl::tryLoadPersistentSample(SamplingTechniqueEnum meth
     const boost::optional<int> numChunks =
         (method == SamplingTechniqueEnum::kChunk) ? _numChunks : boost::none;
 
+    auto* tickSource = _opCtx->getServiceContext()->getTickSource();
+    auto startTicks = tickSource->getTicks();
+
     PersistentSampleLoader loader;
-    auto parsed =
+    auto loadResult =
         loader.tryLoad(_opCtx, _nss.dbName(), collection->uuid(), method, _sampleSize, numChunks);
-    if (!parsed.isOK()) {
-        return parsed.getStatus();
+
+    auto loadMicros = tickSource->ticksTo<Microseconds>(tickSource->getTicks() - startTicks);
+    persistentSampleLoadMicros.increment(loadMicros);
+    persistentSampleLoadMicrosHistogram.increment(durationCount<Microseconds>(loadMicros));
+
+    if (!loadResult.isOK()) {
+        persistentSampleMisses.incrementRelaxed();
+        return loadResult.getStatus();
     }
 
-    _sample = parsed.getValue().getDocs();
+    const auto& parsed = loadResult.getValue().sample;
+    _sample = parsed.getDocs();
     _sampleSize = _sample.size();
     _uniqueDocCount = boost::none;
     _wasSamplePersisted = true;
-    _sampleCreatedAt = parsed.getValue().getCreatedAt();
+    _sampleCreatedAt = parsed.getCreatedAt();
+    _numPages = loadResult.getValue().pagesRead;
+
+    persistentSampleHits.incrementRelaxed();
+    persistentSampleDocsLoaded.incrementRelaxed(_sampleSize);
     return Status::OK();
 }
 
@@ -1142,7 +1152,241 @@ SamplingMetadata SamplingEstimatorImpl::getSamplingMetadata() const {
         meta.numChunks = _numChunks;
     }
     meta.createdAt = _sampleCreatedAt;
+    meta.numPages = _numPages;
     return meta;
+}
+
+std::vector<PersistedNDVEntry> SamplingEstimatorImpl::getPersistedNDVMetadata() const {
+    auto entries = _persistedNDVStatsUsed;
+    // Insertion order follows optimizer traversal; sort for deterministic explain output.
+    // std::vector's operator< compares lexicographically, element by element, so entries order
+    // by their first differing path, with a shorter path list before its extensions.
+    std::sort(entries.begin(), entries.end(), [](auto& a, auto& b) {
+        return a.sortedFieldPaths < b.sortedFieldPaths;
+    });
+    return entries;
+}
+
+bool SamplingEstimatorImpl::persistentNDVStatsEnabled() const {
+    if (!_persistentNDVEnabled) {
+        const bool flagEnabled = feature_flags::gFeatureFlagPersistentStats.isEnabled(
+            VersionContext::getDecoration(_opCtx),
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
+        // The operation's knob configuration, which reflects any query settings overrides.
+        _persistentNDVEnabled =
+            flagEnabled && QueryKnobConfiguration::get(_opCtx).getEnablePersistentNDVStats();
+    }
+    return *_persistentNDVEnabled;
+}
+
+boost::optional<size_t> SamplingEstimatorImpl::selectPersistedNDVSketchIndex(
+    const std::vector<std::pair<std::string, bool>>& sortedFields,
+    const SortedFieldPaths& sortedPaths) const {
+    // A single-field statistic persists exactly one sketch; it serves requests of either
+    // equality semantics (the two answers differ by at most one distinct value). A composite
+    // statistic persists sketches[0], where every field counts null and missing separately,
+    // plus sketches[i + 1] for each sorted field i, where that one field counts null and
+    // missing as the same value. No sketch merges null and missing for more than one field.
+    if (sortedFields.size() == 1) {
+        return 0;
+    }
+
+    size_t foldedCount = 0;
+    size_t sketchIndex = 0;
+    for (size_t i = 0; i < sortedFields.size(); ++i) {
+        if (!sortedFields[i].second /* isExprEq */) {
+            ++foldedCount;
+            sketchIndex = i + 1;
+        }
+    }
+    if (foldedCount > 1) {
+        // No persisted variant folds several fields; the caller falls back to the sample.
+        LOGV2_DEBUG(13176600,
+                    5,
+                    "Persisted NDV statistics cannot serve a request folding several fields",
+                    logAttrs(_nss),
+                    "paths"_attr = sortedPaths,
+                    "numFoldedFields"_attr = foldedCount);
+        return boost::none;
+    }
+    // When no field is folded, 'sketchIndex' was never assigned and still selects the strict
+    // tuple sketch at index 0.
+    return sketchIndex;
+}
+
+const boost::optional<CardinalityEstimate>* PersistedNDVStatsCache::findEstimate(
+    const SortedFieldPaths& sortedPaths, size_t sketchIndex) const {
+    const auto it = _estimates.find(std::pair(sortedPaths, sketchIndex));
+    return it == _estimates.end() ? nullptr : &it->second;
+}
+
+void PersistedNDVStatsCache::storeEstimate(const SortedFieldPaths& sortedPaths,
+                                           size_t sketchIndex,
+                                           boost::optional<CardinalityEstimate> estimate) {
+    _estimates.emplace(std::pair(sortedPaths, sketchIndex), std::move(estimate));
+}
+
+const boost::optional<PersistedNDVEntry>& PersistedNDVStatsCache::getOrLoadDoc(
+    const SortedFieldPaths& sortedPaths,
+    const std::function<boost::optional<PersistedNDVEntry>()>& load) {
+    if (const auto it = _docs.find(sortedPaths); it != _docs.end()) {
+        return it->second;
+    }
+    return _docs.emplace(sortedPaths, load()).first->second;
+}
+
+boost::optional<PersistedNDVEntry> SamplingEstimatorImpl::loadPersistedNDVStats(
+    const SortedFieldPaths& sortedPaths, size_t numFields) const {
+    const CollectionPtr& collection = _collections.lookupCollection(_nss);
+    if (!collection) {
+        return boost::none;
+    }
+
+    auto swDoc = loadFieldStats(_opCtx, _nss.dbName(), collection->uuid(), sortedPaths);
+    if (!swDoc.isOK()) {
+        LOGV2_DEBUG(13176000,
+                    5,
+                    "Found no usable persisted NDV statistics",
+                    logAttrs(_nss),
+                    "paths"_attr = sortedPaths,
+                    "reason"_attr = swDoc.getStatus());
+        return boost::none;
+    }
+
+    // The _id lookup encodes the identity, but the top-level copies of these fields come
+    // from storage all the same; treat a document whose copies disagree as unusable
+    // instead of trusting it.
+    const auto& docPaths = swDoc.getValue().getSortedFieldPaths();
+    const bool identityMatches = swDoc.getValue().getSchemaVersion() == kFieldStatsSchemaVersion &&
+        swDoc.getValue().getCollectionUuid() == collection->uuid() &&
+        std::equal(docPaths.begin(), docPaths.end(), sortedPaths.begin(), sortedPaths.end());
+    if (!identityMatches) {
+        LOGV2_DEBUG(13176601,
+                    5,
+                    "Ignoring persisted NDV statistics document with inconsistent "
+                    "identity fields",
+                    logAttrs(_nss),
+                    "paths"_attr = sortedPaths);
+        return boost::none;
+    }
+
+    // A single-field statistic carries exactly one sketch, a composite one carries one
+    // per folding variant. Any other shape was written by a version that disagrees with
+    // ours, so fall back to the sample rather than asserting on stored data.
+    const auto& sketches = swDoc.getValue().getNdv().getSketches();
+    const size_t expectedNumSketches = numFields == 1 ? 1 : numFields + 1;
+    if (sketches.size() != expectedNumSketches) {
+        LOGV2_DEBUG(13176002,
+                    5,
+                    "Ignoring unusable persisted NDV statistics document",
+                    logAttrs(_nss),
+                    "paths"_attr = sortedPaths,
+                    "expectedNumSketches"_attr = expectedNumSketches,
+                    "numSketches"_attr = sketches.size());
+        return boost::none;
+    }
+
+    // Keep only what serving needs; the sketch registers (16KB each) are dropped here
+    // rather than staying resident in the planner for its lifetime.
+    PersistedNDVEntry summary;
+    summary.sortedFieldPaths = sortedPaths;
+    summary.createdAt = swDoc.getValue().getCreatedAt();
+    summary.ndvPerSketch.reserve(sketches.size());
+    for (const auto& sketch : sketches) {
+        summary.ndvPerSketch.push_back(sketch.getNdv());
+    }
+    return summary;
+}
+
+boost::optional<CardinalityEstimate> SamplingEstimatorImpl::tryEstimateNDVFromPersistentStats(
+    const std::vector<FieldPathAndEqSemantics>& fields,
+    boost::optional<std::span<const OrderedIntervalList>> bounds) const {
+    // Bounded NDV stays sample-only by design: a whole-domain sketch cannot answer how many
+    // distinct values fall within a range.
+    if (fields.empty() || fields.size() > ce::kNdvMaxFields || bounds.has_value() ||
+        !persistentNDVStatsEnabled()) {
+        return boost::none;
+    }
+
+    // NDV(a, b) == NDV(b, a): statistics are keyed on canonically sorted paths, so sort a copy
+    // of the request. The caller's order stays untouched for the sample-based fallback.
+    std::vector<std::pair<std::string, bool>> sortedFields;
+    sortedFields.reserve(fields.size());
+    for (const auto& field : fields) {
+        sortedFields.emplace_back(field.path.fullPath(), field.isExprEq);
+    }
+    std::sort(sortedFields.begin(), sortedFields.end());
+
+    const size_t numFields = sortedFields.size();
+    SortedFieldPaths sortedPaths;
+    sortedPaths.reserve(numFields);
+    for (const auto& [path, _] : sortedFields) {
+        sortedPaths.push_back(path);
+    }
+
+    const auto maybeSketchIndex = selectPersistedNDVSketchIndex(sortedFields, sortedPaths);
+    if (!maybeSketchIndex) {
+        return boost::none;
+    }
+    const size_t sketchIndex = *maybeSketchIndex;
+
+    if (const auto* cached = _persistedNDVCache.findEstimate(sortedPaths, sketchIndex)) {
+        return *cached;
+    }
+
+    // Load the statistics document once per path set; further variants of the same statistic
+    // are served from the cached summary.
+    const boost::optional<PersistedNDVEntry>& doc = _persistedNDVCache.getOrLoadDoc(
+        sortedPaths, [&] { return loadPersistedNDVStats(sortedPaths, numFields); });
+
+    const auto estimate = [&]() -> boost::optional<CardinalityEstimate> {
+        if (!doc) {
+            return boost::none;
+        }
+
+        // The selected variant must hold a non-negative NDV.
+        const auto ndv = doc->ndvPerSketch[sketchIndex];
+        if (ndv < 0) {
+            LOGV2_DEBUG(13176602,
+                        5,
+                        "Ignoring persisted NDV statistics with a negative NDV",
+                        logAttrs(_nss),
+                        "paths"_attr = sortedPaths,
+                        "ndv"_attr = ndv);
+            return boost::none;
+        }
+
+        // EstimationSource::Sampling keeps downstream ranking behavior identical to the
+        // sample-based estimate; explain surfaces the persisted origin via
+        // fieldStatsMetadata instead.
+        CardinalityEstimate persistedEstimate{CardinalityType{static_cast<double>(ndv)},
+                                              EstimationSource::Sampling};
+        // The statistics may predate writes; never serve more than the current collection
+        // cardinality (the sample-based path below clamps the same way).
+        if (cost_based_ranker::exactGt(persistedEstimate, _collectionCard)) {
+            persistedEstimate = _collectionCard;
+        }
+        // Surfaced in explain as queryPlanner.fieldStatsMetadata.<ns>.ndv, one entry per
+        // statistics document, however many of its variants were served.
+        const bool alreadyRecorded =
+            std::any_of(_persistedNDVStatsUsed.begin(),
+                        _persistedNDVStatsUsed.end(),
+                        [&](const auto& entry) { return entry.sortedFieldPaths == sortedPaths; });
+        if (!alreadyRecorded) {
+            _persistedNDVStatsUsed.push_back(*doc);
+        }
+        LOGV2_DEBUG(13176001,
+                    5,
+                    "Serving NDV from persisted statistics",
+                    logAttrs(_nss),
+                    "paths"_attr = sortedPaths,
+                    "estimate"_attr = persistedEstimate);
+        return persistedEstimate;
+    }();
+
+    (estimate ? persistentNDVHits : persistentNDVMisses).incrementRelaxed();
+    _persistedNDVCache.storeEstimate(sortedPaths, sketchIndex, estimate);
+    return estimate;
 }
 
 CardinalityEstimate SamplingEstimatorImpl::estimateNDV(
@@ -1150,6 +1394,12 @@ CardinalityEstimate SamplingEstimatorImpl::estimateNDV(
     boost::optional<std::span<const OrderedIntervalList>> bounds) const {
     tassert(11158504, "Sample must be generated before calling estimateNDV()", _isSampleGenerated);
 
+    if (auto persisted = tryEstimateNDVFromPersistentStats(fields, bounds)) {
+        return *persisted;
+    }
+
+    // Only the sample-based path below reads the field out of the sample, so this precondition is
+    // checked after the persisted statistics have had their chance to serve the estimate.
     if (!_topLevelSampleFieldNames.empty()) {
         for (const auto& field : fields) {
             tassert(11158505,
@@ -1278,8 +1528,7 @@ std::unique_ptr<SamplingEstimator> SamplingEstimatorImpl::makeDefaultSamplingEst
     const MultipleCollectionAccessor& collections,
     SamplingSourceEnum samplingSource) {
     const auto& qkc = cq.getExpCtx()->getQueryKnobConfiguration();
-    const size_t sampleSize = calculateSampleSize(
-        qkc.getConfidenceInterval(), qkc.getSamplingMarginOfError(), qkc.getSamplingSizeOverride());
+    const size_t sampleSize = calculateSampleSize(qkc);
     return std::unique_ptr<ce::SamplingEstimatorImpl>(
         new ce::SamplingEstimatorImpl(cq.getOpCtx(),
                                       collections,

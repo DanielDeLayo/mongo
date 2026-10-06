@@ -7,9 +7,11 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/global_catalog/ddl/sharded_ddl_commands_gen.h"
 #include "mongo/db/global_catalog/ddl/sharding_ddl_util.h"
+#include "mongo/db/global_catalog/metadata_consistency_validation/check_metadata_consistency_gen.h"
 #include "mongo/db/global_catalog/metadata_consistency_validation/metadata_consistency_types_gen.h"
 #include "mongo/db/global_catalog/metadata_consistency_validation/metadata_consistency_util.h"
 #include "mongo/db/namespace_string.h"
@@ -94,6 +96,7 @@ public:
                     primaryShardId,
                     checkRangeDeletionIndexes,
                     checkIndexes,
+                    request().getPerformStrictChunkChecksIfBelowThreshold(),
                     metadata_consistency_util::RSNodeMode::kPrimary);
 
             // Build a streaming executor that merges the secondaries' cursors (or null if there are
@@ -113,23 +116,21 @@ public:
     private:
         void _invokeCommandOnSecondaries(OperationContext* opCtx,
                                          const mongo::ShardId& primaryShardId) {
-            if (sharding_ddl_util::getGrantedAuthoritativeMetadataAccessLevel(
-                    VersionContext::getDecoration(opCtx),
-                    serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) ==
-                AuthoritativeMetadataAccessLevelEnum::kNone) {
-                return;
-            }
-            if (!TestingProctor::instance().isEnabled()) {
+            if (!TestingProctor::instance().isEnabled() || !getTestCommandsEnabled()) {
                 return;
             }
 
             const auto secondaryCheckMode = request().getCommonFields().get_checkSecondariesMode();
-            uassert(
-                ErrorCodes::BadValue,
-                "Called _shardsvrCheckMetadataConsistencyParticipant with empty secondaryCheckMode",
-                secondaryCheckMode);
+            // TODO (SERVER-98118): this should be a uassert or even a tassert.
+            if (!secondaryCheckMode) {
+                LOGV2_WARNING(
+                    13165400,
+                    "Called _shardsvrCheckMetadataConsistencyParticipant with empty "
+                    "secondaryCheckMode, skipping checkMetadataConsistency on secondary nodes");
+                return;
+            }
 
-            if (*secondaryCheckMode ==
+            if (secondaryCheckMode ==
                 CheckMetadataConsistencySecondaryModeEnum::kNoSecondaryCheck) {
                 return;
             }
@@ -145,11 +146,10 @@ public:
             command.setCursor(request().getCursor());
 
             // Secondaries may be lagged, so we need to make sure they see a consistent metadata
-            // view.
-            // With kCheckAtPrimaryTimestamp, we achieve this by sending a readConcern with
-            // afterClusterTime set at majority commit time.
-            // With kCheckAtSecondaryTimestamp, we don't set any readConcern. That signals the
-            // secondary to perform checkMetadataConsistency assuming it may be lagged.
+            // view. With kCheckAtPrimaryTimestamp, we achieve this by sending a readConcern with
+            // afterClusterTime set at majority commit time. With kCheckAtSecondaryTimestamp, we
+            // don't set any readConcern. That signals the secondary to perform
+            // checkMetadataConsistency assuming it may be lagged.
             if (*secondaryCheckMode ==
                 CheckMetadataConsistencySecondaryModeEnum::kCheckAtPrimaryTimestamp) {
                 const auto snapshotTimestamp = replCoord->getCurrentCommittedSnapshotOpTime();
@@ -161,8 +161,9 @@ public:
                 }
                 repl::ReadConcernArgs readConcern{
                     LogicalTime{snapshotTimestamp.getTimestamp()} /* afterClusterTime */,
-                    repl::ReadConcernLevel::kLocalReadConcern};
+                    repl::ReadConcernLevel::kMajorityReadConcern};
                 command.setReadConcern(std::move(readConcern));
+                command.setReadPreference(ReadPreferenceSetting{ReadPreference::SecondaryOnly});
             }
 
             _executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
@@ -239,10 +240,11 @@ public:
 
                 auto cursorWithStatus = CursorResponse::parseFromBSON(response->data);
 
-                if (cursorWithStatus.getStatus().code() == ErrorCodes::NotYetInitialized) {
-                    // The secondary has not completed replica set initialization yet.
+                if (cursorWithStatus.getStatus().code() == ErrorCodes::NotYetInitialized ||
+                    cursorWithStatus.getStatus().code() ==
+                        ErrorCodes::ShardingStateNotInitialized) {
                     LOGV2_WARNING(12922003,
-                                  "Secondary node hasn't completed replica set initialization",
+                                  "Secondary node hasn't completed initialization",
                                   "hostAndPort"_attr = hostAndPort,
                                   "error"_attr = cursorWithStatus.getStatus());
                     continue;
@@ -263,6 +265,38 @@ public:
                                   "Secondary node was interrupted",
                                   "hostAndPort"_attr = hostAndPort,
                                   "error"_attr = cursorWithStatus.getStatus());
+                    continue;
+                }
+
+                // TODO SERVER-98118 Remove this. Secondary replicas may be running a version that
+                // does not support the _shardsvrCheckMetadataConsistencySecondaryParticipant
+                // command yet.
+                if (cursorWithStatus.getStatus().code() == ErrorCodes::CommandNotFound) {
+                    LOGV2_DEBUG(13310700,
+                                2,
+                                "Secondary does not support the "
+                                "_shardsvrCheckMetadataConsistencySecondaryParticipant command",
+                                "hostAndPort"_attr = hostAndPort,
+                                "error"_attr = cursorWithStatus.getStatus());
+                    continue;
+                }
+
+                // In multiversion (or just when upgrading a patch version) the secondary could
+                // answer with InvalidOptions because it doesn't expect the readConcern option. Just
+                // tolerate it.
+                // TODO (SERVER-135565): this check is only needed when interacting with server
+                // binaries that do not support readConcern. After 10.0 has branched out, this
+                // situation is no longer possible.
+                if (cursorWithStatus.getStatus().code() == ErrorCodes::InvalidOptions &&
+                    cursorWithStatus.getStatus().toString().find(
+                        "Command _shardsvrCheckMetadataConsistencySecondaryParticipant does not "
+                        "support") != std::string::npos) {
+                    LOGV2_DEBUG(13556300,
+                                2,
+                                "Secondary does not accept readConcern in the "
+                                "_shardsvrCheckMetadataConsistencySecondaryParticipant command",
+                                "hostAndPort"_attr = hostAndPort,
+                                "error"_attr = cursorWithStatus.getStatus());
                     continue;
                 }
 

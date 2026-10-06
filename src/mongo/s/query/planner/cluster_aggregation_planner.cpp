@@ -161,20 +161,34 @@ AsyncRequestsSender::Response establishMergingShardCursor(OperationContext* opCt
 }
 
 /**
- * Contacts the primary shard for the collection default collation.
- *
- * TODO SERVER-79159: This function can be deleted once all unsharded collections are tracked in the
- * sharding catalog (at this point, it wont't be necessary to contact the primary shard for
- * collation information).
+ * Information about an untracked collection that can only be learned by contacting its primary
+ * shard (see getUntrackedCollectionInfo below).
  */
-BSONObj getUntrackedCollectionCollation(OperationContext* opCtx, const NamespaceString& nss) {
+struct UntrackedCollectionInfo {
+    BSONObj collation;
+    bool untrackedIsViewlessTimeseries = false;
+};
+
+/**
+ * Contacts 'nss's primary shard for information that the router cannot otherwise learn about an
+ * untracked collection: its default collation, and whether it is a viewless timeseries
+ * collection. Callers should only invoke this for untracked collections (i.e. when
+ * '!cri->hasRoutingTable()'), and only when that information is actually needed, since it
+ * requires a network round trip.
+ *
+ * TODO SERVER-79159: This function can be deleted once all unsharded collections are tracked in
+ * the sharding catalog (at this point, it won't be necessary to contact the primary shard for
+ * this information).
+ */
+UntrackedCollectionInfo getUntrackedCollectionInfo(OperationContext* opCtx,
+                                                   const NamespaceString& nss) {
     ListCollections listCollectionsCmd;
     listCollectionsCmd.setDbName(nss.dbName());
     listCollectionsCmd.setFilter(BSON("name" << nss.coll()));
 
     sharding::router::DBPrimaryRouter router(opCtx, nss.dbName());
     const auto collectionsList = router.route(
-        "getUntrackedCollectionCollation"sv,
+        "getUntrackedCollectionInfo"sv,
         [&](OperationContext* opCtx, const CachedDatabaseInfo& cdb) {
             generic_argument_util::setDbVersionIfPresent(listCollectionsCmd, cdb->getVersion());
 
@@ -189,30 +203,50 @@ BSONObj getUntrackedCollectionCollation(OperationContext* opCtx, const Namespace
             return cursorResult.docs;
         });
 
-    // Collection or collection info does not exist; return an empty collation object.
+    // Collection or collection info does not exist; return the defaults (empty collation, not a
+    // viewless timeseries collection).
     if (collectionsList.empty() || collectionsList.front().isEmpty()) {
-        return BSONObj();
+        return {};
     }
 
     auto collectionInfo = collectionsList.front();
 
-    // We inspect 'info' to infer the collection default collation.
-    BSONObj collationToReturn = CollationSpec::kSimpleSpec;
+    UntrackedCollectionInfo info;
+
+    // listCollections reports both viewless and legacy viewful timeseries collections with type
+    // "timeseries". Treating either as viewless conservatively defers optimization to the shard.
+    // TODO SERVER-111172: Remove the legacy viewful-timeseries qualification once 9.0 is last LTS.
+    info.untrackedIsViewlessTimeseries = collectionInfo["type"].type() == BSONType::string &&
+        collectionInfo["type"].valueStringData() == "timeseries";
+
+    // We inspect 'options' to infer the collection default collation.
+    info.collation = CollationSpec::kSimpleSpec;
     if (collectionInfo["options"].type() == BSONType::object) {
         BSONObj collectionOptions = collectionInfo["options"].Obj();
         BSONElement collationElement;
         auto status = bsonExtractTypedField(
             collectionOptions, "collation", BSONType::object, &collationElement);
         if (status.isOK()) {
-            collationToReturn = collationElement.Obj().getOwned();
+            info.collation = collationElement.Obj().getOwned();
             uassert(ErrorCodes::BadValue,
                     "Default collation in collection metadata cannot be empty.",
-                    !collationToReturn.isEmpty());
+                    !info.collation.isEmpty());
         } else if (status != ErrorCodes::NoSuchKey) {
             uassertStatusOK(status);
         }
     }
-    return collationToReturn;
+    return info;
+}
+
+/**
+ * Contacts the primary shard for the collection default collation.
+ *
+ * TODO SERVER-79159: This function can be deleted once all unsharded collections are tracked in the
+ * sharding catalog (at this point, it won't be necessary to contact the primary shard for
+ * collation information).
+ */
+BSONObj getUntrackedCollectionCollation(OperationContext* opCtx, const NamespaceString& nss) {
+    return getUntrackedCollectionInfo(opCtx, nss).collation;
 }
 
 ShardId pickMergingShard(OperationContext* opCtx,
@@ -615,7 +649,7 @@ BSONObj establishMergingMongosCursor(OperationContext* opCtx,
         tassert(12552800,
                 "expected a post batch resume token for change stream query on the sharded cluster",
                 !pbrt.isEmpty());
-        opDebug.changeStreamMetrics.setOptime(ResumeToken::parse(pbrt).getClusterTime());
+        opDebug.changeStreamMetrics.setOptime(ResumeToken::extractClusterTime(pbrt));
     }
 
     if (exhausted) {
@@ -625,9 +659,13 @@ BSONObj establishMergingMongosCursor(OperationContext* opCtx,
         collectQueryStatsMongos(opCtx, ccc);
     }
 
-    ccc->detachFromOperationContext();
     CursorId clusterCursorId = 0;
     if (!exhausted) {
+        // Detach only when registering the cursor, so a later getMore can reattach a fresh opCtx.
+        // An exhausted cursor is instead disposed from its destructor, which needs a valid opCtx to
+        // kill the remotes. Detaching first would dispose with a null opCtx (backstopped by
+        // MergeCursorsStage::doDispose).
+        ccc->detachFromOperationContext();
         auto authUser = AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserName();
         clusterCursorId = uassertStatusOK(Grid::get(opCtx)->getCursorManager()->registerCursor(
             opCtx,
@@ -999,12 +1037,11 @@ Status dispatchPipelineAndMerge(OperationContext* opCtx,
                                    remoteMetricsToInclude);
 }
 
-std::pair<BSONObj, ExpressionContextCollationMatchesDefault> getCollation(
-    OperationContext* opCtx,
-    const boost::optional<CollectionRoutingInfo>& cri,
-    const NamespaceString& nss,
-    const BSONObj& collation,
-    bool requiresCollationForParsingUnshardedAggregate) {
+ResolvedCollectionInfo resolveCollectionInfo(OperationContext* opCtx,
+                                             const boost::optional<CollectionRoutingInfo>& cri,
+                                             const NamespaceString& nss,
+                                             const BSONObj& collation,
+                                             bool requiresCollationForParsingUnshardedAggregate) {
 
     // If this is a collectionless aggregation, we immediately return the user-defined collation if
     // one exists, or an empty BSONObj otherwise.
@@ -1016,12 +1053,23 @@ std::pair<BSONObj, ExpressionContextCollationMatchesDefault> getCollation(
     // information if it is necessary for pipeline parsing. Otherwise, we infer the collation once
     // the command is executed on the primary shard.
     if (!cri->hasRoutingTable()) {
+        if (requiresCollationForParsingUnshardedAggregate) {
+            // Pipeline parsing depends on the collection collation, so we must contact the primary
+            // shard to resolve it. This also lets us learn whether the collection is viewless
+            // timeseries, which determines whether the mandatory timeseries rewrite, and therefore
+            // optimization, must be deferred to the shard.
+            auto info = getUntrackedCollectionInfo(opCtx, nss);
+            if (!collation.isEmpty()) {
+                return {collation,
+                        ExpressionContextCollationMatchesDefault::kNo,
+                        info.untrackedIsViewlessTimeseries};
+            }
+            return {info.collation,
+                    ExpressionContextCollationMatchesDefault::kYes,
+                    info.untrackedIsViewlessTimeseries};
+        }
         if (!collation.isEmpty()) {
             return {collation, ExpressionContextCollationMatchesDefault::kNo};
-        }
-        if (requiresCollationForParsingUnshardedAggregate) {
-            return {getUntrackedCollectionCollation(opCtx, nss),
-                    ExpressionContextCollationMatchesDefault::kYes};
         }
         return {BSONObj(), ExpressionContextCollationMatchesDefault::kYes};
     }
@@ -1124,7 +1172,7 @@ Status runPipelineOnSpecificShardOnly(const boost::intrusive_ptr<ExpressionConte
                     "expected a postBatchResumeToken in the shard response for a change stream "
                     "$_passthroughToShard cursor",
                     !pbrt.isEmpty());
-            opDebug.changeStreamMetrics.setOptime(ResumeToken::parse(pbrt).getClusterTime());
+            opDebug.changeStreamMetrics.setOptime(ResumeToken::extractClusterTime(pbrt));
         }
         result = uassertStatusOK(storePossibleCursor(
             opCtx,

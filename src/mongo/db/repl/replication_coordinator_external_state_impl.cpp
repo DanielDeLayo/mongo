@@ -3,11 +3,6 @@
 
 #include "mongo/db/repl/replication_coordinator_external_state_impl.h"
 
-#include <boost/move/utility_core.hpp>
-#include <boost/none.hpp>
-#include <boost/optional/optional.hpp>
-#include <fmt/format.h>
-// IWYU pragma: no_include "cxxabi.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonelement.h"
@@ -32,7 +27,6 @@
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer/op_observer.h"
-#include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/query_settings/query_settings_service.h"
 #include "mongo/db/read_write_concern_defaults_gen.h"
 #include "mongo/db/repl/always_allow_non_local_writes.h"
@@ -90,7 +84,6 @@
 #include "mongo/db/topology/user_write_block/user_write_block_bypass.h"
 #include "mongo/db/topology/vector_clock/vector_clock.h"
 #include "mongo/db/topology/vector_clock/vector_clock_metadata_hook.h"
-#include "mongo/db/version_context.h"
 #include "mongo/db/versioning_protocol/shard_version.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -117,6 +110,12 @@
 #include <string>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+// IWYU pragma: no_include "cxxabi.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 namespace mongo {
@@ -125,6 +124,7 @@ namespace {
 
 MONGO_FAIL_POINT_DEFINE(skipDurableTimestampUpdates);
 MONGO_FAIL_POINT_DEFINE(hangAfterJournalFlusherGetToken);
+MONGO_FAIL_POINT_DEFINE(hangAfterAcquiringLastVoteCollection);
 
 // The maximum size of the oplog write buffer is set to 256MB.
 constexpr std::size_t kOplogWriteBufferSize = 256 * 1024 * 1024;
@@ -705,10 +705,7 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
     auto role = ShardingState::get(opCtx)->pollClusterRole();
     const bool isConfigsvr = role && role->has(ClusterRole::ConfigServer);
     const bool isReplSet = !role.has_value();
-    if (::mongo::feature_flags::gFeatureFlagPQSBackfill.isEnabled(
-            VersionContext::getDecoration(opCtx),
-            serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
-        (isConfigsvr || isReplSet)) {
+    if (isConfigsvr || isReplSet) {
         query_settings::QuerySettingsService::get(opCtx)
             .createQueryShapeRepresentativeQueriesCollection(opCtx);
     }
@@ -873,22 +870,7 @@ Status ReplicationCoordinatorExternalStateImpl::storeLocalLastVoteDocument(
                   AdmissionContext::Priority::kExempt,
               "Writes that are part of elections should not be throttled");
 
-    try {
-        // If we are casting a vote in a new election immediately after stepping down, we
-        // don't want to have this process interrupted due to us stepping down, since we
-        // want to be able to cast our vote for a new primary right away. Both the write's lock
-        // acquisition and the "waitUntilDurable" lock acquisition must be uninterruptible.
-        //
-        // It is not safe to take an uninterruptible lock during STARTUP2, so we only take this lock
-        // if we are primary or secondary.  We do not have the RSTL but that is OK because we never
-        // move in to STARTUP2 from PRIMARY or SECONDARY, so the consequence of a stale state is
-        // only that we don't take an uninterruptible lock when we should.
-        auto* replCoord = ReplicationCoordinator::get(opCtx);
-
-        boost::optional<UninterruptibleLockGuard> noInterrupt;
-        if (replCoord->isInPrimaryOrSecondaryState_UNSAFE())
-            noInterrupt.emplace(opCtx);
-
+    auto storeLastVote = [&]() -> Status {
         Status status = writeConflictRetry(
             opCtx, "save replica set lastVote", NamespaceString::kLastVoteNamespace, [&] {
                 auto coll =
@@ -899,6 +881,13 @@ Status ReplicationCoordinatorExternalStateImpl::storeLocalLastVoteDocument(
                                           repl::ReadConcernArgs::get(opCtx),
                                           AcquisitionPrerequisites::kWrite),
                                       MODE_IX);
+
+                if (MONGO_unlikely(hangAfterAcquiringLastVoteCollection.shouldFail())) {
+                    LOGV2(12885000,
+                          "Hanging due to hangAfterAcquiringLastVoteCollection failpoint");
+                    hangAfterAcquiringLastVoteCollection.pauseWhileSet(opCtx);
+                }
+
                 WriteUnitOfWork wunit(opCtx);
 
                 // We only want to replace the last vote document if the new last vote document
@@ -928,6 +917,30 @@ Status ReplicationCoordinatorExternalStateImpl::storeLocalLastVoteDocument(
         JournalFlusher::get(opCtx)->waitForJournalFlush();
 
         return Status::OK();
+    };
+
+    try {
+        // If we are casting a vote in a new election immediately after stepping down, we
+        // don't want to have this process interrupted due to us stepping down, since we
+        // want to be able to cast our vote for a new primary right away. Beyond making the lock
+        // acquisitions uninterruptible, we must also ignore the kill flag since the stepdown
+        // kill-ops sweep can mark this operation killed.
+        //
+        // It is not safe to do either during STARTUP2, so we only do so if we are primary or
+        // secondary. We never move in to STARTUP2 from PRIMARY or SECONDARY, so the consequence of
+        // a stale state is only that we don't protect the write when we should.
+        //
+        // TODO(SERVER-91733): Both the UninterruptibleLockGuard and the
+        // runWithoutInterruptionExceptAtGlobalShutdown below can be removed once intent based
+        // kill-ops is used exclusively.
+        auto* replCoord = ReplicationCoordinator::get(opCtx);
+
+        boost::optional<UninterruptibleLockGuard> noInterrupt;
+        if (replCoord->isInPrimaryOrSecondaryState_UNSAFE()) {
+            noInterrupt.emplace(opCtx);
+            return opCtx->runWithoutInterruptionExceptAtGlobalShutdown(storeLastVote);
+        }
+        return storeLastVote();
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
@@ -1188,21 +1201,16 @@ std::size_t ReplicationCoordinatorExternalStateImpl::getOplogFetcherInitialSyncM
 }
 
 std::unique_ptr<JournalListener::Token> ReplicationCoordinatorExternalStateImpl::getToken(
-    OperationContext* opCtx, TokenMode mode) {
-    // If in state PRIMARY, the oplogTruncateAfterPoint must be used for the Durable timestamp to
-    // avoid majority-confirming writes that could later be truncated. That write requires Global
-    // IX, so it is skipped when the caller holds an incompatible lock mode (see
-    // TokenMode::kReadLockHeld).
-    if (mode == TokenMode::kDefault) {
-        if (auto truncatePoint = repl::ReplicationProcess::get(opCtx)
-                                     ->getConsistencyMarkers()
-                                     ->refreshOplogTruncateAfterPointIfPrimary(opCtx)) {
-            return std::make_unique<ReplDurabilityToken>(*truncatePoint, true /*isPrimary*/);
-        }
+    OperationContext* opCtx) {
+    // If in state PRIMARY, the oplogTruncateAfterPoint must be used for the Durable timestamp
+    // in order to avoid majority confirming any writes that could later be truncated.
+    if (auto truncatePoint = repl::ReplicationProcess::get(opCtx)
+                                 ->getConsistencyMarkers()
+                                 ->refreshOplogTruncateAfterPointIfPrimary(opCtx)) {
+        return std::make_unique<ReplDurabilityToken>(*truncatePoint, true /*isPrimary*/);
     }
 
-    // All other repl states (and primaries called under TokenMode::kReadLockHeld) use the
-    // 'lastWritten'.
+    // All other repl states use the 'lastWritten'.
     //
     // Setting 'rollbackSafe' will ensure that a safe lastWritten value is returned if we're rolling
     // back, which may happen in ROLLBACK or REMOVED states. 'lastWritten' may be momentarily set to

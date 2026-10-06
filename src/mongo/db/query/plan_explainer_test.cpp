@@ -1,12 +1,16 @@
 // Copyright (c) MongoDB, Inc.
 // SPDX-License-Identifier: SSPL-1.0
 
+#include "mongo/bson/bson_depth.h"
+#include "mongo/bson/bson_validate.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/pipeline_d.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/compiler/ce/sampling/sampling_test_utils.h"
+#include "mongo/db/query/compiler/parsers/matcher/expression_parser.h"
 #include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/explain_common.h"
@@ -16,15 +20,22 @@
 #include "mongo/db/query/multiple_collection_accessor.h"
 #include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/query/plan_explainer_sbe.h"
+#include "mongo/db/query/plan_ranking/plan_selection_strategy.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/query/query_settings/query_knob_overrides.h"
 #include "mongo/db/query/query_settings/query_settings_context_test_util.h"
 #include "mongo/db/query/query_settings/query_settings_gen.h"
+#include "mongo/db/query/record_id_bound.h"
+#include "mongo/db/query/record_id_range.h"
+#include "mongo/db/query/record_id_range_list.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
 #include "mongo/db/shard_role/shard_catalog/collection_options.h"
 #include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
 #include "mongo/unittest/server_parameter_guard.h"
 #include "mongo/unittest/unittest.h"
+
+#include <functional>
 
 namespace mongo {
 namespace {
@@ -288,9 +299,10 @@ TEST_F(PlanExplainerTest, GetPlanEntriesSingleSolution) {
 
     ASSERT(!explainer.areThereRejectedPlansToExplain());
     auto entries =
-        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kQueryPlanner));
+        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kQueryPlanner),
+                                 PlanStatsFormat::kLegacy,
+                                 PlanSelectionStrategy::kSinglePlan);
     ASSERT_EQ(entries.size(), 1u);
-    ASSERT(entries[0].isWinner);
     ASSERT_STRING_CONTAINS(entries[0].planStatsTree.toString(), "COLLSCAN");
     // No execution stats are requested at queryPlanner verbosity.
     ASSERT_FALSE(entries[0].summary.has_value());
@@ -303,21 +315,13 @@ TEST_F(PlanExplainerTest, GetPlanEntriesMultiPlanner) {
 
     ASSERT(explainer.areThereRejectedPlansToExplain());
     auto entries =
-        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kQueryPlanner));
+        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kQueryPlanner),
+                                 PlanStatsFormat::kLegacy,
+                                 PlanSelectionStrategy::kSinglePlan);
     ASSERT_GTE(entries.size(), 2u);
 
-    // Exactly one winner, and it is the first entry.
-    ASSERT(entries[0].isWinner);
-    size_t numWinners = 0;
-    for (const auto& entry : entries) {
-        if (entry.isWinner) {
-            ++numWinners;
-        }
-    }
-    ASSERT_EQ(numWinners, 1u);
-
-    // The winning entry is byte-identical to the dedicated winning-plan accessor, proving both read
-    // the same per-plan formatting core.
+    // The winner is the first entry (its position is the contract) and is byte-identical to the
+    // dedicated winning-plan accessor, proving both read the same per-plan formatting core.
     auto&& [winningPlan, _] =
         explainer.getWinningPlanStats(ExplainOptions::Verbosity::kQueryPlanner);
     ASSERT_BSONOBJ_EQ(entries[0].planStatsTree, winningPlan);
@@ -330,13 +334,573 @@ TEST_F(PlanExplainerTest, GetPlanEntriesMultiPlannerExecStats) {
     auto& explainer = exec->getPlanExplainer();
 
     auto entries =
-        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kExecAllPlans));
+        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kExecAllPlans),
+                                 PlanStatsFormat::kLegacy,
+                                 PlanSelectionStrategy::kSinglePlan);
     ASSERT_GTE(entries.size(), 2u);
     for (const auto& entry : entries) {
         ASSERT(entry.summary.has_value());
     }
     // A rejected entry carries its trial-period score.
     ASSERT(entries[1].summary->score.has_value());
+}
+
+// Walks a V3-format plan stats tree, invoking 'callback' on every node (root to leaves). The V3
+// node shape always nests children as the 'inputStages' array.
+void forEachV3Node(const BSONObj& node, const std::function<void(const BSONObj&)>& callback) {
+    callback(node);
+    if (auto inputStages = node["inputStages"]; !inputStages.eoo()) {
+        for (auto&& child : inputStages.Array()) {
+            forEachV3Node(child.Obj(), callback);
+        }
+    }
+}
+
+TEST_F(PlanExplainerTest, GetPlanEntriesV3MultiPlannerNodeGrouping) {
+    // The V3 node shape for a multi-planned query (default knobs; the trial produces results, so
+    // the multi-planner decides): structural fields stay flat on the node, the trial counters are
+    // regrouped under statistics.multiPlan.
+    auto exec = buildFindExecAndIter(fromjson("{a: {$gte: 0}, b: {$gte: 0}}"));
+    auto& explainer = exec->getPlanExplainer();
+
+    const auto policy = explainPolicyFor(ExplainOptions::Verbosity::kPlannerStats);
+    auto entries = explainer.getPlanEntries(
+        policy, PlanStatsFormat::kV3, PlanSelectionStrategy::kMultiPlanner);
+    ASSERT_GTE(entries.size(), 2u);
+
+    for (const auto& entry : entries) {
+        // Every candidate ran a multi-planning trial, and the V3 plannerStats policy requests
+        // per-candidate statistics, so the plan-level summary exists despite hasExecStats() being
+        // false.
+        ASSERT(entry.hasTrialStats) << entry.planStatsTree;
+        ASSERT(entry.summary.has_value()) << entry.planStatsTree;
+
+        forEachV3Node(entry.planStatsTree, [&](const BSONObj& node) {
+            // Counters moved into statistics.multiPlan; never flat on the node.
+            ASSERT_FALSE(node.hasField("works")) << node;
+            ASSERT_FALSE(node.hasField("nReturned")) << node;
+            auto multiPlan = node["statistics"]["multiPlan"];
+            ASSERT(multiPlan.isABSONObj()) << node;
+            ASSERT(multiPlan.Obj().hasField("works")) << node;
+            ASSERT(multiPlan.Obj().hasField("nReturned")) << node;
+            ASSERT(multiPlan.Obj().hasField("isEOF")) << node;
+            // Structural fields stay flat on the node.
+            if (node["stage"].String() == "IXSCAN") {
+                ASSERT(node.hasField("keyPattern")) << node;
+                ASSERT(node.hasField("indexBounds")) << node;
+                ASSERT(multiPlan.Obj().hasField("keysExamined")) << node;
+                ASSERT_FALSE(node.hasField("keysExamined")) << node;
+            }
+            // planNodeId appears only on nodes with a known QSN mapping; the pure-multiplanning
+            // decision path does not populate the mapping, so it is legitimately absent here.
+        });
+    }
+
+    // The plans after the winner are ordered by trial score, descending (the multi-planner
+    // decided).
+    for (size_t i = 2; i < entries.size(); ++i) {
+        if (entries[i - 1].summary->score && entries[i].summary->score) {
+            ASSERT_GTE(*entries[i - 1].summary->score, *entries[i].summary->score);
+        }
+    }
+}
+
+TEST_F(PlanExplainerTest, GetPlanEntriesV3StopConditionFullBatch) {
+    // A multi-planned query whose candidates each return far more than the trial's result target
+    // and never reach EOF within it: every plan that ran a trial reports a stop condition, and the
+    // plans that ended the trial did so by filling a batch.
+    auto exec = buildFindExecAndIter(fromjson("{a: {$gte: 0}, b: {$gte: 0}}"));
+    auto& explainer = exec->getPlanExplainer();
+
+    auto entries =
+        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kPlannerStats),
+                                 PlanStatsFormat::kV3,
+                                 PlanSelectionStrategy::kMultiPlanner);
+    ASSERT_GTE(entries.size(), 2u);
+
+    bool sawFullBatch = false;
+    for (const auto& entry : entries) {
+        // The stop condition is reported for exactly the plans that ran a trial.
+        ASSERT_EQ(entry.hasTrialStats, entry.stopCondition.has_value()) << entry.planStatsTree;
+        // Each candidate either filled the batch itself or was stopped when a sibling did. No
+        // candidate can reach EOF here (each index scan covers all 200 documents, more than the
+        // trial's result target), and none can run out of budget, since filling a batch ends the
+        // trial long before the budget is spent.
+        ASSERT(entry.stopCondition == MultiPlannerStopCondition::kFullBatch ||
+               entry.stopCondition == MultiPlannerStopCondition::kTrialEndedEarly)
+            << entry.planStatsTree;
+        sawFullBatch |= entry.stopCondition == MultiPlannerStopCondition::kFullBatch;
+    }
+    ASSERT(sawFullBatch) << "expected a plan to have filled the trial's result batch";
+}
+
+TEST_F(PlanExplainerTest, GetPlanEntriesV3StopConditionTrialEndedEarly) {
+    // A candidate that met no early-exit condition of its own reports why it stopped anyway, and
+    // that reason distinguishes the two ways it can happen. Here the winner reaches EOF, which ends
+    // the trial period for everyone: the remaining candidates were cut short with budget to spare
+    // ('kTrialEndedEarly'), which is a different fact from having spent the budget
+    // ('kExhaustedBudget', asserted below) even though neither exited early. Their trial counters
+    // are tiny - a handful of works out of thousands - which is exactly why the two must not be
+    // conflated.
+    auto exec = buildFindExecAndIter(fromjson("{a: {$eq: 5}, b: {$eq: 5}}"));
+    auto& explainer = exec->getPlanExplainer();
+
+    auto entries =
+        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kPlannerStats),
+                                 PlanStatsFormat::kV3,
+                                 PlanSelectionStrategy::kMultiPlanner);
+    ASSERT_GTE(entries.size(), 2u);
+    ASSERT_EQ(entries[0].stopCondition, MultiPlannerStopCondition::kEof)
+        << entries[0].planStatsTree;
+    for (size_t i = 1; i < entries.size(); ++i) {
+        ASSERT_EQ(entries[i].stopCondition, MultiPlannerStopCondition::kTrialEndedEarly)
+            << entries[i].planStatsTree;
+        // The budget is nowhere near spent: the trial stopped as soon as the winner hit EOF, after
+        // a few works out of a per-plan budget of at least 'internalQueryPlanEvaluationWorks'
+        // (10000 by default).
+        ASSERT_LT(entries[i].summary->totalKeysExamined, 1000u) << entries[i].planStatsTree;
+    }
+}
+
+TEST_F(PlanExplainerTest, GetPlanEntriesV3StopConditionEof) {
+    // The winning plan of a multi-planned query whose candidates exhaust their results well before
+    // a batch is filled.
+    auto exec = buildFindExecAndIter(fromjson("{a: {$eq: 5}, b: {$eq: 5}}"));
+    auto& explainer = exec->getPlanExplainer();
+
+    auto entries =
+        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kPlannerStats),
+                                 PlanStatsFormat::kV3,
+                                 PlanSelectionStrategy::kMultiPlanner);
+    ASSERT_GTE(entries.size(), 2u);
+    ASSERT_EQ(entries[0].stopCondition, MultiPlannerStopCondition::kEof)
+        << entries[0].planStatsTree;
+}
+
+TEST_F(PlanExplainerTest, GetPlanEntriesV3StopConditionExhaustedBudget) {
+    // With the trial's work budget squeezed to a single work per plan, no candidate can meet an
+    // early-exit condition, so every candidate ran out of budget.
+    unittest::ServerParameterGuard worksGuard("internalQueryPlanEvaluationWorks", 1);
+    unittest::ServerParameterGuard collFractionGuard("internalQueryPlanEvaluationCollFraction",
+                                                     0.0);
+    unittest::ServerParameterGuard totalCollFractionGuard(
+        "internalQueryPlanTotalEvaluationCollFraction", 0.0);
+
+    auto exec = buildFindExecAndIter(fromjson("{a: {$gte: 0}, b: {$gte: 0}}"));
+    auto& explainer = exec->getPlanExplainer();
+
+    auto entries =
+        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kPlannerStats),
+                                 PlanStatsFormat::kV3,
+                                 PlanSelectionStrategy::kMultiPlanner);
+    ASSERT_GTE(entries.size(), 2u);
+    for (const auto& entry : entries) {
+        ASSERT_EQ(entry.stopCondition, MultiPlannerStopCondition::kExhaustedBudget)
+            << entry.planStatsTree;
+    }
+}
+
+TEST_F(PlanExplainerTest, GetPlanEntriesV3PlannerChoiceIsStructureOnly) {
+    // plannerChoice renders the same V3 plans[] shape as the stats-rich modes - one entry per
+    // candidate, winner first - but excludes both ranking-statistics families and execution
+    // statistics. The query multi-plans, so trial statistics exist and are deliberately withheld:
+    // no node carries a "statistics" subobject and no entry carries a plan-level summary.
+    auto exec = buildFindExecAndIter(fromjson("{a: {$gte: 0}, b: {$gte: 0}}"));
+    auto& explainer = exec->getPlanExplainer();
+
+    const auto policy = explainPolicyFor(ExplainOptions::Verbosity::kPlannerChoice);
+    auto entries = explainer.getPlanEntries(
+        policy, PlanStatsFormat::kV3, PlanSelectionStrategy::kMultiPlanner);
+    ASSERT_GTE(entries.size(), 2u);
+
+    for (const auto& entry : entries) {
+        // The plans did run a trial - that is what 'hasTrialStats' records - but this verbosity
+        // reports none of it: no plan-level summary, hence no "multiPlanStats" and no
+        // "stopCondition" in the assembled output.
+        ASSERT(entry.hasTrialStats) << entry.planStatsTree;
+        ASSERT_FALSE(entry.summary.has_value()) << entry.planStatsTree;
+
+        forEachV3Node(entry.planStatsTree, [&](const BSONObj& node) {
+            ASSERT(node.hasField("stage")) << node;
+            ASSERT_FALSE(node.hasField("statistics")) << node;
+            // Counters never leak out of the statistics grouping either.
+            ASSERT_FALSE(node.hasField("works")) << node;
+            ASSERT_FALSE(node.hasField("nReturned")) << node;
+        });
+    }
+
+    // Structure is still fully described: the same trees the stats-rich modes show, minus the
+    // statistics. Comparing stage sequences pins that plannerChoice is a projection of plannerStats
+    // rather than a differently shaped output.
+    auto statsEntries =
+        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kPlannerStats),
+                                 PlanStatsFormat::kV3,
+                                 PlanSelectionStrategy::kMultiPlanner);
+    ASSERT_EQ(entries.size(), statsEntries.size());
+    for (size_t i = 0; i < entries.size(); ++i) {
+        std::vector<std::string> plannerChoiceStages;
+        std::vector<std::string> plannerStatsStages;
+        forEachV3Node(entries[i].planStatsTree, [&](const BSONObj& node) {
+            plannerChoiceStages.push_back(node["stage"].String());
+        });
+        forEachV3Node(statsEntries[i].planStatsTree, [&](const BSONObj& node) {
+            plannerStatsStages.push_back(node["stage"].String());
+        });
+        ASSERT_EQ(plannerChoiceStages, plannerStatsStages)
+            << entries[i].planStatsTree << statsEntries[i].planStatsTree;
+    }
+}
+
+TEST_F(PlanExplainerTest, GetPlanEntriesV3SingleSolutionSparseStatistics) {
+    // Sparseness: a single-solution plan never ran a trial and was never costed, so no node has a
+    // "statistics" subobject at all (absent, not empty), and there are no plan-level trial stats.
+    auto exec = buildFindExecAndIter(fromjson("{c: {$eq: 1}}"));
+    auto& explainer = exec->getPlanExplainer();
+
+    auto entries =
+        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kPlannerStats),
+                                 PlanStatsFormat::kV3,
+                                 PlanSelectionStrategy::kSinglePlan);
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_FALSE(entries[0].hasTrialStats);
+
+    forEachV3Node(entries[0].planStatsTree, [&](const BSONObj& node) {
+        ASSERT_FALSE(node.hasField("statistics")) << node;
+        ASSERT(node.hasField("stage")) << node;
+    });
+}
+
+TEST_F(PlanExplainerTest, GetPlanEntriesV3SBESingleSolution) {
+    unittest::ServerParameterGuard sbeFullController("featureFlagSbeFull", true);
+    auto exec = buildFindExecAndIter(fromjson("{c: {$eq: 1}}"));
+    auto& explainer = exec->getPlanExplainer();
+    ASSERT(explainer.isSbeExplainer());
+
+    auto entries =
+        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kPlannerStats),
+                                 PlanStatsFormat::kV3,
+                                 PlanSelectionStrategy::kSinglePlan);
+    ASSERT_EQ(entries.size(), 1u);
+    ASSERT_FALSE(entries[0].hasTrialStats);
+    ASSERT_FALSE(entries[0].summary.has_value());
+    ASSERT(entries[0].solutionHash.has_value());
+    ASSERT(entries[0].slotBasedPlan.has_value());
+    ASSERT(entries[0].slotBasedPlan->hasField("stages")) << *entries[0].slotBasedPlan;
+
+    bool sawCollscan = false;
+    forEachV3Node(entries[0].planStatsTree, [&](const BSONObj& node) {
+        ASSERT(node.hasField("stage")) << node;
+        ASSERT(node.hasField("planNodeId")) << node;
+        ASSERT_FALSE(node.hasField("statistics")) << node;
+        // The V3 node shape never nests a single child as "inputStage".
+        ASSERT_FALSE(node.hasField("inputStage")) << node;
+        sawCollscan = sawCollscan || node["stage"].String() == "COLLSCAN";
+    });
+    ASSERT(sawCollscan) << entries[0].planStatsTree;
+}
+
+TEST_F(PlanExplainerTest, GetPlanEntriesV3SBEMultiPlanner) {
+    // A multi-planned SBE query. The candidates were ranked by the classic runtime planner, so the
+    // entries are that planner's trial trees with the winner first and the compiled SBE tree
+    // attached to it.
+    unittest::ServerParameterGuard sbeFullController("featureFlagSbeFull", true);
+    expCtx->setExplain(ExplainOptions::Verbosity::kPlannerStats);
+    auto exec = buildFindExecAndIter(fromjson("{a: {$gte: 0}, b: {$gte: 0}}"));
+    auto& explainer = exec->getPlanExplainer();
+    ASSERT(explainer.isSbeExplainer());
+
+    auto entries =
+        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kPlannerStats),
+                                 PlanStatsFormat::kV3,
+                                 PlanSelectionStrategy::kMultiPlanner);
+    ASSERT_GTE(entries.size(), 2u);
+
+    // Only the winning plan was compiled to SBE, so only its entry describes an SBE tree.
+    ASSERT(entries[0].slotBasedPlan.has_value());
+    ASSERT(entries[0].solutionHash.has_value());
+    for (size_t i = 1; i < entries.size(); ++i) {
+        ASSERT_FALSE(entries[i].slotBasedPlan.has_value()) << entries[i].planStatsTree;
+    }
+
+    for (const auto& entry : entries) {
+        ASSERT(entry.hasTrialStats) << entry.planStatsTree;
+        ASSERT(entry.summary.has_value()) << entry.planStatsTree;
+        ASSERT(entry.stopCondition.has_value()) << entry.planStatsTree;
+
+        forEachV3Node(entry.planStatsTree, [&](const BSONObj& node) {
+            ASSERT_FALSE(node.hasField("works")) << node;
+            ASSERT_FALSE(node.hasField("nReturned")) << node;
+            auto multiPlan = node["statistics"]["multiPlan"];
+            ASSERT(multiPlan.isABSONObj()) << node;
+            ASSERT(multiPlan.Obj().hasField("works")) << node;
+            if (node["stage"].String() == "IXSCAN") {
+                ASSERT(node.hasField("keyPattern")) << node;
+                ASSERT_FALSE(node.hasField("keysExamined")) << node;
+                ASSERT(multiPlan.Obj().hasField("keysExamined")) << node;
+            }
+        });
+    }
+
+    // The plans after the winner are ordered by trial score, descending (the multi-planner
+    // decided).
+    for (size_t i = 2; i < entries.size(); ++i) {
+        if (entries[i - 1].summary->score && entries[i].summary->score) {
+            ASSERT_GTE(*entries[i - 1].summary->score, *entries[i].summary->score);
+        }
+    }
+}
+
+TEST_F(PlanExplainerTest, V3SbeQueryWithDeferredEngineChoiceDisabled) {
+    // A multi-planned SBE query explained at a V3 verbosity must report why the deciding ranker was
+    // chosen, even with the deferred engine feature disabled.
+    unittest::ServerParameterGuard deferredEngineChoiceOff(
+        "featureFlagGetExecutorDeferredEngineChoice", false);
+    unittest::ServerParameterGuard sbeFullController("featureFlagSbeFull", true);
+
+    expCtx->setExplain(ExplainOptions::Verbosity::kPlannerStats);
+    auto exec = buildFindExecAndIter(fromjson("{a: {$gte: 0}, b: {$gte: 0}}"));
+
+    auto& explainer = exec->getPlanExplainer();
+    ASSERT(explainer.isSbeExplainer());
+
+    ASSERT(explainer.getPlanSelectionStrategy().has_value());
+    ASSERT_TRUE(*explainer.getPlanSelectionStrategy() == PlanSelectionStrategy::kMultiPlanner);
+
+    ASSERT_FALSE(explainer
+                     .getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kPlannerStats),
+                                     PlanStatsFormat::kV3,
+                                     *explainer.getPlanSelectionStrategy())
+                     .empty());
+
+    auto coll = acquireCollection(operationContext(),
+                                  CollectionAcquisitionRequest::fromOpCtx(
+                                      operationContext(), kNss, AcquisitionPrerequisites::kRead),
+                                  MODE_IS);
+    MultipleCollectionAccessor colls{coll};
+
+    BSONObjBuilder bob;
+    Explain::explainStages(exec.get(),
+                           colls,
+                           ExplainOptions::Verbosity::kPlannerStats,
+                           Status::OK(),
+                           boost::none,
+                           BSONObj(),
+                           SerializationContext::stateCommandReply(),
+                           BSONObj(),
+                           &bob);
+    const BSONObj explained = bob.obj();
+
+    auto rankerChoice = explained["queryPlanner"]["rankerChoice"];
+    ASSERT(rankerChoice.isABSONObj()) << explained;
+    ASSERT_EQ(rankerChoice["chosenRanker"].String(), "multiPlanning") << explained;
+    // TODO SERVER-134550 Populate the reason field for SBE + deferred engine off.
+    ASSERT(!rankerChoice.Obj().hasField("reason")) << explained;
+}
+
+TEST_F(PlanExplainerTest, GetPlanEntriesV3SBEPlannerChoiceIsStructureOnly) {
+    // As on the classic engine, plannerChoice renders the same plans[] shape.
+    unittest::ServerParameterGuard sbeFullController("featureFlagSbeFull", true);
+    expCtx->setExplain(ExplainOptions::Verbosity::kPlannerChoice);
+    auto exec = buildFindExecAndIter(fromjson("{a: {$gte: 0}, b: {$gte: 0}}"));
+    auto& explainer = exec->getPlanExplainer();
+
+    auto entries =
+        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kPlannerChoice),
+                                 PlanStatsFormat::kV3,
+                                 PlanSelectionStrategy::kMultiPlanner);
+    ASSERT_GTE(entries.size(), 2u);
+    for (const auto& entry : entries) {
+        ASSERT_FALSE(entry.summary.has_value()) << entry.planStatsTree;
+        forEachV3Node(entry.planStatsTree, [&](const BSONObj& node) {
+            ASSERT(node.hasField("stage")) << node;
+            ASSERT_FALSE(node.hasField("statistics")) << node;
+        });
+    }
+}
+
+TEST_F(PlanExplainerTest, GetPlanEntriesV3WinnerUsesTrialSnapshot) {
+    // The winner's V3 tree must show trial statistics, never final-execution statistics: executing
+    // the query further must not change the winner's entry. Explain queries get the winner's trial
+    // snapshot (exported by the ranking strategies, or captured at explainer construction).
+    expCtx->setExplain(ExplainOptions::Verbosity::kPlannerStats);
+    auto exec = buildFindExecAndIter(fromjson("{a: {$gte: 0}, b: {$gte: 0}}"));
+    auto& explainer = exec->getPlanExplainer();
+
+    const auto policy = explainPolicyFor(ExplainOptions::Verbosity::kPlannerStats);
+    auto before = explainer.getPlanEntries(
+        policy, PlanStatsFormat::kV3, PlanSelectionStrategy::kMultiPlanner);
+
+    // Drain the executor: the live root's counters accumulate real-execution work.
+    while (exec->getNext(nullptr, nullptr) != PlanExecutor::IS_EOF) {
+    }
+
+    auto after = explainer.getPlanEntries(
+        policy, PlanStatsFormat::kV3, PlanSelectionStrategy::kMultiPlanner);
+    ASSERT_EQ(before.size(), after.size());
+    ASSERT_BSONOBJ_EQ(before[0].planStatsTree, after[0].planStatsTree);
+}
+
+TEST_F(PlanExplainerTest, GetPlanEntriesV3WinnerUsesTrialSnapshotPureMultiPlanning) {
+    // Same guarantee on the pure-multiplanning path (MultiPlanStage still in the execution tree):
+    // the explainer's constructor snapshots the trial statistics before the explained query can
+    // execute, isolating the winner's trial tree from execution.
+    unittest::ServerParameterGuard cbrController("featureFlagCostBasedRanker", false);
+    expCtx->setExplain(ExplainOptions::Verbosity::kPlannerStats);
+    auto exec = buildFindExecAndIter(fromjson("{a: {$gte: 0}, b: {$gte: 0}}"));
+    auto& explainer = exec->getPlanExplainer();
+
+    const auto policy = explainPolicyFor(ExplainOptions::Verbosity::kPlannerStats);
+    auto before = explainer.getPlanEntries(
+        policy, PlanStatsFormat::kV3, PlanSelectionStrategy::kMultiPlanner);
+
+    while (exec->getNext(nullptr, nullptr) != PlanExecutor::IS_EOF) {
+    }
+
+    auto after = explainer.getPlanEntries(
+        policy, PlanStatsFormat::kV3, PlanSelectionStrategy::kMultiPlanner);
+    ASSERT_EQ(before.size(), after.size());
+    for (size_t i = 0; i < before.size(); ++i) {
+        ASSERT_BSONOBJ_EQ(before[i].planStatsTree, after[i].planStatsTree);
+    }
+}
+
+TEST_F(PlanExplainerTest, GetPlanEntriesV3CostBasedRankerOrdering) {
+    // When the cost-based ranker decided, plans are grouped under statistics.costBased and the
+    // plans after the winner are ordered by root cost estimate, ascending.
+    unittest::ServerParameterGuard planRankerController("internalQueryPlanRanker", "costBased");
+    unittest::ServerParameterGuard samplingController("internalQueryCBRCEMode", "samplingCE");
+    expCtx->setExplain(ExplainOptions::Verbosity::kPlannerStats);
+
+    auto exec = buildFindExecAndIter(fromjson("{a: {$gte: 0}, b: {$gte: 0}}"));
+    auto& explainer = exec->getPlanExplainer();
+
+    auto entries =
+        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kPlannerStats),
+                                 PlanStatsFormat::kV3,
+                                 PlanSelectionStrategy::kCostBasedRanker);
+    ASSERT_GTE(entries.size(), 2u);
+
+    boost::optional<double> previousCost;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const auto& entry = entries[i];
+        auto costBased = entry.planStatsTree["statistics"]["costBased"];
+        ASSERT(costBased.isABSONObj()) << entry.planStatsTree;
+        ASSERT(costBased.Obj().hasField("costEstimate")) << entry.planStatsTree;
+        ASSERT(costBased.Obj().hasField("cardinalityEstimate")) << entry.planStatsTree;
+
+        if (i != 0) {
+            // CBR-rejected plans never ran a trial: no multiPlan group, no plan-level trial stats.
+            ASSERT_FALSE(entry.hasTrialStats) << entry.planStatsTree;
+            ASSERT_FALSE(entry.planStatsTree["statistics"].Obj().hasField("multiPlan"))
+                << entry.planStatsTree;
+
+            const double cost = costBased.Obj()["costEstimate"].numberDouble();
+            if (previousCost) {
+                ASSERT_GTE(cost, *previousCost) << entry.planStatsTree;
+            }
+            previousCost = cost;
+        }
+    }
+}
+
+TEST_F(PlanExplainerTest, LegacyAccessorsMatchPlanEntriesAcrossVerbosities) {
+    // The legacy winning/rejected accessors and the kLegacy
+    // per-plan enumerator produce BSON-identical output for every legacy verbosity across
+    // single-plan, multi-planned, and CBR-rejected scenarios. First verified against the
+    // pre-consolidation accessor implementations, it now pins the consolidation (the accessors
+    // are thin wrappers over getPlanEntries) to byte-identity.
+    auto assertAccessorsMatchEntries = [&](PlanExecutor* exec) {
+        auto& explainer = exec->getPlanExplainer();
+        for (auto verbosity : {ExplainOptions::Verbosity::kQueryPlanner,
+                               ExplainOptions::Verbosity::kExecStats,
+                               ExplainOptions::Verbosity::kExecAllPlans,
+                               ExplainOptions::Verbosity::kInternal}) {
+            auto entries = explainer.getPlanEntries(explainPolicyFor(verbosity),
+                                                    PlanStatsFormat::kLegacy,
+                                                    PlanSelectionStrategy::kSinglePlan);
+            ASSERT_GTE(entries.size(), 1u);
+
+            auto&& [winningPlan, winningSummary] = explainer.getWinningPlanStats(verbosity);
+            ASSERT_BSONOBJ_EQ(entries[0].planStatsTree, winningPlan);
+            ASSERT_EQ(entries[0].summary.has_value(), winningSummary.has_value());
+
+            auto rejected = explainer.getRejectedPlansStats(verbosity);
+            ASSERT_EQ(rejected.size(), entries.size() - 1);
+            for (size_t i = 0; i < rejected.size(); ++i) {
+                ASSERT_BSONOBJ_EQ(entries[i + 1].planStatsTree, rejected[i].first);
+                ASSERT_EQ(entries[i + 1].summary.has_value(), rejected[i].second.has_value());
+                if (rejected[i].second) {
+                    ASSERT_EQ(entries[i + 1].summary->score.has_value(),
+                              rejected[i].second->score.has_value());
+                }
+            }
+        }
+    };
+
+    {
+        // Single-plan scenario.
+        auto exec = buildFindExecAndIter(fromjson("{c: {$eq: 1}}"));
+        assertAccessorsMatchEntries(exec.get());
+    }
+    {
+        // Multi-planned scenario.
+        auto exec = buildFindExecAndIter(fromjson("{a: {$gte: 0}, b: {$gte: 0}}"));
+        assertAccessorsMatchEntries(exec.get());
+    }
+    {
+        // CBR scenario with rejected plans that never ran a trial.
+        unittest::ServerParameterGuard planRankerController("internalQueryPlanRanker", "costBased");
+        unittest::ServerParameterGuard samplingController("internalQueryCBRCEMode", "samplingCE");
+        expCtx->setExplain(ExplainOptions::Verbosity::kQueryPlanner);
+        auto exec = buildFindExecAndIter(fromjson("{a: {$gte: 0}, b: {$gte: 0}}"));
+        assertAccessorsMatchEntries(exec.get());
+    }
+}
+
+TEST_F(PlanExplainerTest, V3ExecStatsSectionMatchesLegacyExecStatsSection) {
+    // Serializing the same executor state at the V3 execStats and the legacy executionStats
+    // verbosities must produce identical executionStats sections - V3's retained section is
+    // generated by the same code path at the kExecStats policy by design, so a future fork of that
+    // path (e.g. a "V3-ification" of executionStages) fails here rather than shipping silently.
+    // Only the wall-clock totals, which generateExecutionInfo() reads from the operation timer at
+    // serialization time, are excluded from the comparison. The jstest explain_exec_stats_parity.js
+    // carries the system-level form of the guarantee.
+    //
+    // Plan under explain, as the explain command does before serializing at any V3 verbosity: the
+    // ranking strategies record rankerChoice.reason only for explain-planned queries, and V3
+    // emission tasserts (13237700) if a strategy decided the winner but no reason was carried.
+    expCtx->setExplain(ExplainOptions::Verbosity::kExecStatsV3);
+    auto exec = buildFindExecAndIter(fromjson("{a: {$gte: 0}, b: {$gte: 0}}"));
+    while (exec->getNext(nullptr, nullptr) != PlanExecutor::IS_EOF) {
+    }
+
+    auto coll = acquireCollection(operationContext(),
+                                  CollectionAcquisitionRequest::fromOpCtx(
+                                      operationContext(), kNss, AcquisitionPrerequisites::kRead),
+                                  MODE_IS);
+    MultipleCollectionAccessor colls{coll};
+
+    auto explainExecutionStatsAt = [&](ExplainOptions::Verbosity verbosity) {
+        BSONObjBuilder bob;
+        Explain::explainStages(exec.get(),
+                               colls,
+                               verbosity,
+                               Status::OK(),
+                               exec->getPlanExplainer().getWinningPlanTrialStats(),
+                               BSONObj(),
+                               SerializationContext::stateCommandReply(),
+                               BSONObj(),
+                               &bob);
+        const BSONObj explained = bob.obj();
+        ASSERT(explained["executionStats"].isABSONObj()) << explained;
+        // Strip the wall-clock totals (see the comment above); everything else must be equal.
+        return explained["executionStats"].Obj().removeFields(
+            StringDataSet{"executionTimeMillis", "executionTimeMicros"});
+    };
+
+    const BSONObj legacySection = explainExecutionStatsAt(ExplainOptions::Verbosity::kExecStats);
+    const BSONObj v3Section = explainExecutionStatsAt(ExplainOptions::Verbosity::kExecStatsV3);
+    ASSERT_BSONOBJ_EQ(legacySection, v3Section);
 }
 
 TEST_F(PlanExplainerTest, SBEMultiPlannerExplain) {
@@ -463,6 +1027,76 @@ TEST_F(PlanExplainerTest, ExpressPlanExecStatsIncludeNanoExecutionTime) {
     ASSERT_EQ(summary->executionTime.precision, QueryExecTimerPrecision::kNanos);
 }
 
+TEST_F(PlanExplainerTest, ExpressPlanGetPlanEntriesLegacyMatchesWinningPlanAccessor) {
+    // The legacy format still routes through the same per-plan core as the winning-plan accessor,
+    // so the sole entry is byte-identical to it.
+    auto exec = buildFindExecAndIter(fromjson("{_id: 1}"));
+    auto& explainer = exec->getPlanExplainer();
+
+    auto entries =
+        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kQueryPlanner),
+                                 PlanStatsFormat::kLegacy,
+                                 PlanSelectionStrategy::kSinglePlan);
+    ASSERT_EQ(entries.size(), 1u);
+    auto&& [winningPlan, _] =
+        explainer.getWinningPlanStats(ExplainOptions::Verbosity::kQueryPlanner);
+    ASSERT_BSONOBJ_EQ(entries[0].planStatsTree, winningPlan);
+}
+
+TEST_F(PlanExplainerTest, ExpressPlanGetPlanEntriesV3) {
+    // An express plan yields exactly one V3 entry: the express path is taken only for fast-path
+    // query shapes, so no candidate is ever enumerated and there is nothing after the winner. The
+    // entry carries no ranking provenance of either family - no trial, no score, no stop
+    // condition - and no solution hash, since express plans have no QuerySolution.
+    auto exec = buildFindExecAndIter(fromjson("{_id: 1}"));
+    auto& explainer = exec->getPlanExplainer();
+
+    auto entries =
+        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kPlannerStats),
+                                 PlanStatsFormat::kV3,
+                                 PlanSelectionStrategy::kSinglePlan);
+    ASSERT_EQ(entries.size(), 1u);
+    const auto& entry = entries[0];
+    ASSERT_FALSE(entry.hasTrialStats) << entry.planStatsTree;
+    ASSERT_FALSE(entry.isCached) << entry.planStatsTree;
+    ASSERT_FALSE(entry.solutionHash.has_value()) << entry.planStatsTree;
+    ASSERT_FALSE(entry.stopCondition.has_value()) << entry.planStatsTree;
+
+    // 'isCached' is hoisted to the plan object, and neither statistics group applies to an express
+    // plan, so the node carries no "statistics" subobject at all.
+    ASSERT_STRING_CONTAINS(entry.planStatsTree.toString(), "EXPRESS_IXSCAN");
+    forEachV3Node(entry.planStatsTree, [&](const BSONObj& node) {
+        ASSERT(node.hasField("stage")) << node;
+        ASSERT_FALSE(node.hasField("isCached")) << node;
+        ASSERT_FALSE(node.hasField("statistics")) << node;
+    });
+}
+
+TEST_F(PlanExplainerTest, ExpressPlanGetPlanEntriesV3ExcludesExecutionCounters) {
+    // Even at the V3 execStats verbosity the plans[] tree stays structural: execution counters are
+    // never fused into a V3 node. They remain reported for express in the retained legacy
+    // executionStats section, which the winning-plan accessor still produces.
+    expCtx->setExplain(ExplainOptions::Verbosity::kExecStatsV3);
+    auto exec = buildFindExecAndIter(fromjson("{_id: 1}"));
+    auto& explainer = exec->getPlanExplainer();
+
+    auto entries =
+        explainer.getPlanEntries(explainPolicyFor(ExplainOptions::Verbosity::kExecStatsV3),
+                                 PlanStatsFormat::kV3,
+                                 PlanSelectionStrategy::kSinglePlan);
+    ASSERT_EQ(entries.size(), 1u);
+    forEachV3Node(entries[0].planStatsTree, [&](const BSONObj& node) {
+        ASSERT_FALSE(node.hasField("nReturned")) << node;
+        ASSERT_FALSE(node.hasField("keysExamined")) << node;
+        ASSERT_FALSE(node.hasField("docsExamined")) << node;
+        ASSERT_FALSE(node.hasField("executionTimeMillisEstimate")) << node;
+    });
+    // The plan-level summary is still collected, so the section that does report the counters has
+    // its source.
+    ASSERT(entries[0].summary.has_value());
+    ASSERT_EQ(entries[0].summary->nReturned, 1u);
+}
+
 TEST_F(PlanExplainerTest, ClassicPipelinePlanExplain) {
     // A pipeline query including sargable predicates on different fields will consider multiple
     // plans during planning. Its executor can be explained, and the explain output should indicate
@@ -522,6 +1156,80 @@ auto makeCollScanNode(const std::string& collName) {
     auto node = std::make_unique<CollectionScanNode>();
     node->nss = NamespaceString::createNamespaceString_forTest(collName);
     return node;
+}
+
+namespace {
+RecordIdRange makeIntRange(int min, bool minInclusive, int max, bool maxInclusive) {
+    RecordIdRange r;
+    r.maybeNarrowMin(RecordIdBound(RecordId(min)), minInclusive);
+    r.maybeNarrowMax(RecordIdBound(RecordId(max)), maxInclusive);
+    return r;
+}
+
+BSONObj callStatsToBSON(const QuerySolutionNode* node) {
+    BSONObjBuilder bob;
+    statsToBSON(node, &bob, &bob);
+    return bob.obj();
+}
+}  // namespace
+
+TEST_F(PlanExplainerTest, StatsToBSONTruncatesPlanExceedingMaxBSONDepth) {
+    // Build a plan tree that is deeper than the max BSON depth allowed for user storage.
+    std::unique_ptr<QuerySolutionNode> root = makeCollScanNode("testdb.explain");
+    for (std::uint32_t i = 0; i < BSONDepth::getMaxDepthForUserStorage(); ++i) {
+        root = std::make_unique<FetchNode>(
+            std::move(root), NamespaceString::createNamespaceString_forTest("testdb.explain"));
+    }
+
+    auto obj = callStatsToBSON(root.get());
+
+    // The serialized plan must not exceed the BSON nesting depth limit.
+    ASSERT_OK(validateBSONDepthForUserStorage(obj));
+
+    // The deepest serialized stage must carry the truncation warning.
+    BSONObj current = obj;
+    while (current.hasField("inputStage")) {
+        current = current["inputStage"].Obj();
+    }
+    ASSERT_EQ(current["warning"].str(),
+              "stats tree exceeded BSON depth limit; omitting the rest of the tree");
+}
+
+// An SBE plan node's stage-specific fields come first in both explain shapes, followed by the
+// filter and then the cost estimates: flat in the legacy shape, inside the "statistics" subobject
+// in the V3 shape. This is the order statsToBsonV3Impl emits for classic plans, so SBE and classic
+// nodes read alike, and the order the query_golden tests record for SBE plans.
+TEST_F(PlanExplainerTest, StatsToBSONEstimateAndFilterPositionPerShape) {
+    using namespace cost_based_ranker;
+    auto root = std::make_unique<FetchNode>(
+        makeCollScanNode("testdb.explain"),
+        NamespaceString::createNamespaceString_forTest("testdb.explain"));
+    // The parsed filter keeps references into its BSON, which must outlive the serialization.
+    const BSONObj filterObj = fromjson("{a: 1}");
+    root->filter = uassertStatusOK(MatchExpressionParser::parse(filterObj, expCtx));
+    EstimateMap estimates;
+    estimates[root.get()] = std::make_unique<QSNEstimate>(
+        CardinalityEstimate{CardinalityType{10}, EstimationSource::Code},
+        CostEstimate{CostType{1}, EstimationSource::Code});
+
+    auto fieldNames = [](const BSONObj& obj) {
+        std::string names;
+        for (auto&& el : obj) {
+            names += (names.empty() ? "" : ",") + std::string{el.fieldNameStringData()};
+        }
+        return names;
+    };
+
+    BSONObjBuilder legacyBob;
+    statsToBSON(root.get(), &legacyBob, &legacyBob, estimates);
+    ASSERT_EQ(fieldNames(legacyBob.obj()),
+              "stage,planNodeId,nss,filter,costEstimate,cardinalityEstimate,estimatesMetadata,"
+              "inputStage");
+
+    BSONObjBuilder v3Bob;
+    statsToBsonV3(
+        root.get(), ExplainPolicy{ExplainSettings::kCostBasedStats}, estimates, &v3Bob, &v3Bob);
+    ASSERT_EQ(fieldNames(v3Bob.obj()), "stage,planNodeId,nss,filter,statistics,inputStages");
 }
 
 TEST_F(PlanExplainerTest, HashJoinEmbeddingTest) {
@@ -664,7 +1372,7 @@ TEST_F(PlanExplainerTest, PlanExplainerDataMergeEmpty) {
     data1.rejectedPlansWithStages.push_back({nullptr, nullptr});
 
     PlanExplainerData data2;
-    data2.planStageQsnMap.emplace(nullptr, nullptr);
+    data2.planStageQsnMap.emplace(nullptr, stage_builder::QsnMapping{});
 
     data1 << std::move(data2);
 
@@ -690,7 +1398,7 @@ TEST_F(PlanExplainerTest, OptionalPlanExplainerDataMerge) {
     // Both have values - merges content
     boost::optional<PlanExplainerData> data3;
     data3.emplace();
-    data3->planStageQsnMap.emplace(nullptr, nullptr);
+    data3->planStageQsnMap.emplace(nullptr, stage_builder::QsnMapping{});
 
     data1 << std::move(data3);
     ASSERT_EQ(data1->rejectedPlansWithStages.size(), 1);
@@ -702,14 +1410,16 @@ TEST_F(PlanExplainerTest, PlanExplainerDataMergeFull) {
     auto qsn1 = std::make_unique<QuerySolution>();
     data1.rejectedPlansWithStages.push_back({std::move(qsn1), nullptr});
     // Use distinct pointer values to avoid key collision
-    data1.planStageQsnMap.emplace(reinterpret_cast<const PlanStage*>(0x1), nullptr);
+    data1.planStageQsnMap.emplace(reinterpret_cast<const PlanStage*>(0x1),
+                                  stage_builder::QsnMapping{});
     data1.estimates.emplace(reinterpret_cast<const QuerySolutionNode*>(0x1),
                             std::make_unique<cost_based_ranker::QSNEstimate>());
 
     PlanExplainerData data2;
     auto qsn2 = std::make_unique<QuerySolution>();
     data2.rejectedPlansWithStages.push_back({std::move(qsn2), nullptr});
-    data2.planStageQsnMap.emplace(reinterpret_cast<const PlanStage*>(0x2), nullptr);
+    data2.planStageQsnMap.emplace(reinterpret_cast<const PlanStage*>(0x2),
+                                  stage_builder::QsnMapping{});
     data2.estimates.emplace(reinterpret_cast<const QuerySolutionNode*>(0x2),
                             std::make_unique<cost_based_ranker::QSNEstimate>());
 
@@ -785,20 +1495,87 @@ TEST_F(PlanExplainerTest, CBRSamplingMetadataSerializedInExplain) {
     ASSERT(nsMeta.hasField("sampleDocCount")) << nsMeta;
     ASSERT(nsMeta.hasField("sampleRequestedDocCount")) << nsMeta;
     ASSERT(nsMeta.hasField("sampleMemorySizeBytes")) << nsMeta;
+    ASSERT(!nsMeta.hasField("sampleNumPages")) << nsMeta;
 }
 
-TEST_F(PlanExplainerTest, GenerateQueryKnobsEmitsNothingWhenFeatureFlagOff) {
-    unittest::ServerParameterGuard flagGuard("featureFlagPqsQueryKnobs", false);
+TEST_F(PlanExplainerTest, CBRSamplingMetadataReportsPagesForPersistedSample) {
+    // Verifies that the page count shows up in 'ceSamplingMetadata' when read back
+    // from persisted samples collection.
+    // TODO SERVER-124372: Remove once featureFlagPersistentStats is enabled by default.
+    unittest::ServerParameterGuard persistentStatsFlag("featureFlagPersistentStats", true);
+    unittest::ServerParameterGuard planRankerController("internalQueryPlanRanker", "costBased");
+    unittest::ServerParameterGuard samplingController("internalQueryCBRCEMode", "samplingCE");
+    // Requested sample size is part of a persisted sample's key, so pin it to avoid full coll scan.
+    constexpr int kPersistedSampleSize = 10;
+    unittest::ServerParameterGuard sampleSizeOverride("internalSamplingSizeOverride",
+                                                      kPersistedSampleSize);
+
+    const UUID collUuid = [&] {
+        auto coll = acquireCollection(
+            operationContext(),
+            CollectionAcquisitionRequest::fromOpCtx(
+                operationContext(), kNss, AcquisitionPrerequisites::OperationType::kRead),
+            MODE_IS);
+        return coll.getCollectionPtr()->uuid();
+    }();
+
+    std::vector<BSONObj> sample;
+    for (int i = 0; i < kPersistedSampleSize; ++i) {
+        sample.push_back(BSON("_id" << i << "a" << i << "b" << i));
+    }
+
+    const std::vector<BSONObj> pages =
+        ce::makePersistentSamplePageDocs(collUuid,
+                                         ce::SamplingTechniqueEnum::kRandom,
+                                         kPersistedSampleSize,
+                                         boost::none /* numChunks */,
+                                         sample,
+                                         Date_t::now());
+    ASSERT_EQ(pages.size(), 1u);
+
+    ce::createCollAndInsertDocuments(
+        operationContext(),
+        NamespaceString::createNamespaceString_forTest(kNss.dbName(), ce::kSamplesCollectionName),
+        pages,
+        /*clustered=*/true);
+
+    const auto verbosity = ExplainOptions::Verbosity::kQueryPlanner;
+    expCtx->setExplain(verbosity);
+    auto exec = buildFindExecAndIter(fromjson("{a: {$gte: 0}, b: {$gte: 0}}"));
+
+    auto coll = acquireCollection(operationContext(),
+                                  CollectionAcquisitionRequest::fromOpCtx(
+                                      operationContext(), kNss, AcquisitionPrerequisites::kRead),
+                                  MODE_IS);
+    MultipleCollectionAccessor colls{coll};
 
     BSONObjBuilder bob;
-    explain_common::generateQueryKnobs(expCtx, &bob);
+    Explain::explainStages(exec.get(),
+                           colls,
+                           verbosity,
+                           Status::OK(),
+                           boost::none,
+                           BSONObj(),
+                           SerializationContext::stateCommandReply(),
+                           BSONObj(),
+                           &bob);
+    const BSONObj explained = bob.obj();
 
-    ASSERT_FALSE(bob.asTempObj().hasField("queryKnobs"));
+    auto queryPlanner = explained["queryPlanner"];
+    ASSERT(queryPlanner.isABSONObj()) << "Missing queryPlanner in: " << explained;
+    auto ceSamplingMeta = queryPlanner["ceSamplingMetadata"];
+    ASSERT(ceSamplingMeta.isABSONObj())
+        << "Missing ceSamplingMetadata in queryPlanner: " << queryPlanner;
+    ASSERT_EQ(ceSamplingMeta.Obj().nFields(), 1) << ceSamplingMeta;
+    const BSONObj nsMeta = ceSamplingMeta.Obj().firstElement().Obj();
+
+    // Reading the persisted sample makes the page count available.
+    ASSERT_EQ(nsMeta["sampleSource"].String(), "persisted") << nsMeta;
+    ASSERT_EQ(nsMeta["sampleNumPages"].numberLong(), 1) << nsMeta;
 }
 
-TEST_F(PlanExplainerTest, GenerateQueryKnobsEmitsQuerySettingsKnobsWhenFeatureFlagOn) {
+TEST_F(PlanExplainerTest, GenerateQueryKnobsEmitsQuerySettingsKnobs) {
     auto* opCtx = operationContext();
-    unittest::ServerParameterGuard flagGuard("featureFlagPqsQueryKnobs", true);
     query_settings::QuerySettingsGuardForTest settingsGuard(
         opCtx, fromjson(R"({queryKnobs: {samplingMarginOfError: 2.5}})"));
 
@@ -816,7 +1593,6 @@ TEST_F(PlanExplainerTest, GenerateQueryKnobsEmitsQuerySettingsKnobsWhenFeatureFl
 
 TEST_F(PlanExplainerTest, GenerateQueryKnobsOmitsKnobsWhenOutputNearlyFull) {
     auto* opCtx = operationContext();
-    unittest::ServerParameterGuard flagGuard("featureFlagPqsQueryKnobs", true);
     query_settings::QuerySettingsGuardForTest settingsGuard(
         opCtx, fromjson(R"({queryKnobs: {samplingMarginOfError: 2.5, cbrCEMode: "samplingCE"}})"));
     auto testExpCtx = make_intrusive<ExpressionContextForTest>(opCtx, kNss);
@@ -844,6 +1620,36 @@ TEST_F(PlanExplainerTest, GenerateQueryKnobsOmitsKnobsWhenOutputNearlyFull) {
     auto result = out.obj();
     ASSERT_FALSE(result.hasField("queryKnobs"));
     ASSERT_TRUE(result.hasField("warning"));
+}
+
+// A CollectionScanNode with two ranges must emit recordIdRanges with both entries.
+TEST_F(PlanExplainerTest, CollScanMultiRangeIncludesRecordIdRanges) {
+    auto csn = makeCollScanNode("testdb.col");
+    csn->rangeList = RecordIdRangeList::makeUnion(
+        {makeIntRange(1, true, 5, true), makeIntRange(10, false, 20, true)});
+
+    auto result = callStatsToBSON(csn.get());
+    ASSERT(result.hasField("recordIdRanges")) << result;
+    ASSERT_BSONOBJ_EQ_AUTO(
+        R"([{"min":1, "minInclusive": true, "max":5, "maxInclusive": true}, {"min":10, "minInclusive": false, "max": 20, "maxInclusive": true}])",
+        BSONArray(result["recordIdRanges"].Obj()))
+        << result;
+    // Outer bounds are also emitted for backward compatibility.
+    ASSERT_EQ(result["minRecord"].Long(), 1) << result;
+    ASSERT_EQ(result["maxRecord"].Long(), 20) << result;
+}
+
+// An empty rangeList (∅, no ranges) also emits recordIdRanges (as an empty array).
+// In this case, both minRecord and maxRecord are set to null.
+TEST_F(PlanExplainerTest, CollScanEmptyRangeListIncludesRecordIdRanges) {
+    auto csn = makeCollScanNode("testdb.col");
+    csn->rangeList = RecordIdRangeList::makeUnion({});  // explicit empty list
+
+    auto result = callStatsToBSON(csn.get());
+    ASSERT(result.hasField("recordIdRanges")) << result;
+    ASSERT_EQ(result["recordIdRanges"].Array().size(), 0u) << result;
+    ASSERT(result["minRecord"].isNull()) << result;
+    ASSERT(result["maxRecord"].isNull()) << result;
 }
 
 }  // namespace

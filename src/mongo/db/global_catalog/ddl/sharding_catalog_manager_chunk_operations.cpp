@@ -1,13 +1,6 @@
 // Copyright (c) MongoDB, Inc.
 // SPDX-License-Identifier: SSPL-1.0
 
-#include <boost/cstdint.hpp>
-#include <boost/move/utility_core.hpp>
-#include <boost/none.hpp>
-#include <boost/optional.hpp>
-#include <boost/optional/optional.hpp>
-#include <boost/smart_ptr.hpp>
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
@@ -58,7 +51,6 @@
 #include "mongo/db/sharding_environment/client/shard.h"
 #include "mongo/db/sharding_environment/grid.h"
 #include "mongo/db/sharding_environment/shard_id.h"
-#include "mongo/db/sharding_environment/shard_ref.h"
 #include "mongo/db/sharding_environment/sharding_config_server_parameters_gen.h"
 #include "mongo/db/sharding_environment/sharding_logging.h"
 #include "mongo/db/topology/shard_registry.h"
@@ -104,6 +96,14 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 MONGO_FAIL_POINT_DEFINE(overrideHistoryWindowInSecs);
 
@@ -492,9 +492,12 @@ std::vector<int> mergeAllChunksOnShardInTransaction(OperationContext* opCtx,
 
     auto updateChunksFn = [collectionUUID, shardId, &newChunks, &numMergedChunksPerRange](
                               const txn_api::TransactionClient& txnClient, ExecutorPtr txnExec) {
+        // The transaction body may be executed more than once if the transaction is retried. Reset
+        // the accumulator on each attempt.
+        numMergedChunksPerRange.clear();
+
         std::vector<ExecutorFuture<void>> statementsChain;
 
-        StmtId stmtId{};
         for (auto& chunk : newChunks) {
             // Prepare deletion of existing chunks in the range
             BSONObjBuilder queryBuilder;
@@ -516,16 +519,8 @@ std::vector<int> mergeAllChunksOnShardInTransaction(OperationContext* opCtx,
             write_ops::InsertCommandRequest insertOp(NamespaceString::kConfigsvrChunksNamespace,
                                                      {chunk.toConfigBSON()});
 
-            // When the inner transaction inherits a retryable-write context, every write op must
-            // carry an explicit stmtIds field. The delete is multi=true, which is incompatible
-            // with retryable-write statement tracking, so we mark it as untracked
-            // (kUninitializedStmtId). The insert is single-doc and can have a real stmt id.
-            // Per-statement idempotency is not needed here: atomicity is guaranteed by the
-            // surrounding transaction and retry semantics live at the parent's session level.
-            const StmtId insertStmtId = stmtId++;
-
             statementsChain.push_back(
-                txnClient.runCRUDOp(deleteOp, {kUninitializedStmtId})
+                txnClient.runCRUDOp(deleteOp, {})
                     .thenRunOn(txnExec)
                     .then([&numMergedChunksPerRange](auto removeChunksResponse) {
                         uassertStatusOK(removeChunksResponse.toStatus());
@@ -533,8 +528,8 @@ std::vector<int> mergeAllChunksOnShardInTransaction(OperationContext* opCtx,
                             static_cast<int>(removeChunksResponse.getN()));
                     })
                     .thenRunOn(txnExec)
-                    .then([&txnClient, insertOp = std::move(insertOp), insertStmtId]() {
-                        return txnClient.runCRUDOp(insertOp, {insertStmtId});
+                    .then([&txnClient, insertOp = std::move(insertOp)]() {
+                        return txnClient.runCRUDOp(insertOp, {});
                     })
                     .thenRunOn(txnExec)
                     .then([](auto insertChunkResponse) {
@@ -549,14 +544,7 @@ std::vector<int> mergeAllChunksOnShardInTransaction(OperationContext* opCtx,
     auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
     auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
 
-    // Provide a yielder so the inner transaction can be safely run when the caller has a session
-    // checked out on its opCtx (e.g. when invoked as a retryable write); the yielder is a no-op
-    // otherwise.
-    txn_api::SyncTransactionWithRetries txn(
-        opCtx,
-        executor,
-        TransactionParticipantResourceYielder::make("mergeAllChunksOnShard"),
-        inlineExecutor);
+    txn_api::SyncTransactionWithRetries txn(opCtx, executor, nullptr, inlineExecutor);
     txn.run(opCtx, updateChunksFn);
 
     if (MONGO_unlikely(mergeAllChunksFailAfterCommit.shouldFail())) {
@@ -785,9 +773,7 @@ ShardingCatalogManager::_splitChunkInTransaction(OperationContext* opCtx,
 
     ShardingCatalogManager::SplitChunkInTransactionResult splitChunkResult;
     auto updateChunksFn = [&](const txn_api::TransactionClient& txnClient, ExecutorPtr txnExec) {
-        // TODO SERVER-127411: use ShardRef/UUID instead of std::string for shardName
-        ChunkType chunk(
-            origChunk.getCollectionUUID(), range, collPlacementVersion, ShardRef{shardName});
+        ChunkType chunk(origChunk.getCollectionUUID(), range, collPlacementVersion, shardName);
 
         // Verify that the range matches exactly a single chunk
         auto countRequest = buildCountSingleChunkCommand(chunk);
@@ -3010,12 +2996,12 @@ void ShardingCatalogManager::_commitChunkMigrationInTransaction(
         uassertStatusOK(getStatusFromWriteCommandReply(distinctCommandResponse));
 
         // 4. Persist new data to the config.placementHistory collection.
-        std::vector<ShardRef> shardRefs;
+        std::vector<ShardId> shardIds;
         for (const auto& valueElement : distinctCommandResponse.getField("values").Array()) {
-            shardRefs.emplace_back(ShardRef::parse(valueElement));
+            shardIds.emplace_back(valueElement.String());
         }
         NamespacePlacementType placementInfo(
-            nss, migratedChunk.getHistory().front().getValidAfter(), std::move(shardRefs));
+            nss, migratedChunk.getHistory().front().getValidAfter(), std::move(shardIds));
         placementInfo.setUuid(migratedChunk.getCollectionUUID());
         write_ops::InsertCommandRequest insertPlacementEntry(
             NamespaceString::kConfigsvrPlacementHistoryNamespace, {placementInfo.toBSON()});

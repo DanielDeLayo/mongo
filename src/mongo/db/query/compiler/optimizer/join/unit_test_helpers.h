@@ -7,6 +7,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/compiler/ce/sampling/sampling_estimator.h"
+#include "mongo/db/query/compiler/optimizer/cost_based_ranker/cbr_test_utils.h"
 #include "mongo/db/query/compiler/optimizer/cost_based_ranker/estimates.h"
 #include "mongo/db/query/compiler/optimizer/join/cardinality_estimator.h"
 #include "mongo/db/query/compiler/optimizer/join/join_graph.h"
@@ -21,6 +22,7 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/modules.h"
 
+#include <algorithm>
 #include <string_view>
 
 namespace mongo::join_ordering {
@@ -97,14 +99,14 @@ public:
         SingleTableAccessPlansResult singleTableAccess{
             .cbrCqQsns = std::move(cbrCqQsns),
             .estimate = {},
-            .nodeCardinalities = std::move(nodeCardinalities),
+            .nodeCardinalitiesOriginalFilter = std::move(nodeCardinalities),
             .collCardinalities = std::move(collCardinalities),
             .nodeCBRCosts = std::move(costs)};
 
         JoinReorderingContext jCtx{.joinGraph = joinGraphStorage.value(),
                                    .resolvedPaths = std::move(resolvedPaths),
                                    .singleTableAccess = std::move(singleTableAccess),
-                                   .perCollIdxs = std::move(perCollIdxs),
+                                   .perCollIdxs = perCollIdxs,
                                    .catStats = std::move(catStats)};
 
         return jCtx;
@@ -149,10 +151,6 @@ public:
     FakeNdvEstimator(CardinalityEstimate collCard) : _collCard(collCard) {};
 
     CardinalityEstimate estimateCardinality(const MatchExpression* expr) const override {
-        MONGO_UNREACHABLE;
-    }
-    std::vector<CardinalityEstimate> estimateCardinality(
-        const std::vector<const MatchExpression*>& expr) const override {
         MONGO_UNREACHABLE;
     }
     CardinalityEstimate estimateKeysScanned(const IndexBounds& bounds) const override {
@@ -216,10 +214,37 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    std::vector<ce::PersistedNDVEntry> getPersistedNDVMetadata() const override {
+        return _persistedNDVMetadata;
+    }
+
+    size_t getNumPersistedNDVStatsUsed() const override {
+        return _numPersistedNDVStatsUsed;
+    }
+
+    void addPersistedNDVStats(std::vector<std::string> sortedFieldPaths) {
+        ce::PersistedNDVEntry entry;
+        entry.sortedFieldPaths = std::move(sortedFieldPaths);
+        _persistedNDVMetadata.push_back(std::move(entry));
+    }
+
 private:
     CardinalityEstimate _collCard;
     stdx::unordered_map<std::vector<FieldPath>, CardinalityEstimate> _fakeEstimates;
+    std::vector<ce::PersistedNDVEntry> _persistedNDVMetadata;
+    // Incremented by 'estimateNDV()' when the estimate is served from a persisted statistic added
+    // via 'addPersistedNDVStats()'. 'estimateNDV' is const, hence mutable.
+    mutable size_t _numPersistedNDVStatsUsed = 0;
 };
+
+/**
+ * Builds a join-edge selectivity estimate whose only meaningful field is the selectivity, for
+ * tests that inject fabricated edge selectivities by hand. The NDV and provenance are left at
+ * benign defaults.
+ */
+inline JoinEdgeSelectivityEstimate makeJoinSelectivityEstimate(double s) {
+    return {.ndv = cost_based_ranker::oneCE, .selectivity = makeSel(s)};
+}
 
 /**
  * Fake implementation of JoinCardinalityEstimator useful for tests which need to inject artificial
@@ -233,7 +258,8 @@ public:
      */
     FakeJoinCardinalityEstimator(const JoinReorderingContext& jCtx)
         : JoinCardinalityEstimator(
-              jCtx, EdgeSelectivities(jCtx.joinGraph.numEdges(), cost_based_ranker::zeroSel)) {
+              jCtx,
+              EdgeSelectivities(jCtx.joinGraph.numEdges(), makeJoinSelectivityEstimate(0.1))) {
         for (uint64_t i = 0; i < std::pow(2, jCtx.joinGraph.numNodes()); ++i) {
             _subsetCardinalities.emplace(
                 NodeSet::fromUIntBitSet(i),
@@ -250,7 +276,8 @@ public:
      */
     FakeJoinCardinalityEstimator(const JoinReorderingContext& jCtx, SubsetCardinalities subsetCards)
         : JoinCardinalityEstimator(
-              jCtx, EdgeSelectivities(jCtx.joinGraph.numEdges(), cost_based_ranker::zeroSel)) {
+              jCtx,
+              EdgeSelectivities(jCtx.joinGraph.numEdges(), makeJoinSelectivityEstimate(0.1))) {
         _subsetCardinalities = std::move(subsetCards);
     }
 

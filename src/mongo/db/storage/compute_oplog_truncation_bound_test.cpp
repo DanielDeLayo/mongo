@@ -1,11 +1,17 @@
 // Copyright (c) MongoDB, Inc.
 // SPDX-License-Identifier: SSPL-1.0
 
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/replicated_fast_count/replicated_fast_count_init.h"
 #include "mongo/db/replicated_fast_count/replicated_fast_count_manager.h"
 #include "mongo/db/replicated_fast_count/replicated_fast_count_test_helpers.h"
 #include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
+#include "mongo/db/storage/ident.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/oplog_truncation.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/record_store_write_conflict_fail_points.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/fail_point.h"
 
@@ -35,8 +41,28 @@ public:
 
     void setUp() override {
         CatalogTestFixture::setUp();
-        ASSERT_OK(replicated_fast_count::createReplicatedFastCountTimestampCollection(
-            storageInterface(), operationContext()));
+
+        ASSERT_OK(createInternalFastCountContainers(operationContext(),
+                                                    NamespaceString::kAdminCommandNamespace,
+                                                    ident::kFastCountMetadataStore,
+                                                    KeyFormat::String,
+                                                    ident::kFastCountMetadataStoreTimestamps,
+                                                    KeyFormat::Long,
+                                                    /*writeToOplog=*/false));
+
+        auto& manager = replicated_fast_count::ReplicatedFastCountManager::get(getServiceContext());
+        auto* engine = operationContext()->getServiceContext()->getStorageEngine()->getEngine();
+        manager.initializeContainerStores(
+            engine->getRecordStore(operationContext(),
+                                   NamespaceString::kAdminCommandNamespace,
+                                   ident::kFastCountMetadataStore,
+                                   RecordStore::Options{.keyFormat = KeyFormat::String},
+                                   /*uuid=*/boost::none),
+            engine->getRecordStore(operationContext(),
+                                   NamespaceString::kAdminCommandNamespace,
+                                   ident::kFastCountMetadataStoreTimestamps,
+                                   RecordStore::Options{.keyFormat = KeyFormat::Long},
+                                   /*uuid=*/boost::none));
     }
 
     void setPersistedTimestamp(Timestamp ts) {
@@ -52,6 +78,13 @@ TEST_F(ComputeOplogTruncationBoundTest, ReturnsPinnedOplogTimestamp) {
     const Timestamp pinnedOplogTs{1, 5};
     setPinnedOplogTimestamp(operationContext(), pinnedOplogTs);
     ASSERT_EQ(oplog_truncation::computeTruncationBound(operationContext()), pinnedOplogTs);
+}
+
+TEST_F(ComputeOplogTruncationBoundWithReplicatedFastCountTest,
+       ReturnsMinTimestampIfPersistedValidAsOfNotSet) {
+    const Timestamp pinnedOplogTs{1, 5};
+    setPinnedOplogTimestamp(operationContext(), pinnedOplogTs);
+    EXPECT_EQ(oplog_truncation::computeTruncationBound(operationContext()), Timestamp::min());
 }
 
 TEST_F(ComputeOplogTruncationBoundWithReplicatedFastCountTest,
@@ -80,8 +113,8 @@ TEST_F(ComputeOplogTruncationBoundWithReplicatedFastCountTest,
     setPersistedTimestamp(persistedValidAsOfTs);
 
     // Throw WCE on the first call, then disable.
-    FailPointEnableBlock fp("WTWriteConflictExceptionForReads",
-                            FailPoint::ModeOptions{.mode = FailPoint::nTimes, .val = 1});
+    auto fp =
+        enableWriteConflictForReads(FailPoint::ModeOptions{.mode = FailPoint::nTimes, .val = 1});
 
     // Should retry and return the correct value on the second attempt.
     ASSERT_EQ(oplog_truncation::computeTruncationBound(operationContext()), persistedValidAsOfTs);

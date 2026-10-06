@@ -109,6 +109,38 @@ export function getSingleNodeExplain(explain) {
 }
 
 /**
+ * Returns true if this 'queryPlanner' section is in the V3 explain shape, where every candidate
+ * plan lives in a unified "plans" array (winner first) instead of the legacy
+ * winningPlan/rejectedPlans pair.
+ */
+export function isV3QueryPlanner(queryPlanner) {
+    return queryPlanner.hasOwnProperty("plans") && !queryPlanner.hasOwnProperty("winningPlan");
+}
+
+/**
+ * Presents one V3 "plans" array entry in the legacy plan shape this library's accessors consume:
+ * the plan's stage tree, with the plan-level fields (isCached, multiPlanStats, ...) kept on the
+ * root - the place the legacy winningPlan/rejectedPlans entries carry them.
+ *
+ * When the winner carries "executedPlanStages" (a pipeline pushed down to SBE after ranking), that
+ * tree is used instead of the ranked "planStages".
+ */
+function v3PlanToLegacyShape(planEntry) {
+    const {planStages, executedPlanStages, ...planLevelFields} = planEntry;
+    return Object.assign(planLevelFields, executedPlanStages ?? planStages);
+}
+
+/**
+ * Returns the rejected plans of one 'queryPlanner' section (not the whole explain; use
+ * getRejectedPlans() for that), handling both the legacy and the V3 section shape.
+ */
+function getRejectedPlansFromQueryPlanner(queryPlanner) {
+    return isV3QueryPlanner(queryPlanner)
+        ? queryPlanner.plans.slice(1).map(v3PlanToLegacyShape)
+        : queryPlanner.rejectedPlans;
+}
+
+/**
  * Returns the winning plan from the corresponding sub-node of classic/SBE explain output. Takes
  * into account that the plan may or may not have agg stages.
  * For sharded collections, this may return the top-level "winningPlan" which contains the shards.
@@ -116,15 +148,23 @@ export function getSingleNodeExplain(explain) {
  * for that shard i.e, explain.queryPlanner.winningPlan.shards[shardNames[0]].
  */
 export function getWinningPlanFromExplain(explain, isSBEPlan = false) {
-    let getWinningSBEPlan = (queryPlanner) => queryPlanner.winningPlan.slotBasedPlan;
+    let getWinningSBEPlan = (queryPlanner) =>
+        isV3QueryPlanner(queryPlanner)
+            ? queryPlanner.plans[0].slotBasedPlan
+            : queryPlanner.winningPlan.slotBasedPlan;
 
-    // The 'queryPlan' format is used when the SBE engine is turned on. If this field is present,
+    // In the V3 shape the winner is the first entry of the unified "plans" array. Otherwise, the
+    // 'queryPlan' format is used when the SBE engine is turned on. If this field is present,
     // it will hold a serialized winning plan, otherwise it will be stored in the 'winningPlan'
     // field itself.
-    let getWinningPlan = (queryPlanner) =>
-        queryPlanner.winningPlan.hasOwnProperty("queryPlan")
+    let getWinningPlan = (queryPlanner) => {
+        if (isV3QueryPlanner(queryPlanner)) {
+            return v3PlanToLegacyShape(queryPlanner.plans[0]);
+        }
+        return queryPlanner.winningPlan.hasOwnProperty("queryPlan")
             ? queryPlanner.winningPlan.queryPlan
             : queryPlanner.winningPlan;
+    };
 
     if ("shards" in explain) {
         for (const shardName in explain.shards) {
@@ -157,49 +197,97 @@ export function getWinningPlanFromExplain(explain, isSBEPlan = false) {
  *   kCostBased     - the cost-based ranker (CBR) ranked the plan (it carries a cost estimate).
  *   kMultiPlanning - the multi-planner (MP) ranked the plan (no cost estimate). This includes the
  *                    case where CBR was engaged but could not cost the plans and fell back to MP.
- *   kNone          - no ranking was needed (e.g. a single candidate plan).
+ *   kSinglePlan    - no ranking was needed because there was a single candidate plan.
+ *   kCachedPlan    - no ranking was needed because the plan came from the plan cache.
  */
 export const ChosenRanker = {
     kMultiPlanning: "multiPlanning",
     kCostBased: "costBased",
-    kNone: "none",
+    kSinglePlan: "singlePlan",
+    kCachedPlan: "cachedPlan",
 };
 
 /**
- * The reason a particular ranker was chosen for a query. These document the intended planner
- * decision for a test case. Not all reasons apply to every plan ranker or CE strategy.
+ * The reason a particular ranker was chosen for a query, as reported by the V3 explain
+ * queryPlanner.rankerChoice.reason field. These values mirror the C++ PlanRankerReason enum
+ * (src/mongo/db/query/plan_ranking/plan_ranker_reason.h) byte for byte. Not all reasons apply to
+ * every plan ranker or CE strategy.
+ * TODO SERVER-115714: add enum value kSmallCollection: "smallCollection"
  */
 export const PlanRankerReason = {
     kSinglePlan: "singlePlan",
-    kFeatureFlag: "featureFlag",
-    kQueryKnob: "queryKnob",
-    kInestimableNode: "inestimableNode",
+    kCBRFeatureFlagDisabled: "cbrFeatureFlagDisabled",
+    kQueryPlanRankerKnob: "queryPlanRankerKnob",
+    kCBRInestimableNode: "cbrInestimableNode",
     kHistogramCEInternalColl: "histogramCEInternalColl",
-    kSmallCollection: "smallCollection",
-    kMpEarlyExitOrResult: "mpEarlyExitOrResult",
+    kMpEarlyExit: "mpEarlyExit",
+    kMpFoundResult: "mpFoundResult",
     kNoMultiplanningResults: "noMultiplanningResults",
-    kMpEarlyExitEofOrFullBatch: "mpEarlyExitEofOrFullBatch",
     kInestimableMP: "inestimableMP",
     kMpCheaperThanCbr: "mpCheaperThanCbr",
     kCbrCheaperThanMp: "cbrCheaperThanMp",
 };
 
+export function getRankerChoice(explain) {
+    const queryPlanner = getQueryPlanner(explain);
+    const rankerChoice = queryPlanner.rankerChoice;
+    assert(rankerChoice, "missing queryPlanner.rankerChoice", {explain});
+    return rankerChoice;
+}
+
 /**
- * Asserts that the winning plan in 'explain' was produced by 'chosenRanker' for 'reason'.
+ * Asserts that the winning plan in 'explain' was produced by 'chosenRanker'.
  *
- * Today the only observable signal is whether the winning plan carries a cost estimate (the
- * 'costEstimate' field): CBR (kCostBased) costs the plan, while the multi-planner (kMultiPlanning)
- * and the single-plan path (kNone) do not.
- *
- * 'reason' must be passed and is validated against 'PlanRankerReason', but it is not yet asserted
- * against the explain output because the explain format does not surface it.
- * TODO SERVER-130875: assert 'chosenRanker' and 'reason' directly against the v3 explain output.
+ * Optionally takes 'reason', which is validated against 'PlanRankerReason' and, for V3 explain
+ * output, asserted against queryPlanner.rankerChoice.reason. Legacy explain output does not
+ * surface the reason, so there it is validated only.
  */
-export function assertChosenRanker(explain, {chosenRanker, reason}) {
+export function assertChosenRanker(explain, chosenRanker, reason = undefined) {
     assert(Object.values(ChosenRanker).includes(chosenRanker), "Unknown chosenRanker", {
         chosenRanker,
     });
-    assert(Object.values(PlanRankerReason).includes(reason), "Unknown reason", {reason});
+    if (reason !== undefined) {
+        assert(Object.values(PlanRankerReason).includes(reason), "Unknown reason", {reason});
+    }
+
+    const queryPlanner = getQueryPlanner(explain);
+    if (isV3QueryPlanner(queryPlanner)) {
+        assert(queryPlanner.hasOwnProperty("rankerChoice"), "Expected rankerChoice in V3 explain", {
+            queryPlanner,
+        });
+
+        const rankerChoice = queryPlanner.rankerChoice;
+        assert(
+            rankerChoice.hasOwnProperty("chosenRanker"),
+            "Expected chosenRanker in rankerChoice",
+            {rankerChoice},
+        );
+        assert(
+            rankerChoice.chosenRanker === chosenRanker,
+            'Unexpected chosenRanker in rankerChoice, expected: "' +
+                chosenRanker +
+                '", got: "' +
+                rankerChoice.chosenRanker +
+                '"',
+            {rankerChoice},
+        );
+
+        if (reason !== undefined) {
+            assert(rankerChoice.hasOwnProperty("reason"), "Expected reason in rankerChoice", {
+                rankerChoice,
+            });
+            assert(
+                rankerChoice.reason === reason,
+                'Unexpected reason in rankerChoice, expected: "' +
+                    reason +
+                    '", got: "' +
+                    rankerChoice.reason +
+                    '"',
+                {rankerChoice},
+            );
+        }
+        return;
+    }
 
     const winningPlan = getWinningPlanFromExplain(explain);
     const isCosted = isPlanCosted(winningPlan);
@@ -218,10 +306,104 @@ export function assertChosenRanker(explain, {chosenRanker, reason}) {
                 winningPlan,
             });
             break;
-        case ChosenRanker.kNone:
+        case ChosenRanker.kSinglePlan:
+        case ChosenRanker.kCachedPlan:
             assert(getRejectedPlans(explain).length === 0, "Expected no rejected plans", {explain});
             break;
     }
+}
+
+/**
+ * Returns the V3 per-plan array of 'explain', asserting it is present. The winning (or sole) plan is
+ * always the first entry; the rest follow in the deciding ranker's order.
+ */
+export function getV3Plans(explain) {
+    const queryPlanner = getQueryPlanner(explain);
+    const plans = queryPlanner.plans;
+    assert(Array.isArray(plans), "missing queryPlanner.plans", {explain});
+    assert.gte(plans.length, 1, "plans must hold at least the winning plan", {explain});
+    return plans;
+}
+
+/**
+ * The values that legitimately differ between two explain invocations of the same query on the same
+ * data: planning and trial timing, and yield bookkeeping. Everything else is expected to be
+ * reproducible, so keeping this list short and named is what gives a deep explain comparison its
+ * teeth - resist adding to it.
+ *
+ */
+const kRunVaryingExplainFields = new Set([
+    "optimizationTimeMillis",
+    "optimizationTimeMicros",
+    "executionTimeMillisEstimate",
+    "executionTimeMicros",
+    "executionTimeNanos",
+    "saveState",
+    "restoreState",
+    "needYield",
+]);
+
+/**
+ * Returns a deep copy of 'value' with every run-varying field (see 'kRunVaryingExplainFields')
+ * replaced by the placeholder string "<normalized>", so that two explain outputs for the same query
+ * can be compared for deep equality.
+ *
+ * Field *presence* is never normalized: a normalized field is still present, so a field appearing or
+ * disappearing between the two outputs still fails the comparison. Recurses through both objects and
+ * arrays; scalars pass through unchanged.
+ */
+export function normalizeRunVarying(value) {
+    if (Array.isArray(value)) {
+        return value.map(normalizeRunVarying);
+    }
+    if (typeof value === "object" && value !== null) {
+        const out = {};
+        for (const key of Object.keys(value)) {
+            out[key] = kRunVaryingExplainFields.has(key)
+                ? "<normalized>"
+                : normalizeRunVarying(value[key]);
+        }
+        return out;
+    }
+    return value;
+}
+
+/**
+ * How a candidate plan's multi-planner trial period ended.
+ *   kEof             - the plan exhausted its results before any trial bound could stop it.
+ *   kFullBatch       - the plan buffered the trial's target number of results, without hitting EOF.
+ *   kExhaustedBudget - the plan met no early-exit condition and used up the per-plan work budget.
+ *   kTrialEndedEarly - the plan met no early-exit condition, but another plan did and ended the
+ *                      trial period for everyone, so this plan was stopped short with budget left.
+ *   kFailed          - the plan's trial ended by failing recoverably (e.g. a blocking sort over its
+ *                      memory limit with disk use disallowed). Such a plan is ranked out but still
+ *                      appears among the rejected plans, with partial counters and no score.
+ */
+export const MultiPlannerStopCondition = {
+    kEof: "EOF",
+    kFullBatch: "fullBatch",
+    kExhaustedBudget: "exhaustedBudget",
+    kTrialEndedEarly: "trialEndedEarly",
+    kFailed: "failed",
+};
+
+/**
+ * Asserts that 'plan', one entry of a V3 explain's queryPlanner.plans[], ran a multi-planning trial
+ * that ended with the 'expected' condition, one of 'MultiPlannerStopCondition'. A plan that ran a
+ * trial is equivalently one carrying plan-level 'multiPlanStats'; a plan that never ran one (e.g. a
+ * CBR-rejected plan) has no stop condition to report and fails here.
+ *
+ */
+export function assertStopCondition(plan, expected) {
+    assert(Object.values(MultiPlannerStopCondition).includes(expected), "Unknown stop condition", {
+        expected,
+    });
+    assert(
+        plan.hasOwnProperty("multiPlanStats"),
+        "expected a plan that ran a multi-planning trial",
+        {plan},
+    );
+    assert.eq(plan.multiPlanStats.stopCondition, expected, {plan});
 }
 
 /**
@@ -272,6 +454,8 @@ export function normalizePlan(plan, flatten = true) {
     }
 
     // Expand this array if you find new fields which are inconsistent across different test runs.
+    // The last three are the V3 explain shape's per-node statistics grouping and plan-level
+    // fields, which carry the same run-varying content as the legacy estimate fields above.
     const ignoreFields = [
         "isCached",
         "indexVersion",
@@ -279,6 +463,9 @@ export function normalizePlan(plan, flatten = true) {
         "cardinalityEstimate",
         "costEstimate",
         "estimatesMetadata",
+        "statistics",
+        "multiPlanStats",
+        "solutionHashUnstable",
     ];
 
     // Iterates over the plan while ignoring the `ignoreFields`, to create flattened stages whenever
@@ -319,7 +506,9 @@ export function normalizePlan(plan, flatten = true) {
 export function formatQueryPlanner(queryPlanner, shouldFlatten = true) {
     let winningPlan = normalizePlan(getWinningPlanFromExplain(queryPlanner), shouldFlatten);
     let rejectedPlans =
-        queryPlanner.rejectedPlans?.map((plan) => normalizePlan(plan, shouldFlatten)) ?? [];
+        getRejectedPlansFromQueryPlanner(queryPlanner)?.map((plan) =>
+            normalizePlan(plan, shouldFlatten),
+        ) ?? [];
     return {winningPlan, rejectedPlans};
 }
 
@@ -437,7 +626,11 @@ export function formatExplainRoot(explain, shouldFlatten = true, fieldsToExclude
                     ? formatQueryPlanner(shardExplain.queryPlanner, shouldFlatten)
                     : formatExplainPipeline(shardExplain.stages);
         }
-    } else if ("queryPlanner" in explain && "shards" in explain.queryPlanner.winningPlan) {
+    } else if (
+        "queryPlanner" in explain &&
+        "winningPlan" in explain.queryPlanner &&
+        "shards" in explain.queryPlanner.winningPlan
+    ) {
         res = {...res, ...invertShards(explain.queryPlanner, shouldFlatten)};
     } else if ("queryPlanner" in explain) {
         res = {...res, ...formatQueryPlanner(explain.queryPlanner, shouldFlatten)};
@@ -563,6 +756,33 @@ export function getAllPlanStages(root) {
 }
 
 /**
+ * Given a stage of explain's JSON representation of a query plan, returns its immediate child
+ * stages, in order.
+ *
+ * Use this instead of reading '.inputStage' directly: the legacy node shape nests a single child as
+ * the 'inputStage' subdocument and multiple children as the 'inputStages' array, while the V3 node
+ * shape always uses the array. Reading '.inputStage' therefore silently yields undefined on a V3
+ * plan (queryPlanner.plans[]), even though the V3 executionStats section keeps the legacy nesting.
+ */
+export function getChildStages(node) {
+    if (node.hasOwnProperty("inputStages")) {
+        return node.inputStages;
+    }
+    return node.hasOwnProperty("inputStage") ? [node.inputStage] : [];
+}
+
+/**
+ * Given a stage of explain's JSON representation of a query plan, returns its only child stage,
+ * asserting that it has exactly one. The node-shape-independent form of reading '.inputStage'; see
+ * getChildStages().
+ */
+export function getSingleChildStage(node) {
+    const children = getChildStages(node);
+    assert.eq(children.length, 1, "expected a stage with exactly one child", {node});
+    return children[0];
+}
+
+/**
  * Given the root stage of explain's JSON representation of a query plan ('root'), returns the
  * subdocument with its stage as 'stage'. Returns null if the plan does not have such a stage.
  * Asserts that no more than one stage is a match.
@@ -588,6 +808,9 @@ export function getPlanStage(root, stage) {
  */
 export function getRejectedPlans(root) {
     if (root.hasOwnProperty("queryPlanner")) {
+        if (isV3QueryPlanner(root.queryPlanner)) {
+            return getRejectedPlansFromQueryPlanner(root.queryPlanner);
+        }
         if (root.queryPlanner.winningPlan.hasOwnProperty("shards")) {
             const rejectedPlans = [];
             for (let shard of root.queryPlanner.winningPlan.shards) {
@@ -603,7 +826,10 @@ export function getRejectedPlans(root) {
             return getRejectedPlans(root.shards[shardName]);
         }
     } else {
-        return root.stages[0]["$cursor"].queryPlanner.rejectedPlans;
+        const firstStage = root.stages[0];
+        const cursorStage = firstStage && (firstStage.$cursor || firstStage.$geoNearCursor);
+        assert(cursorStage, "expected a leading cursor stage", {root});
+        return getRejectedPlans(cursorStage);
     }
 }
 
@@ -613,6 +839,10 @@ export function getRejectedPlans(root) {
  */
 export function hasRejectedPlans(root) {
     function sectionHasRejectedPlans(explainSection) {
+        if (isV3QueryPlanner(explainSection)) {
+            // The V3 "plans" array holds the winner first, then the rejected plans.
+            return explainSection.plans.length > 1;
+        }
         assert(explainSection.hasOwnProperty("rejectedPlans"), tojson(explainSection));
         return explainSection.rejectedPlans.length !== 0;
     }
@@ -641,6 +871,9 @@ export function hasRejectedPlans(root) {
     } else {
         // This is some sort of query explain.
         assert(root.hasOwnProperty("queryPlanner"), tojson(root));
+        if (isV3QueryPlanner(root.queryPlanner)) {
+            return sectionHasRejectedPlans(root.queryPlanner);
+        }
         assert(root.queryPlanner.hasOwnProperty("winningPlan"), tojson(root));
         if (!root.queryPlanner.winningPlan.hasOwnProperty("shards")) {
             // This is an unsharded explain.
@@ -691,6 +924,15 @@ export function getExecutionStages(root) {
 export function getExecutionStats(root) {
     if (root.hasOwnProperty("shards")) {
         return Object.values(root.shards).map((shardExplain) => shardExplain.executionStats);
+    }
+    // If the root does not have executionStats but has stages, it is likely a classic pipeline
+    // with a leading cursor stage.
+    if (!root.hasOwnProperty("executionStats") && Array.isArray(root.stages)) {
+        const firstStage = root.stages[0];
+        const cursorStage = firstStage && (firstStage.$cursor || firstStage.$geoNearCursor);
+        assert(cursorStage, root);
+        assert(cursorStage.hasOwnProperty("executionStats"), root);
+        return [cursorStage.executionStats];
     }
     assert(root.hasOwnProperty("executionStats"), root);
     if (
@@ -851,8 +1093,15 @@ export function getAggPlanStages(root, stage, useQueryPlannerSection = false) {
     function getStagesFromQueryLayerOutput(queryLayerOutput) {
         let results = [];
 
-        assert(queryLayerOutput.hasOwnProperty("queryPlanner"));
-        assert(queryLayerOutput.queryPlanner.hasOwnProperty("winningPlan"));
+        assert(queryLayerOutput.hasOwnProperty("queryPlanner"), "missing queryPlanner section", {
+            queryLayerOutput,
+        });
+        const queryPlanner = queryLayerOutput.queryPlanner;
+        assert(
+            isV3QueryPlanner(queryPlanner) || queryPlanner.hasOwnProperty("winningPlan"),
+            "missing plans or winningPlan",
+            {queryLayerOutput},
+        );
 
         // If execution stats are available, then use the execution stats tree. Otherwise use the
         // plan info from the "queryPlanner" section.
@@ -862,9 +1111,7 @@ export function getAggPlanStages(root, stage, useQueryPlannerSection = false) {
                 getPlanStages(queryLayerOutput.executionStats.executionStages, stage),
             );
         } else {
-            results = results.concat(
-                getPlanStages(getWinningPlanFromExplain(queryLayerOutput.queryPlanner), stage),
-            );
+            results = results.concat(getPlanStages(getWinningPlanFromExplain(queryPlanner), stage));
         }
 
         return results;
@@ -1612,6 +1859,10 @@ export function canonicalizePlan(p) {
     delete p.cardinalityEstimate;
     delete p.costEstimate;
     delete p.estimatesMetadata;
+    // The V3 explain shape's per-node statistics grouping and plan-level fields.
+    delete p.statistics;
+    delete p.multiPlanStats;
+    delete p.solutionHashUnstable;
     if (p.hasOwnProperty("inputStage")) {
         canonicalizePlan(p.inputStage);
     } else if (p.hasOwnProperty("inputStages")) {

@@ -114,8 +114,6 @@ mongo_cc_library(
         # CollectionRouter, CollectionRoutingInfo, CatalogCache::getCollectionRoutingInfo.
         "//src/mongo/s:grid",
         "//src/mongo/s:sharding_router_api",
-        # getTargetedShardsForQuery.
-        "//src/mongo/s/query:shard_targeting_helpers",
     ],
 )
 
@@ -156,6 +154,19 @@ mongo_cc_library(
         ":sharded_cluster_local_lookup_eligibility",
         # ShardingState::get / shardId() ship in shard_role_api (topology/sharding_state.cpp).
         "//src/mongo/db:shard_role_api",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "local_lookup_eligibility_factory_impl_test",
+    srcs = [
+        "local_lookup_eligibility_factory_impl_test.cpp",
+    ],
+    tags = ["mongo_unittest_eighth_group"],
+    deps = [
+        ":local_lookup_eligibility_factory",
+        "//src/mongo/db/sharding_environment:shard_server_test_fixture",
+        "//src/mongo/transport:transport_layer_mock",
     ],
 )
 
@@ -251,13 +262,13 @@ mongo_cc_library(
         "//src/mongo/db/query:collection_query_info",
         # PlanYieldPolicySBE.
         "//src/mongo/db/query:plan_yield_policy_sbe",
-        # IndexBoundsBuilder::isDirectlyEncodableEqualityType.
-        "//src/mongo/db/query/compiler/optimizer/index_bounds_builder",
         # QueryPlanner::plan + QueryPlannerParams.
         "//src/mongo/db/query:query_planner",
         # QueryPlannerParams::fillOutMainCollectionPlannerParams / requiresShardFiltering.
         "//src/mongo/db/query:query_planner_params",
-        # parameterizeMatchExpression.
+        # validIdField.
+        "//src/mongo/db/query/util:validate_id",
+        # isEligibleForComparisonAutoParameterization.
         "//src/mongo/db/query/compiler/rewrites/matcher:matcher_rewrites",
         # buildSlotBasedExecutableTree, prepareSlotBasedExecutableTree, makeKeyStringPair,
         # PlanStageData, ParameterizedIndexScanSlots.
@@ -296,6 +307,7 @@ mongo_cc_library(
         ":single_document_lookup_executor",
         ":single_document_lookup_stats",
         "//src/mongo/db/pipeline/process_interface:mongo_process_interface",
+        "//src/mongo/s/commands:document_shard_key_query_conversion",
     ],
 )
 

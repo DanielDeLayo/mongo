@@ -3,10 +3,6 @@
 
 #pragma once
 
-#include "mongo/util/modules.h"
-
-#include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
 #include "mongo/base/status.h"
 #include "mongo/db/exec/classic/plan_stage.h"
 #include "mongo/db/exec/classic/working_set.h"
@@ -15,12 +11,16 @@
 #include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
 #include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
 #include "mongo/db/query/query_knobs/query_knob_configuration.h"
+#include "mongo/util/modules.h"
 
 #include <algorithm>
 #include <cstddef>
 #include <deque>
 #include <memory>
 #include <string>
+
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
@@ -185,6 +185,22 @@ struct BaseCandidatePlan {
     // Indicates whether this candidate plan has completed the trial run early by achieving one
     // of the trial run metrics.
     bool exitedEarly{false};
+    // How this candidate's trial period ended, set once the candidate has run a trial. Refines
+    // 'exitedEarly', which only says whether the candidate met some early-exit condition and not
+    // which one; 'exitedEarly == false' corresponds to kExhaustedBudget or kTrialEndedEarly,
+    // depending on whether this candidate ran out of budget or a sibling ended the trial first.
+    // Remains boost::none for a candidate that never ran a trial (e.g. one constructed directly
+    // from a cached plan).
+    //
+    // TODO SERVER-134444: deduplicate with 'exitedEarly'. In the classic path the two are already
+    // equivalent once the trial is over ('exitedEarly' iff the condition is kEof or kFullBatch),
+    // but 'exitedEarly' cannot be dropped yet: the SBE trial executor sets only that flag - its
+    // sole functional reader being the SBE cached-plan replan decision - and its early exits do not
+    // decompose into these three conditions (the TrialRunTracker metrics and the stash size limit
+    // have no classic counterpart). Extending V3 explain to SBE forces those stop conditions to be
+    // named, at which point 'exitedEarly' becomes derivable from this field everywhere and should
+    // be removed.
+    boost::optional<MultiPlannerStopCondition> stopCondition;
     // If the candidate plan has failed in a recoverable fashion during the trial run, contains a
     // non-OK status.
     Status status{Status::OK()};
@@ -194,6 +210,14 @@ struct BaseCandidatePlan {
     bool fromPlanCache{false};
     // Any results produced during the plan's execution prior to scoring are retained here.
     std::deque<ResultType> results;
+    // The plan's final ranking score - the trial score (QuerySolution::score) plus any
+    // tie-breaking heuristics bonuses - set by pickBestPlan() when it ranks the candidates.
+    // Sorting by it descending reproduces PlanRankingDecision::candidateOrder. Kept separate from
+    // QuerySolution::score, which explain displays: the bonuses participate in the ranking but are
+    // not part of the displayed trial score.
+    // TODO SERVER-131545 Refactor QuerySolution::score into BaseCandidatePlan and unify it with
+    // this field as one per-candidate scores record.
+    boost::optional<double> adjustedScore;
 };
 
 using CandidatePlan = BaseCandidatePlan<PlanStage*, WorkingSetID, WorkingSet*>;

@@ -5,6 +5,7 @@
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/modules.h"
 
 #include <string_view>
@@ -51,7 +52,6 @@ public:
     Status dropIdent(RecoveryUnit& ru,
                      std::string_view ident,
                      bool identHasSizeInfo,
-                     const StorageEngine::DropIdentCallback& onDrop,
                      boost::optional<uint64_t> schemaEpoch,
                      bool waitForLocks) override;
 
@@ -160,6 +160,13 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    boost::optional<uint64_t> getStableSchemaEpoch() override {
+        MONGO_UNREACHABLE;
+    }
+    void setStableSchemaEpoch(uint64_t schemaEpoch) override {
+        MONGO_UNREACHABLE;
+    }
+
     BSONObj setFlagToStorageOptions(const BSONObj& storageEngineOptions,
                                     std::string_view flagName,
                                     boost::optional<bool> flagValue) const override {
@@ -202,7 +209,7 @@ public:
     }
 
     void publishIdent(WiredTigerRecoveryUnit& ru,
-                      std::string_view ident,
+                      const std::string& uri,
                       uint64_t schemaEpoch) override {
         MONGO_UNREACHABLE;
     }

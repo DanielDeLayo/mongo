@@ -516,6 +516,11 @@ __session_config_int(WT_SESSION_IMPL *session, WT_CONF *conf)
             F_SET(session, WT_SESSION_IGNORE_CACHE_SIZE);
         else
             F_CLR(session, WT_SESSION_IGNORE_CACHE_SIZE);
+        /*
+         * The session now owns this flag, so drop any ownership a running transaction recorded in
+         * txn config; it must no longer undo the setting when it is released.
+         */
+        F_CLR(session->txn, WT_TXN_IGNORE_CACHE_SIZE);
     }
     WT_RET_NOTFOUND_OK(ret);
 
@@ -554,14 +559,8 @@ __session_config_int(WT_SESSION_IMPL *session, WT_CONF *conf)
     }
     WT_RET_NOTFOUND_OK(ret);
 
-    if ((ret = __wt_conf_getones(session, conf, cache_max_wait_ms, &cval)) == 0) {
-        if (cval.val > 1)
-            session->cache_max_wait_us = (uint64_t)(cval.val * WT_THOUSAND);
-        else if (cval.val == 1)
-            session->cache_max_wait_us = 1;
-        else
-            session->cache_max_wait_us = 0;
-    }
+    if ((ret = __wt_conf_getones(session, conf, cache_max_wait_ms, &cval)) == 0)
+        session->cache_max_wait_us = cval.val > 0 ? (uint64_t)(cval.val * WT_THOUSAND) : 0;
     WT_RET_NOTFOUND_OK(ret);
 
     return (0);
@@ -654,8 +653,6 @@ __session_open_cursor_int(WT_SESSION_IMPL *session, const char *uri, WT_CURSOR *
     case 't':
         if (WT_PREFIX_MATCH(uri, "table:"))
             WT_RET(__wt_curtable_open(session, uri, owner, cfg, cursorp));
-        if (WT_PREFIX_MATCH(uri, "tiered:"))
-            WT_RET(__wt_curfile_open(session, uri, owner, cfg, cursorp));
         break;
     case 'c':
         if (WT_PREFIX_MATCH(uri, "colgroup:")) {
@@ -893,7 +890,7 @@ __session_open_cursor(WT_SESSION *wt_session, const char *uri, WT_CURSOR *to_dup
         if (!WT_PREFIX_MATCH(uri, "backup:") && !WT_PREFIX_MATCH(uri, "colgroup:") &&
           !WT_PREFIX_MATCH(uri, "index:") && !WT_PREFIX_MATCH(uri, "file:") &&
           !WT_PREFIX_MATCH(uri, WT_METADATA_URI) && !WT_PREFIX_MATCH(uri, "table:") &&
-          !WT_PREFIX_MATCH(uri, "tiered:") && __wt_schema_get_source(session, uri) == NULL)
+          __wt_schema_get_source(session, uri) == NULL)
             WT_ERR(__wt_bad_object_type(session, uri));
     }
 
@@ -1913,6 +1910,8 @@ err:
     WT_TRET(__wt_call_log_begin_transaction(session, config, ret));
 #endif
     API_CONF_END(session, conf);
+    WT_ASSERT_ALWAYS(
+      session, ret != WT_ROLLBACK, "Transaction begin cannot return a rollback error");
     API_END_RET(session, ret);
 }
 
@@ -1962,6 +1961,34 @@ __session_commit_transaction(WT_SESSION *wt_session, const char *config)
     if (F_ISSET(txn, WT_TXN_ERROR) && txn->mod_count != 0)
         WT_ERR_MSG(session, EINVAL, "failed %s transaction requires rollback",
           F_ISSET(txn, WT_TXN_PREPARE) ? "prepared " : "");
+
+    /*
+     * The step-down rollback below cannot apply to a prepared transaction: failing a prepared
+     * commit fails the system. Catch a transaction that prepared before the timestamp was set with
+     * a clear message instead.
+     *
+     * FIXME-WT-18723: remove this bypass once prepared transactions are supported across a
+     * step-down.
+     */
+    if (!FLD_ISSET(S2C(session)->debug.flags, WT_CONN_DEBUG_DISAGG_STEPDOWN_PREPARE))
+        WT_ASSERT_ALWAYS(session,
+          !F_ISSET(txn, WT_TXN_PREPARE) ||
+            __wt_atomic_load_uint64_relaxed(&S2C(session)->txn_global.step_down_timestamp) ==
+              WT_TS_NONE,
+          "prepared transactions are not supported while the step-down timestamp is set");
+
+    /*
+     * The straddler checks at cursor operations are only an optimization to roll back early: they
+     * read the step-down timestamp without taking the step-down lock and may miss it even when it
+     * is set. This check is the guarantee: under the step-down lock it always observes a set
+     * timestamp, so no straddler commits after the timestamp is in place.
+     */
+    if (txn->mod_count != 0 && !txn->stepdown_ts_set && __wt_conn_is_disagg(session)) {
+        __wt_readlock(session, &S2C(session)->txn_global.step_down_lock);
+        ret = __wt_txn_stepdown_straddler_check(session, true);
+        __wt_readunlock(session, &S2C(session)->txn_global.step_down_lock);
+        WT_ERR(ret);
+    }
 
 err:
     /*
@@ -2465,7 +2492,8 @@ __session_checkpoint(WT_SESSION *wt_session, const char *config)
     WT_ERR(__wt_inmem_unsupported_op(session, NULL));
 
     /* Skip running checkpoint for standby. */
-    if (__wt_conn_is_disagg(session) && !S2C(session)->layered_table_manager.leader)
+    if (__wt_conn_is_disagg(session) &&
+      !__wt_atomic_load_bool_relaxed(&S2C(session)->layered_table_manager.leader))
         goto done;
 
     /*

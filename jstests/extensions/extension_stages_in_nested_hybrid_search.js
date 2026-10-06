@@ -9,9 +9,6 @@
  *
  * @tags: [
  *   featureFlagExtensionsAPI,
- *   featureFlagRankFusionFull,
- *   featureFlagSearchHybridScoringFull,
- *   featureFlagVectorSimilarityExpressions,
  *   requires_fcv_90,
  * ]
  */

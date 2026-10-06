@@ -105,6 +105,13 @@ void replaceQueryMetaFieldName(mutablebson::Element elem,
     // Replace any occurences of the metaField in the top-level required fields of the JSON Schema
     // object with "meta".
     if (fieldName == "$jsonSchema") {
+        // Mirror the error thrown by the $jsonSchema match expression parser for a non-object
+        // argument. Without this check, the calls to findFirstChildNamed() below would trip an
+        // invariant for non-object (e.g. array) values.
+        uassert(ErrorCodes::TypeMismatch,
+                "$jsonSchema must be an object",
+                elem.isType(BSONType::object));
+
         mutablebson::Element requiredElem = elem.findFirstChildNamed("required");
         if (requiredElem.ok()) {
             for (auto subElem = requiredElem.leftChild(); subElem.ok();
@@ -144,8 +151,6 @@ void replaceQueryMetaFieldName(mutablebson::Element elem,
 }  // namespace
 
 BSONObj translateQuery(const BSONObj& query, std::string_view metaField) {
-    invariant(!metaField.empty());
-
     mutablebson::Document queryDoc(query);
     for (auto queryElem = queryDoc.root().leftChild(); queryElem.ok();
          queryElem = queryElem.rightSibling()) {
@@ -295,13 +300,17 @@ BSONObj getBucketLevelPredicateForRouting(const BSONObj& originalQuery,
         : std::unique_ptr<MatchExpression>{};
 
     // Translate the time field predicate into a predicate on the bucket-level time field.
+    // The router has no visibility into shard-local bucket data, so we must conservatively
+    // assume extended-range data may be present to avoid an unsafe optimization.
+    BucketSpec routingBucketSpec{
+        std::string{tsOptions.getTimeField()},
+        metaField.map([](std::string_view s) { return std::string{s}; }),
+    };
+    routingBucketSpec.setUsesExtendedRange(true);
     std::unique_ptr<MatchExpression> timeBucketPred = timeOnlyPred
         ? BucketSpec::createPredicatesOnBucketLevelField(
               timeOnlyPred.get(),
-              BucketSpec{
-                  std::string{tsOptions.getTimeField()},
-                  metaField.map([](std::string_view s) { return std::string{s}; }),
-              },
+              routingBucketSpec,
               *tsOptions.getBucketMaxSpanSeconds(),
               expCtx,
               false /*haveComputedMetaField*/,
@@ -330,7 +339,8 @@ TimeseriesWritesQueryExprs getMatchExprsForWrites(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const TimeseriesOptions& tsOptions,
     const BSONObj& writeQuery) {
-    const bool fixedBuckets = canUseFixedBucketOptimizations(tsOptions);
+    const bool fixedBuckets = canUseFixedBucketOptimizations(
+        tsOptions, expCtx->getRequiresTimeseriesExtendedRangeSupport());
     auto [metaOnlyExpr, bucketMetricExpr, residualExpr] =
         BucketSpec::getPushdownPredicates(expCtx,
                                           tsOptions,

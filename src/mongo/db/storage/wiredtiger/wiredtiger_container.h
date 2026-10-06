@@ -37,7 +37,7 @@ class WiredTigerIntegerKeyedContainer : public WiredTigerContainer,
 public:
     class Cursor : public IntegerKeyedContainerBase::Cursor {
     public:
-        Cursor(RecoveryUnit& ru, uint64_t tableId, std::string_view uri);
+        Cursor(RecoveryUnit& ru, uint64_t tableId, const std::string& uri);
 
         boost::optional<std::span<const char>> find(int64_t key) final;
 
@@ -55,6 +55,10 @@ public:
     Status insert(RecoveryUnit& ru,
                   int64_t key,
                   std::span<const char> value,
+                  container::ExistingKeyPolicy policy) final;
+    Status insert(RecoveryUnit& ru,
+                  std::span<const int64_t> keys,
+                  std::span<const std::span<const char>> values,
                   container::ExistingKeyPolicy policy) final;
 
     int insert(WiredTigerRecoveryUnit& ru,
@@ -80,7 +84,7 @@ class WiredTigerStringKeyedContainer : public WiredTigerContainer, public String
 public:
     class Cursor : public StringKeyedContainerBase::Cursor {
     public:
-        Cursor(RecoveryUnit& ru, uint64_t tableId, std::string_view uri);
+        Cursor(RecoveryUnit& ru, uint64_t tableId, const std::string& uri);
 
         boost::optional<std::span<const char>> find(std::span<const char> key) final;
 
@@ -96,6 +100,10 @@ public:
     Status insert(RecoveryUnit& ru,
                   std::span<const char> key,
                   std::span<const char> value,
+                  container::ExistingKeyPolicy policy) final;
+    Status insert(RecoveryUnit& ru,
+                  std::span<const std::span<const char>> keys,
+                  std::span<const std::span<const char>> values,
                   container::ExistingKeyPolicy policy) final;
 
     int insert(WiredTigerRecoveryUnit& ru,

@@ -3,6 +3,7 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/sbe/values/bson.h"
+#include "mongo/db/exec/sbe/values/value_size.h"
 #include "mongo/db/exec/sbe/vm/vm.h"
 
 #include <string_view>
@@ -31,7 +32,7 @@ value::TagValueMaybeOwned ByteCode::builtinDropFields(ArityType arity) {
         restrictFieldsSet.emplace(value::getStringView(field.tag, field.value));
     }
 
-    value::TagValueOwned result{value::makeNewObject()};
+    value::TagValueOwned result = value::TagValueOwned::fromRaw(value::makeNewObject());
     auto obj = value::getObjectView(result.value());
 
     if (inObj.tag == value::TypeTags::bsonObject) {
@@ -40,7 +41,7 @@ value::TagValueMaybeOwned ByteCode::builtinDropFields(ArityType arity) {
         // Skip document length.
         be += 4;
         while (be != end - 1) {
-            auto sv = bson::fieldNameAndLength(be);
+            auto sv = bson::fieldNameAndLength(be, end);
 
             if (restrictFieldsSet.count(sv) == 0) {
                 auto [tag, val] = bson::convertToOwned(be, end, sv.size()).releaseToRaw();
@@ -86,7 +87,7 @@ value::TagValueMaybeOwned ByteCode::builtinKeepFields(ArityType arity) {
         keepFieldsSet.emplace(value::getStringView(field.tag, field.value));
     }
 
-    value::TagValueOwned result{value::makeNewObject()};
+    value::TagValueOwned result = value::TagValueOwned::fromRaw(value::makeNewObject());
     auto obj = value::getObjectView(result.value());
 
     if (inObj.tag == value::TypeTags::bsonObject) {
@@ -95,7 +96,7 @@ value::TagValueMaybeOwned ByteCode::builtinKeepFields(ArityType arity) {
         // Skip document length.
         be += 4;
         while (be != end - 1) {
-            auto sv = bson::fieldNameAndLength(be);
+            auto sv = bson::fieldNameAndLength(be, end);
 
             if (keepFieldsSet.count(sv) == 1) {
                 auto [tag, val] = bson::convertToView(be, end, sv.size());
@@ -122,41 +123,37 @@ value::TagValueMaybeOwned ByteCode::builtinKeepFields(ArityType arity) {
 }
 
 value::TagValueMaybeOwned ByteCode::builtinNewObj(ArityType arity) {
-    std::vector<value::TypeTags> typeTags;
-    std::vector<value::Value> values;
-    std::vector<std::string> names;
-
-    size_t tmpVectorLen = arity >> 1;
-    typeTags.reserve(tmpVectorLen);
-    values.reserve(tmpVectorLen);
-    names.reserve(tmpVectorLen);
-
-    for (ArityType idx = 0; idx < arity; idx += 2) {
-        {
-            auto nameView = viewFromStack(idx);
-
-            if (!value::isString(nameView.tag)) {
-                return value::TagValueMaybeOwned::nothing();
-            }
-
-            names.emplace_back(value::getStringView(nameView.tag, nameView.value));
-        }
-        {
-            auto fieldView = viewFromStack(idx + 1);
-            typeTags.push_back(fieldView.tag);
-            values.push_back(fieldView.value);
-        }
+    // Build the object directly from the stack in a single pass.
+    value::TagValueOwned result = value::TagValueOwned::fromRaw(value::makeNewObject());
+    auto obj = value::getObjectView(result.value());
+    if (arity > 0) {
+        // 'Object::reserve()' normalizes its argument to at least 1, so calling it for an empty
+        // object would allocate rather than leave the object's vectors empty.
+        obj->reserve(arity / 2);
     }
 
-    value::TagValueOwned result{value::makeNewObject()};
-    auto obj = value::getObjectView(result.value());
+    size_t currentMemoryBytes = 0;
+    const size_t maxMemoryBytes = internalQueryMaxSingleExpressionMemoryUsageBytes.loadRelaxed();
 
-    if (typeTags.size()) {
-        obj->reserve(typeTags.size());
-        for (size_t idx = 0; idx < typeTags.size(); ++idx) {
-            auto [tagCopy, valCopy] = value::copyValue(typeTags[idx], values[idx]);
-            obj->push_back_raw(names[idx], tagCopy, valCopy);
+    for (ArityType idx = 0; idx < arity; idx += 2) {
+        auto nameView = viewFromStack(idx);
+
+        if (!value::isString(nameView.tag)) {
+            return value::TagValueMaybeOwned::nothing();
         }
+
+        auto name = value::getStringView(nameView.tag, nameView.value);
+        auto fieldView = viewFromStack(idx + 1);
+        currentMemoryBytes +=
+            name.size() + value::getApproximateSize(fieldView.tag, fieldView.value);
+        if (MONGO_unlikely(currentMemoryBytes > maxMemoryBytes)) {
+            uasserted(ErrorCodes::ExceededMemoryLimit,
+                      str::stream() << "$object would use too much memory (" << currentMemoryBytes
+                                    << " bytes) and cannot spill to disk. Memory limit: "
+                                    << maxMemoryBytes << " bytes");
+        }
+        obj->push_back(
+            name, value::TagValueOwned::fromRaw(value::copyValue(fieldView.tag, fieldView.value)));
     }
 
     return std::move(result);
@@ -181,31 +178,15 @@ value::TagValueMaybeOwned ByteCode::builtinNewBsonObj(ArityType arity) {
     return {true, value::TypeTags::bsonObject, value::bitcastFrom<char*>(data)};
 }
 
-value::TagValueMaybeOwned ByteCode::builtinMergeObjects(ArityType arity) {
-    auto fieldView = viewFromStack(1);
-    // Move the incoming accumulator state from the stack. Given that we are now the owner of the
-    // state we are free to do any in-place update as we see fit.
-    value::TagValueOwned aggState{moveRawOwnedFromStack(0)};
-    // Create a new object if it does not exist yet.
-    if (aggState.tag() == value::TypeTags::Nothing) {
-        aggState = value::TagValueOwned{value::makeNewObject()};
-    }
-
-    tassert(
-        11086807, "Unexpected type of Agg parameter", aggState.tag() == value::TypeTags::Object);
-
-    // If our field is nothing or null or it's not an object, return the accumulator state.
-    if (fieldView.tag == value::TypeTags::Nothing || fieldView.tag == value::TypeTags::Null ||
-        (fieldView.tag != value::TypeTags::Object &&
-         fieldView.tag != value::TypeTags::bsonObject)) {
-        return std::move(aggState);
-    }
-
-    auto obj = value::getObjectView(aggState.value());
-
+namespace {
+/**
+ * Merges the fields of the object 'field' into 'obj'. Fields already present in 'obj' are
+ * overwritten in place, preserving their original position, while new fields are appended in the
+ * order they appear in 'field'.
+ */
+void mergeObjectInto(value::Object* obj, value::TagValueView field) {
     StringMap<value::TagValueView> currObjMap;
-    for (auto currObjEnum = value::ObjectEnumerator{fieldView.tag, fieldView.value};
-         !currObjEnum.atEnd();
+    for (auto currObjEnum = value::ObjectEnumerator{field.tag, field.value}; !currObjEnum.atEnd();
          currObjEnum.advance()) {
         currObjMap[currObjEnum.getFieldName()] = currObjEnum.getViewOfValue();
     }
@@ -227,8 +208,7 @@ value::TagValueMaybeOwned ByteCode::builtinMergeObjects(ArityType arity) {
     // Copy the remaining fields of the current object being processed to the
     // accumulator. Fields that were already present in the accumulated fields
     // have been set already. Preserves the relative order of the new fields
-    for (auto currObjEnum = value::ObjectEnumerator{fieldView.tag, fieldView.value};
-         !currObjEnum.atEnd();
+    for (auto currObjEnum = value::ObjectEnumerator{field.tag, field.value}; !currObjEnum.atEnd();
          currObjEnum.advance()) {
         auto it = currObjMap.find(currObjEnum.getFieldName());
         if (it != currObjMap.end()) {
@@ -237,8 +217,55 @@ value::TagValueMaybeOwned ByteCode::builtinMergeObjects(ArityType arity) {
             obj->push_back_raw(currObjEnum.getFieldName(), currObjTagCopy, currObjValCopy);
         }
     }
+}
+}  // namespace
+
+value::TagValueMaybeOwned ByteCode::builtinMergeObjects(ArityType arity) {
+    auto fieldView = viewFromStack(1);
+    // Move the incoming accumulator state from the stack. Given that we are now the owner of the
+    // state we are free to do any in-place update as we see fit.
+    value::TagValueOwned aggState = moveOwnedFromStack(0);
+    // Create a new object if it does not exist yet.
+    if (aggState.tag() == value::TypeTags::Nothing) {
+        aggState = value::TagValueOwned::fromRaw(value::makeNewObject());
+    }
+
+    tassert(
+        11086807, "Unexpected type of Agg parameter", aggState.tag() == value::TypeTags::Object);
+
+    // If our field is nothing or null or it's not an object, return the accumulator state.
+    if (fieldView.tag == value::TypeTags::Nothing || fieldView.tag == value::TypeTags::Null ||
+        (fieldView.tag != value::TypeTags::Object &&
+         fieldView.tag != value::TypeTags::bsonObject)) {
+        return std::move(aggState);
+    }
+
+    mergeObjectInto(value::getObjectView(aggState.value()), fieldView);
 
     return std::move(aggState);
+}
+
+value::TagValueMaybeOwned ByteCode::builtinMergeObjectsForExpr(ArityType arity) {
+    value::TagValueOwned result = value::TagValueOwned::fromRaw(value::makeNewObject());
+    auto obj = value::getObjectView(result.value());
+
+    auto processOne = [&](value::TypeTags tag, value::Value val) {
+        // Mirror classic AccumulatorMergeObjects::processInternal: nullish inputs are ignored and
+        // anything else that is not an object is an error.
+        if (value::isNullish(tag)) {
+            return;
+        }
+        uassert(5158600,
+                str::stream() << "$mergeObjects requires object inputs, but input "
+                              << std::make_pair(tag, val) << " is of type " << tag,
+                value::isObject(tag));
+
+        mergeObjectInto(obj, value::TagValueView{tag, val});
+    };
+
+    processStackRange(0, arity, processOne);
+
+    return std::move(result);
 }
 
 value::TagValueMaybeOwned ByteCode::builtinBsonSize(ArityType arity) {
@@ -266,21 +293,22 @@ value::TagValueMaybeOwned ByteCode::builtinObjectToArray(ArityType arity) {
         return value::TagValueMaybeOwned::nothing();
     }
 
-    value::TagValueOwned arr{value::makeNewArray()};
+    value::TagValueOwned arr = value::TagValueOwned::fromRaw(value::makeNewArray());
     auto array = value::getArrayView(arr.value());
 
     value::ObjectEnumerator objectEnumerator(obj.tag, obj.value);
     while (!objectEnumerator.atEnd()) {
         // get key
         auto fieldName = objectEnumerator.getFieldName();
-        value::TagValueOwned key{value::makeNewString(fieldName)};
+        value::TagValueOwned key = value::TagValueOwned::fromRaw(value::makeNewString(fieldName));
 
         // get value
         auto [valueTag, valueVal] = objectEnumerator.getViewOfValue();
-        value::TagValueOwned valueCopy{value::copyValue(valueTag, valueVal)};
+        value::TagValueOwned valueCopy =
+            value::TagValueOwned::fromRaw(value::copyValue(valueTag, valueVal));
 
-        // create a new obejct
-        value::TagValueOwned elem{value::makeNewObject()};
+        // create a new object
+        value::TagValueOwned elem = value::TagValueOwned::fromRaw(value::makeNewObject());
         auto elemObj = value::getObjectView(elem.value());
 
         // insert key and value to the object

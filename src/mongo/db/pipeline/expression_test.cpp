@@ -1,8 +1,8 @@
 // Copyright (c) MongoDB, Inc.
 // SPDX-License-Identifier: SSPL-1.0
 
-#include <boost/smart_ptr/intrusive_ptr.hpp>
-// IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
+#include "mongo/db/pipeline/expression.h"
+
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
@@ -17,7 +17,6 @@
 #include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/accumulator_multi.h"
-#include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/compiler/dependency_analysis/expression_dependencies.h"
 #include "mongo/db/query/query_shape/serialization_options.h"
@@ -37,6 +36,9 @@
 #include <cmath>
 #include <limits>
 #include <string_view>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+// IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
 
 using namespace std::literals::string_view_literals;
 
@@ -2838,6 +2840,17 @@ TEST(ExpressionReplaceAllTest, RegExCorrectSerializationTest) {
         "{$replaceAll: {input: {$const: \"?\"}, find: {$const: //?//}, replacement: {$const: "
         "\"?\"}}}",
         serializedStr);
+}
+
+TEST(ExpressionDeserializeEJSONTest, EmptyFieldNameInInputDocument) {
+    auto expCtx = ExpressionContextForTest{};
+
+    // User MQL can supply an object whose field name is the empty string via $literal.
+    auto exprBSON = fromjson(R"({$deserializeEJSON: {input: {$literal: {"": 1}}}})");
+    auto expr = Expression::parseExpression(&expCtx, exprBSON, expCtx.variablesParseState);
+
+    auto result = expr->evaluate(Document{}, &expCtx.variables);
+    ASSERT_VALUE_EQ(result, Value(BSON("" << 1)));
 }
 
 }  // namespace ExpressionTests

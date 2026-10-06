@@ -37,8 +37,14 @@ export function concreteQueryFromFamily(queryShape, leafId) {
     return queryShape;
 }
 
-function createColl(db, coll, isTS, metaField) {
-    const args = isTS ? {timeseries: {timeField: "t", metaField}} : {};
+function createColl(db, coll, isClustered, isTS, metaField) {
+    assert(!(isTS && isClustered), "isTS and isClustered cannot both be true", {isTS, isClustered});
+    const args = {};
+    if (isTS) {
+        args.timeseries = {timeField: "t", metaField};
+    } else if (isClustered) {
+        args.clusteredIndex = {key: {_id: 1}, unique: true};
+    }
     assert.commandWorked(db.createCollection(coll.getName(), args));
 }
 
@@ -103,9 +109,16 @@ function runProperty(propertyFn, namespaces, workload, sortArrays) {
     let {collSpec, foreignCollSpec, queries, extraParams} = workload;
     const {controlColl, experimentColl, foreignControlColl, foreignExperimentColl} = namespaces;
 
-    function setUpCollection({collection, docs, isTS = false, metaField = "m", indexes = []}) {
+    function setUpCollection({
+        collection,
+        docs,
+        isClustered = false,
+        isTS = false,
+        metaField = "m",
+        indexes = [],
+    }) {
         assertDropCollection(collection.getDB(), collection.getName());
-        createColl(collection.getDB(), collection, isTS, metaField);
+        createColl(collection.getDB(), collection, isClustered, isTS, metaField);
         assert.commandWorked(collection.insert(docs));
         createIndexesForPBT(collection, indexes);
     }
@@ -115,6 +128,7 @@ function runProperty(propertyFn, namespaces, workload, sortArrays) {
     setUpCollection({
         collection: experimentColl,
         docs: collSpec.docs,
+        isClustered: TestData.pbtClusteredExperimentColl,
         isTS: collSpec.isTS,
         metaField: collSpec.metaField,
         indexes: collSpec.indexes,
@@ -132,6 +146,7 @@ function runProperty(propertyFn, namespaces, workload, sortArrays) {
         setUpCollection({
             collection: foreignExperimentColl,
             docs: foreignCollSpec.docs,
+            isClustered: TestData.pbtClusteredExperimentColl,
             isTS: foreignCollSpec.isTS,
             metaField: foreignCollSpec.metaField,
             indexes: foreignCollSpec.indexes,
@@ -310,6 +325,7 @@ function unoptimize(q) {
  * - execution framework set to classic engine
  * - plan cache disabled
  * - pipeline optimizations disabled
+ * - boolean expressions simplifier disabled
  * Returns a map from the position of the query in the list to the result documents.
  */
 export function runDeoptimized(controlColl, queries) {
@@ -323,17 +339,17 @@ export function runDeoptimized(controlColl, queries) {
             getParameter: 1,
             internalQueryFrameworkControl: 1,
             internalQueryDisablePlanCache: 1,
+            internalQueryEnableBooleanExpressionsSimplifier: 1,
         }),
     );
-
     assert.commandWorked(
         db.adminCommand({
             setParameter: 1,
             internalQueryFrameworkControl: "forceClassicEngine",
             internalQueryDisablePlanCache: true,
+            internalQueryEnableBooleanExpressionsSimplifier: false,
         }),
     );
-
     try {
         return queries.map((query) => {
             assert(Array.isArray(query.pipeline) && typeof query.options === "object");
@@ -348,6 +364,8 @@ export function runDeoptimized(controlColl, queries) {
                 setParameter: 1,
                 internalQueryFrameworkControl: priorSettings.internalQueryFrameworkControl,
                 internalQueryDisablePlanCache: priorSettings.internalQueryDisablePlanCache,
+                internalQueryEnableBooleanExpressionsSimplifier:
+                    priorSettings.internalQueryEnableBooleanExpressionsSimplifier,
             }),
         );
     }

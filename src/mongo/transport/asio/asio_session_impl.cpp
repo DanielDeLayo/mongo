@@ -9,12 +9,10 @@
 #include "mongo/config.h"
 #include "mongo/db/auth/auth_options_gen.h"
 #include "mongo/db/commands/server_status/server_status_metric.h"
-#include "mongo/db/connection_health_metrics_parameter_gen.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_severity_suppressor.h"
-#include "mongo/otel/metrics/metrics_histogram.h"
-#include "mongo/otel/metrics/metrics_service.h"
 #include "mongo/transport/asio/asio_utils.h"
 #include "mongo/transport/ingress_handshake_metrics.h"
 #include "mongo/transport/message_filter_hooks.h"
@@ -130,15 +128,6 @@ std::string makeTLVString(const std::vector<ProxiedSupplementaryDataEntry>& tlvD
     return tlvString;
 };
 
-auto& totalIngressTLSConnections =  //
-    *MetricBuilder<Counter64>("network.totalIngressTLSConnections");
-auto& totalIngressTLSHandshakeTimeMillis =  //
-    *MetricBuilder<Counter64>("network.totalIngressTLSHandshakeTimeMillis");
-otel::metrics::Histogram<int64_t>& ingressTLSHandshakeTimesMillis =
-    otel::metrics::MetricsService::instance().createInt64Histogram(
-        otel::metrics::MetricNames::kIngressTLSHandshakeLatency,
-        "The latency of the TLS handshake when establishing a new ingress connection.",
-        otel::metrics::MetricUnit::kMilliseconds);
 auto& totalMessageSizeErrorsPreAuth =
     *MetricBuilder<Counter64>("network.totalMessageSizeErrorPreAuth");
 auto& totalMessageSizeErrorsPostAuth =
@@ -380,7 +369,16 @@ bool CommonAsioSession::isConnected() {
     if (!getSocket().is_open())
         return false;
 
-    auto swPollEvents = pollASIOSocket(getSocket(), POLLIN, Milliseconds{0});
+    unsigned events = POLLIN;
+    unsigned disconnectedEvents = POLLERR | POLLHUP | POLLNVAL;
+#ifdef __linux__
+    // POLLRDHUP reports that the peer has shut down its write side. Without it, data the peer
+    // sent before disconnecting keeps POLLIN set and the peek below succeeding, so a session
+    // with buffered unread data would be reported as connected indefinitely.
+    events |= POLLRDHUP;
+    disconnectedEvents |= POLLRDHUP;
+#endif
+    auto swPollEvents = pollASIOSocket(getSocket(), events, Milliseconds{0});
     if (!swPollEvents.isOK()) {
         if (swPollEvents != ErrorCodes::NetworkTimeout) {
             LOGV2_WARNING(4615609,
@@ -392,21 +390,52 @@ bool CommonAsioSession::isConnected() {
     }
 
     auto revents = swPollEvents.getValue();
+    if (revents & disconnectedEvents) {
+        return false;
+    }
     if (revents & POLLIN) {
         try {
             char testByte;
             const auto bytesRead =
                 peekASIOStream(getSocket(), asio::buffer(&testByte, sizeof(testByte)));
-            uassert(ErrorCodes::SocketException,
-                    "Couldn't peek from underlying socket",
-                    bytesRead == sizeof(testByte));
-            return true;
+            // Nothing to peek after POLLIN means the peer has shut down its write side: a
+            // normal disconnect, not an error.
+            return bytesRead == sizeof(testByte);
         } catch (const DBException& e) {
             LOGV2_WARNING(4615610, "Failed to check socket connectivity", "error"_attr = e);
+            return false;
         }
     }
 
     return false;
+}
+
+bool CommonAsioSession::waitForPeerDisconnectUntil(Date_t deadline) {
+    invariant(
+        _blockingMode == sync,
+        "waitForPeerDisconnectUntil is only safe on a sync-mode session where the asio reactor "
+        "is not touching the socket");
+
+    if (!getSocket().is_open()) {
+        return true;
+    }
+
+    const auto remaining = deadline - Date_t::now();
+    if (remaining.count() <= 0) {
+        return false;
+    }
+
+    auto swPollEvents = pollASIOSocket(getSocket(), POLLRDHUP | POLLHUP, remaining);
+    if (!swPollEvents.isOK()) {
+        // A NetworkTimeout means the poll timed out without observing a disconnect, so the peer is
+        // still connected. Any other error indicates the socket itself is broken which we treat as
+        // a disconnect.
+        return swPollEvents != ErrorCodes::NetworkTimeout;
+    }
+    // The poll returned an event before the deadline. We only asked for POLLRDHUP|POLLHUP (plus the
+    // always-reported POLLERR/POLLNVAL), so any event here means the peer is gone or the socket
+    // is in error.
+    return true;
 }
 
 #ifdef MONGO_CONFIG_SSL
@@ -937,8 +966,9 @@ Future<bool> CommonAsioSession::maybeHandshakeSSLForIngress(const MutableBufferS
                     asio::ssl::stream_base::server, buffer, UseFuture{});
             }
         };
-        auto startTimer = Timer();
-        return doHandshake().then([this, startTimer = std::move(startTimer)](size_t size) {
+        IngressHandshakeMetrics::get(*this).onTLSHandshakeStarted(
+            getGlobalServiceContext()->getTickSource());
+        return doHandshake().then([this](size_t size) {
             if (_sslSocket->get_sni()) {
                 auto sniName = _sslSocket->get_sni().value();
                 LOGV2_DEBUG(
@@ -946,16 +976,7 @@ Future<bool> CommonAsioSession::maybeHandshakeSSLForIngress(const MutableBufferS
             } else {
                 LOGV2_DEBUG(4908001, 2, "Client connected without SNI extension");
             }
-            const auto handshakeDurationMillis = durationCount<Milliseconds>(startTimer.elapsed());
             IngressHandshakeMetrics::get(*this).onTLSHandshakeCompleted();
-            if (gEnableDetailedConnectionHealthMetricLogLines.load()) {
-                LOGV2(6723804,
-                      "Ingress TLS handshake complete",
-                      "durationMillis"_attr = handshakeDurationMillis);
-            }
-            totalIngressTLSConnections.increment(1);
-            totalIngressTLSHandshakeTimeMillis.increment(handshakeDurationMillis);
-            ingressTLSHandshakeTimesMillis.record(handshakeDurationMillis);
             auto sslPeerInfo = SSLPeerInfo::forSession(shared_from_this());
             if (!sslPeerInfo) {
                 return getSSLManager()

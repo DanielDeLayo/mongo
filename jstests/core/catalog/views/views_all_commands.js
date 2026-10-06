@@ -1,4 +1,5 @@
 // @tags: [
+//   uses_explain,
 //   # The test runs a lot of commands that are not allowed with security token: addShard,
 //   # addShardToZone, appendOplogNote, applyOps, and so on.
 //   not_allowed_with_signed_security_token,
@@ -73,6 +74,7 @@
  *      If true, do not run this command on a standalone mongod.
  */
 
+import {isServerSideJavaScriptEnabled} from "jstests/libs/js_engine_util.js";
 import {commandsRemovedFromMongodSinceLastLTS} from "jstests/sharding/libs/last_lts_mongod_commands.js";
 import {commandsRemovedFromMongosSinceLastLTS} from "jstests/sharding/libs/last_lts_mongos_commands.js";
 
@@ -257,6 +259,9 @@ let viewsCommandTests = {
     streams_sendEvent: {skip: isAnInternalCommand},
     streams_writeCheckpoint: {skip: isAnInternalCommand},
     streams_updateConnection: {skip: isAnInternalCommand},
+    streams_previewStream: {skip: isAnInternalCommand},
+    streams_getMorePreview: {skip: isAnInternalCommand},
+    streams_stopPreview: {skip: isAnInternalCommand},
     _transferMods: {skip: isAnInternalCommand},
     abortMoveCollection: {skip: isUnrelated},
     abortRewriteCollection: {skip: isUnrelated},
@@ -312,6 +317,7 @@ let viewsCommandTests = {
         skip: "Tested in views/views_sharded.js",
     },
     cleanupStructuredEncryptionData: {skip: isUnrelated},
+    clearJoinPlanCache: {skip: isUnrelated},
     clearJumboFlag: {
         command: {clearJumboFlag: "test.view"},
         skipStandalone: true,
@@ -464,6 +470,7 @@ let viewsCommandTests = {
     getESECMKIdentifierListStatus: {skip: isUnrelated},
     getESERotateActiveKEKStatus: {skip: isUnrelated},
     getLog: {skip: isUnrelated},
+    getMetricsFilteringAllowlist: {skip: isUnrelated},
     getMore: {
         setup: function (conn) {
             assert.commandWorked(conn.collection.remove({}));
@@ -585,6 +592,9 @@ let viewsCommandTests = {
             out: "out",
         },
         expectFailure: true,
+        // Needs a server-side JS engine, which is absent on some builds (e.g. ppc64le links
+        // scripting_none). Skip just this command there.
+        skipNoScripting: true,
     },
     mergeAllChunksOnShard: {skip: isUnrelated},
     mergeChunks: {
@@ -692,6 +702,7 @@ let viewsCommandTests = {
             skipSharded: true,
         },
     ],
+    repairReplicatedMetadata: {skip: isUnrelated},
     replicateSearchIndexCommand: {skip: isAnInternalCommand},
     replSetAbortPrimaryCatchUp: {skip: isUnrelated},
     replSetFreeze: {skip: isUnrelated},
@@ -806,7 +817,7 @@ let viewsCommandTests = {
     startTransitionToDedicatedConfigServer: {skip: isUnrelated},
     stopTransitionToDedicatedConfigServer: {skip: isUnrelated},
     sysprofile: {skip: isAnInternalCommand},
-    testCommandFeatureFlaggedOnLatestFCV83: {skip: isAnInternalCommand},
+    testCommandFeatureFlaggedOnLatestFCV91: {skip: isAnInternalCommand},
     testDeprecation: {skip: isAnInternalCommand},
     testDeprecationInVersion2: {skip: isAnInternalCommand},
     testInternalTransactions: {skip: isAnInternalCommand},
@@ -834,6 +845,7 @@ let viewsCommandTests = {
     },
     update: {command: {update: "view", updates: [{q: {x: 1}, u: {x: 2}}]}, expectFailure: true},
     updateESECMKIdentifierList: {skip: isUnrelated},
+    updateMetricsFilteringAllowlist: {skip: isUnrelated},
     updateRole: {
         command: {
             updateRole: "testrole",
@@ -925,6 +937,11 @@ for (let command of commands) {
 
         if (subtest.skipStandalone && !isMongos) {
             print("Skipping " + command + ": not applicable to mongoD");
+            continue;
+        }
+
+        if (subtest.skipNoScripting && !isServerSideJavaScriptEnabled(db)) {
+            print("Skipping " + command + ": server-side JS is unavailable on this build");
             continue;
         }
 

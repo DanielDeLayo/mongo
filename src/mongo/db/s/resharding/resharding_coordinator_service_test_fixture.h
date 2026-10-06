@@ -7,6 +7,7 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/feature_compatibility_version_document_gen.h"
 #include "mongo/db/global_catalog/type_chunk.h"
 #include "mongo/db/global_catalog/type_collection.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
@@ -116,6 +117,10 @@ public:
             Status{errorCode, "Failing call to searchIndexExistsForCollection"});
     }
 
+    void pushResumeMigrationsError(ErrorCodes::Error errorCode) {
+        _resumeMigrationsErrors.push_back(errorCode);
+    }
+
     void tellAllDonorsToRefresh(OperationContext* opCtx,
                                 const NamespaceString& sourceNss,
                                 const UUID& reshardingUUID,
@@ -191,6 +196,8 @@ public:
 
         if (_options.blockInGetDocumentsToCopy) {
             std::unique_lock lk(_mutex);
+            _hasBlockedInGetDocumentsToCopy = true;
+            _blockedInGetDocumentsToCopyCV.notify_all();
             opCtx->waitForConditionOrInterrupt(_blockInGetDocumentsToCopyCV, lk, [this] {
                 return !_doKeepBlockingInGetDocumentsToCopy;
             });
@@ -219,6 +226,8 @@ public:
 
         if (_options.blockInGetDocumentsDelta) {
             std::unique_lock lk(_mutex);
+            _hasBlockedInGetDocumentsDelta = true;
+            _blockedInGetDocumentsDeltaCV.notify_all();
             opCtx->waitForConditionOrInterrupt(_blockInGetDocumentsDeltaCV, lk, [this] {
                 return !_doKeepBlockingInGetDocumentsDelta;
             });
@@ -287,9 +296,14 @@ public:
 
     void resumeMigrations(OperationContext* opCtx,
                           const NamespaceString& nss,
-                          const UUID&,
                           ReshardingAuthoritativeMetadataAccessLevelEnum,
                           std::function<OperationSessionInfo()>) override {
+        if (!_resumeMigrationsErrors.empty()) {
+            auto errorCode = _resumeMigrationsErrors.front();
+            _resumeMigrationsErrors.erase(_resumeMigrationsErrors.begin());
+            uasserted(errorCode, "Simulating resumeMigrations failure");
+        }
+
         DBDirectClient client(opCtx);
         client.update(NamespaceString::kConfigsvrCollectionsNamespace,
                       BSON(CollectionType::kNssFieldName << NamespaceStringUtil::serialize(
@@ -318,10 +332,22 @@ public:
         _errorFunction = std::make_tuple(phase, func);
     }
 
+    void waitUntilBlockedInGetDocumentsToCopy(OperationContext* opCtx) {
+        std::unique_lock lk(_mutex);
+        opCtx->waitForConditionOrInterrupt(
+            _blockedInGetDocumentsToCopyCV, lk, [this] { return _hasBlockedInGetDocumentsToCopy; });
+    }
+
     void unblockGetDocumentsToCopy() {
         std::lock_guard lk(_mutex);
         _doKeepBlockingInGetDocumentsToCopy = false;
         _blockInGetDocumentsToCopyCV.notify_all();
+    }
+
+    void waitUntilBlockedInGetDocumentsDelta(OperationContext* opCtx) {
+        std::unique_lock lk(_mutex);
+        opCtx->waitForConditionOrInterrupt(
+            _blockedInGetDocumentsDeltaCV, lk, [this] { return _hasBlockedInGetDocumentsDelta; });
     }
 
     void unblockGetDocumentsDelta() {
@@ -343,11 +369,17 @@ private:
     std::mutex _mutex;
     stdx::condition_variable _blockInGetDocumentsToCopyCV;
     bool _doKeepBlockingInGetDocumentsToCopy = true;
+    stdx::condition_variable _blockedInGetDocumentsToCopyCV;
+    bool _hasBlockedInGetDocumentsToCopy = false;
     stdx::condition_variable _blockInGetDocumentsDeltaCV;
     bool _doKeepBlockingInGetDocumentsDelta = true;
+    stdx::condition_variable _blockedInGetDocumentsDeltaCV;
+    bool _hasBlockedInGetDocumentsDelta = false;
 
     std::vector<StatusWith<bool>> _searchIndexResults;
     bool _searchIndexDefaultResult{false};
+
+    std::vector<ErrorCodes::Error> _resumeMigrationsErrors;
 
     CoordinatorStateEnum _getCurrentPhaseOnDisk(OperationContext* opCtx) {
         DBDirectClient client(opCtx);
@@ -470,10 +502,18 @@ public:
     void setUp() override {
         ConfigServerTestFixture::setUp();
 
+        // Creating a resharding coordinator checks whether an FCV transition is in progress, which
+        // requires a global FCV document to be set.
+        // TODO(SERVER-131381): Review/rework this logic to avoid relying on FCV internals
+        FeatureCompatibilityVersionDocument fcvDoc;
+        // (Generic FCV reference): Required test only setup.
+        fcvDoc.setVersion(multiversion::GenericFCV::kLatest);
+        serverGlobalParams.mutableFCV.setVersionFromFCVDocument(fcvDoc);
+
         std::vector<ShardType> shards;
         for (const auto& id : getShardIds()) {
             ShardType s;
-            s.setHandle(ShardHandle{ShardId(id.toString()), boost::none});
+            s.setName(id.toString());
             s.setHost(id.toString() + ":1234");
             shards.push_back(std::move(s));
         }
@@ -520,10 +560,14 @@ public:
         globalFailPointRegistry().disableAllFailpoints();
         externalState()->unblockGetDocumentsToCopy();
         externalState()->unblockGetDocumentsDelta();
+        // Coordinators must be stepped down before their executors are shut down, and joined
+        // before ConfigServerTestFixture::tearDown() clears the sharding state they use.
+        _registry->onStepDown();
         TransactionCoordinatorService::get(operationContext())->interruptForStepDown();
         WaitForMajorityService::get(getServiceContext()).shutDown();
-        ConfigServerTestFixture::tearDown();
+        shutdownExecutorPool();
         _registry->onShutdown();
+        ConfigServerTestFixture::tearDown();
     }
 
     CoordinatorStateTransitionController* controller() {

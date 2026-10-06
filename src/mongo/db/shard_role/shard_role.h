@@ -22,6 +22,7 @@
 #include "mongo/util/modules.h"
 #include "mongo/util/uuid.h"
 
+#include <functional>
 #include <memory>
 #include <utility>
 #include <variant>
@@ -722,18 +723,47 @@ CollectionAcquisition acquireLocalCollectionNoConsistentCatalog(
     LockMode lockMode);
 
 /*
- * Resolve the collection namespace without acquiring a collection. These helpers do not lock the
- * namespace or provide shard version checks. They only make sense to run quick prechecks before
- * executing code that will eventually acquire the collections.
+ * Resolve the collection namespace without acquiring a collection. Does not lock the namespace or
+ * provide shard version checks. Ensures the resolution is done on the latest catalog, and in case
+ * the UUID is pending commit, waits until it is committed and published. Only use to run quick
+ * prechecks before executing code that will eventually acquire the collections, or for
+ * authorization checks.
+ *
+ * Throws NamespaceNotFound if the UUID is not found.
  */
 [[MONGO_MOD_USE_REPLACEMENT(acquireCollection)]]
-NamespaceString resolveNssWithoutAcquisition(OperationContext* opCtx,
-                                             const DatabaseName& dbName,
-                                             const UUID& uuid);
+NamespaceString resolveNssWithoutAcquisitionAtLatest(OperationContext* opCtx,
+                                                     const DatabaseName& dbName,
+                                                     const UUID& uuid);
 
+/*
+ * Lookup the collection namespace without acquiring a collection. Does not lock the namespace or
+ * provide shard version checks. If there is a stashed catalog, it will be used. If the UUID is
+ * pending commit, the pre-commit state will be used. Only use to run quick prechecks before
+ * executing code that will eventually acquire the collections, or for authorization checks.
+ *
+ * Returns boost::none if the UUID is not found.
+ */
 [[MONGO_MOD_USE_REPLACEMENT(acquireCollection)]]
 boost::optional<NamespaceString> lookupNssWithoutAcquisition(OperationContext* opCtx,
                                                              const UUID& uuid);
+
+/**
+ * Iterates every entry in the durable catalog (_mdb_catalog), calling 'visitor' for each one.
+ *
+ * The caller must hold at least a global IS lock for the duration of the iteration.
+ *
+ * Handles read-source management internally: on secondaries with rc:local the read source is
+ * set to kLastApplied before iterating, ensuring the catalog state returned is consistent with
+ * the replication state. When a storage snapshot is already open (e.g. after a collection
+ * acquisition), the existing read source is preserved.
+ *
+ * Feature-tracking documents written by older versions are skipped automatically.
+ */
+[[MONGO_MOD_PUBLIC]] void iterateDurableCatalog(
+    OperationContext* opCtx,
+    const std::function<void(const NamespaceString& ns, const BSONObj& catalogEntry)>& visitor);
+
 
 }  // namespace shard_role_nocheck
 }  // namespace mongo

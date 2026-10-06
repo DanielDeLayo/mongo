@@ -66,6 +66,17 @@ public:
     Microseconds totalTimeQueuedMicros() const;
 
     /**
+     * Returns total admission queueing time accumulated in the per-operation aggregate counter for
+     * this OperationContext.
+     */
+    static Microseconds getTotalTimeQueuedForAdmission(const OperationContext* opCtx);
+
+    /** Returns the operation context associated with this admission context, if any. */
+    virtual OperationContext* getOperationContext() {
+        return nullptr;
+    }
+
+    /**
      * Returns the time this admission context started waiting to be queued, if it is currently
      * queued.
      */
@@ -134,6 +145,10 @@ public:
 
     [[MONGO_MOD_PUBLIC]] void setTotalTimeQueuedMicros_forTest(int64_t micros);
 
+    // Block until this AdmissionContext is queued waiting on a ticket or the timeout expires.
+    // Returns true if we got queued, or false if the timeout expired.
+    [[MONGO_MOD_PUBLIC]] bool waitUntilQueued_forTest(Nanoseconds timeout);
+
 protected:
     friend class ScopedAdmissionPriorityBase;
     friend class WaitingForAdmissionGuard;
@@ -158,11 +173,6 @@ protected:
 class [[MONGO_MOD_PUBLIC]] MockAdmissionContext : public AdmissionContext {
 public:
     MockAdmissionContext() = default;
-    // Block until this AdmissionContext is queued waiting on a ticket or the timeout expires.
-    // Returns true if we got queued, or false if the timeout expired.
-    bool waitUntilQueued(Nanoseconds timeout) {
-        return bool(_startQueueingTime.waitFor(kNotQueueing, timeout));
-    }
 
     void recordDelinquentAcquisition(Milliseconds delay) {
         ++delinquentAcquisitions;

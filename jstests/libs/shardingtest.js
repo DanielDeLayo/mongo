@@ -2,6 +2,7 @@ import {getTimeseriesCollForDDLOps} from "jstests/core/timeseries/libs/viewless_
 import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 import {Thread} from "jstests/libs/parallelTester.js";
 import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {setFCVWithRetryOnBackgroundOpInProgress} from "jstests/libs/set_fcv_helpers.js";
 
 // Symbol used to override the constructor. Please do not use this, it's only meant to aid
 // in migrating the jstest corpus to proper module usage.
@@ -13,18 +14,6 @@ const kDefaultWTimeoutMs = 5 * 60 * 1000;
 
 // Oplog collection name
 const kOplogName = "oplog.rs";
-
-// 'reshardingDocumentVerification' defaults to false in production, so enable it (and raise the
-// size-based skip threshold, default 1KB) in test clusters to preserve coverage for resharding
-// document-count validation. Only sets values not already specified so individual tests can override.
-function setDefaultReshardingVerificationParameters(setParameter) {
-    if (setParameter.reshardingDocumentVerification === undefined) {
-        setParameter.reshardingDocumentVerification = true;
-    }
-    if (setParameter.reshardingDocumentValidationMaxCollectionSizeBytes === undefined) {
-        setParameter.reshardingDocumentValidationMaxCollectionSizeBytes = 1024 * 1024 * 1024; // 1GiB
-    }
-}
 
 export class ShardingTest {
     // ShardingTest API
@@ -228,7 +217,6 @@ export class ShardingTest {
 
     stop(opts = {}) {
         this.checkMetadataConsistency();
-        this.checkUUIDsConsistentAcrossCluster();
         this.checkIndexesConsistentAcrossCluster();
         this.checkOrphansAreDeleted();
         this.checkRoutingTableConsistency();
@@ -1285,6 +1273,26 @@ export class ShardingTest {
         try {
             const clusterVersionInfo = this.getClusterVersionInfo();
 
+            // Sets the OpenTelemetry trace directory on 'options' (in place) if tracing is enabled
+            // and the node being started supports it.
+            const maybeSetOtelTraceDirectory = (options, clusterVersionInfo) => {
+                if (!jsTestOptions().otelTraceDirectory || clusterVersionInfo.isMixedVersion) {
+                    return;
+                }
+                if (MongoRunner.compareBinVersions(
+                        MongoRunner.getBinVersionFor(options.binVersion ?? "latest"),
+                        MongoRunner.getBinVersionFor("8.3.0")) < 0) {
+                    return;
+                }
+                options.setParameter = options.setParameter ?? {};
+                // The trace directory and the HTTP endpoint cannot both be set, so don't create a
+                // trace directory for tests that should use the HTTP endpoint.
+                if (!options.setParameter.opentelemetryHttpEndpoint) {
+                    options.setParameter.opentelemetryTraceDirectory =
+                        jsTestOptions().otelTraceDirectory;
+                }
+            };
+
             let startTime = new Date();  // Measure the execution time of startup and initiate.
             if (!isConfigShardMode) {
                 //
@@ -1321,14 +1329,11 @@ export class ShardingTest {
                 startOptions = Object.merge(startOptions, otherParams.configOptions);
 
                 const clusterVersionInfo = this.getClusterVersionInfo();
-                if (jsTestOptions().otelTraceDirectory && !clusterVersionInfo.isMixedVersion &&
-                    MongoRunner.compareBinVersions(MongoRunner.getBinVersionFor(startOptions.binVersion ?? "latest"), MongoRunner.getBinVersionFor("8.3.0")) >= 0) {
-                    startOptions.setParameter = startOptions.setParameter ?? {};
-                    startOptions.setParameter.opentelemetryTraceDirectory = jsTestOptions().otelTraceDirectory;
-                }
-                if (!clusterVersionInfo.isMixedVersion) {
-                    startOptions.setParameter = startOptions.setParameter ?? {};
-                    setDefaultReshardingVerificationParameters(startOptions.setParameter);
+                maybeSetOtelTraceDirectory(startOptions, clusterVersionInfo);
+                // Enable resharding document-count validation (off by default) in test clusters.
+                startOptions.setParameter = startOptions.setParameter ?? {};
+                if (startOptions.setParameter.reshardingDocumentVerification === undefined) {
+                    startOptions.setParameter.reshardingDocumentVerification = true;
                 }
                 rstOptions = Object.merge(rstOptions, otherParams.configReplSetTestOptions);
 
@@ -1405,12 +1410,11 @@ export class ShardingTest {
                     otherParams.migrationLockAcquisitionMaxWaitMS;
 
                 const clusterVersionInfo = this.getClusterVersionInfo();
-                if (jsTestOptions().otelTraceDirectory && !clusterVersionInfo.isMixedVersion &&
-                    MongoRunner.compareBinVersions(MongoRunner.getBinVersionFor(rsDefaults.binVersion || "latest"), MongoRunner.getBinVersionFor("8.3.0")) >= 0) {
-                    rsDefaults.setParameter.opentelemetryTraceDirectory = jsTestOptions().otelTraceDirectory;
-                }
-                if (!clusterVersionInfo.isMixedVersion) {
-                    setDefaultReshardingVerificationParameters(rsDefaults.setParameter);
+                maybeSetOtelTraceDirectory(rsDefaults, clusterVersionInfo);
+                // Enable resharding document-count validation (off by default) in test clusters.
+                // See the equivalent config server option above.
+                if (rsDefaults.setParameter.reshardingDocumentVerification === undefined) {
+                    rsDefaults.setParameter.reshardingDocumentVerification = true;
                 }
 
                 let rsSettings = rsDefaults.settings;
@@ -1727,10 +1731,7 @@ export class ShardingTest {
                     options.setParameter.mongosShutdownTimeoutMillisForSignaledShutdown || 0;
 
                 const clusterVersionInfo = this.getClusterVersionInfo();
-                if (jsTestOptions().otelTraceDirectory && !clusterVersionInfo.isMixedVersion &&
-                    MongoRunner.compareBinVersions(MongoRunner.getBinVersionFor(options.binVersion ?? "latest"), MongoRunner.getBinVersionFor("8.3.0")) >= 0) {
-                    options.setParameter.opentelemetryTraceDirectory = jsTestOptions().otelTraceDirectory;
-                }
+                maybeSetOtelTraceDirectory(options, clusterVersionInfo);
 
                 options.port = options.port || _allocatePortForMongos();
                 if (this._usePriorityPorts || options.hasOwnProperty("priorityPort")) {
@@ -1747,13 +1748,12 @@ export class ShardingTest {
             if (_hasNewFeatureCompatibilityVersion() && clusterVersionInfo.isMixedVersion) {
                 const fcv = binVersionToFCV(clusterVersionInfo.oldestBinVersion);
                 function setFeatureCompatibilityVersion() {
-                    assert.commandWorked(
-                        csrsPrimary.adminCommand({
-                            setFeatureCompatibilityVersion: fcv,
-                            confirm: true,
-                            fromConfigServer: true,
-                        }),
-                    );
+                    // Startup system index builds can still be in flight here and hold a stale
+                    // operation FCV, which makes setFCV fail with
+                    // BackgroundOperationInProgressForNamespace. Retry until they drain.
+                    setFCVWithRetryOnBackgroundOpInProgress(csrsPrimary, fcv, {
+                        fromConfigServer: true,
+                    });
 
                     // Wait for the new featureCompatibilityVersion to propagate to all nodes in the
                     // CSRS to ensure that older versions of mongos can successfully connect.
@@ -2057,10 +2057,6 @@ export class ShardingTest {
 ShardingTest.prototype.checkMetadataConsistency = function() {
     jsTest.log.info("Unhooked checkMetadataConsistency function");
 };
-
-// Stub for a hook to check that collection UUIDs are consistent across shards and the config
-// server.
-ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {};
 
 // Stub for a hook to check that indexes are consistent across shards.
 ShardingTest.prototype.checkIndexesConsistentAcrossCluster = function() {};

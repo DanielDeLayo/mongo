@@ -8,7 +8,7 @@
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonelement_comparator.h"
 #include "mongo/bson/bsontypes.h"
-#include "mongo/db/admission/write_throttler_admission_context.h"
+#include "mongo/db/admission/write_throttler.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/resource_pattern.h"
@@ -112,6 +112,7 @@
 #include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
 #include <algorithm>
@@ -154,6 +155,22 @@ MONGO_FAIL_POINT_DEFINE(hangAndFailAfterDocumentInsertsReserveOpTimes);
 MONGO_FAIL_POINT_DEFINE(hangWithLockDuringBatchInsert);
 MONGO_FAIL_POINT_DEFINE(hangWithLockDuringBatchUpdate);
 MONGO_FAIL_POINT_DEFINE(hangWithLockDuringBatchRemove);
+
+bool isTimeseriesWriteSource(OperationSource source) {
+    return source == OperationSource::kTimeseriesInsert ||
+        source == OperationSource::kTimeseriesUpdate ||
+        source == OperationSource::kTimeseriesDelete;
+}
+
+void admitKnownWrites(OperationContext* opCtx, OperationSource source, int64_t knownWrites) {
+    if (isTimeseriesWriteSource(source)) {
+        return;
+    }
+
+    if (auto* throttler = WriteThrottler::get(opCtx)) {
+        throttler->admitKnownWrites(opCtx, knownWrites);
+    }
+}
 
 /**
  * Metrics group for the `updateMany` and `deleteMany` operations. For each
@@ -350,12 +367,12 @@ void insertDocumentsAtomically(OperationContext* opCtx,
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     const bool inTransaction = opCtx->inMultiDocumentTransaction();
     const bool oplogDisabled = replCoord->isOplogDisabledFor(opCtx, collection.nss());
-    WriteUnitOfWork::OplogEntryGroupType oplogEntryGroupType = WriteUnitOfWork::kDontGroup;
+    WriteUnitOfWork::OplogEntryGroupType oplogEntryGroupType = WriteUnitOfWork::noGroup;
 
     // For multiple inserts not part of a multi-document transaction, the inserts will be
     // batched into a single applyOps oplog entry.
     if (!inTransaction && batchSize > 1 && !oplogDisabled) {
-        oplogEntryGroupType = WriteUnitOfWork::kGroupForPossiblyRetryableOperations;
+        oplogEntryGroupType = WriteUnitOfWork::nonAtomicGroup;
     }
 
     // Intentionally not using writeConflictRetry. That is handled by the caller so it can react to
@@ -426,9 +443,8 @@ SingleWriteResult makeWriteResultForInsertOrDeleteRetry() {
 std::tuple<bool, bool> getDocumentValidationFlags(OperationContext* opCtx,
                                                   const write_ops::WriteCommandRequestBase& req,
                                                   const boost::optional<TenantId>& tenantId) {
-    auto& encryptionInfo = req.getEncryptionInformation();
-    const bool fleCrudProcessed = getFleCrudProcessed(opCtx, encryptionInfo, tenantId);
-    return std::make_tuple(req.getBypassDocumentValidation(), fleCrudProcessed);
+    return std::make_tuple(req.getBypassDocumentValidation(),
+                           getFleCrudProcessed(req.getEncryptionInformation()));
 }
 
 void saveStatsOnConflict(PlanExecutor* exec, CurOp* curOp) {
@@ -458,14 +474,6 @@ bool handleError(OperationContext* opCtx,
 
     if (ErrorCodes::isInterruption(ex.code())) {
         throw;  // These have always failed the whole batch.
-    }
-
-    if (ex.code() == ErrorCodes::WriteConflictRetryLimitExceeded) {
-        // Surface as command-level ok:0 so drivers' RetryableWriteError /
-        // TransientTransactionError label attachment fires. Per-doc framing in writeErrors does
-        // not trigger driver retry. For ordered:false batches this aborts the whole batch;
-        // drivers re-send with stmtId idempotency.
-        throw;
     }
 
     if (ErrorCodes::WouldChangeOwningShard == ex.code()) {
@@ -534,19 +542,8 @@ bool handleError(OperationContext* opCtx,
     return !ordered;
 }
 
-bool getFleCrudProcessed(OperationContext* opCtx,
-                         const boost::optional<EncryptionInformation>& encryptionInfo,
-                         const boost::optional<TenantId>& tenantId) {
-    if (encryptionInfo && encryptionInfo->getCrudProcessed().value_or(false)) {
-        uassert(6666201,
-                "External users cannot have crudProcessed enabled",
-                AuthorizationSession::get(opCtx->getClient())
-                    ->isAuthorizedForActionsOnResource(
-                        ResourcePattern::forClusterResource(tenantId), ActionType::internal));
-
-        return true;
-    }
-    return false;
+bool getFleCrudProcessed(const boost::optional<EncryptionInformation>& encryptionInfo) {
+    return encryptionInfo && encryptionInfo->getCrudProcessed().value_or(false);
 }
 
 /**
@@ -607,7 +604,7 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
                                       .getDatabaseProfileLevel(nss.dbName()));
 
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
-            &hangWithLockDuringBatchInsert, opCtx, "hangWithLockDuringBatchInsert");
+            &hangWithLockDuringBatchInsert, opCtx, "hangWithLockDuringBatchInsert", nullptr, nss);
     };
 
     auto txnParticipant = TransactionParticipant::get(opCtx);
@@ -1100,10 +1097,6 @@ void updateRetryStats(OperationContext* opCtx, bool containsRetry) {
 }
 
 void logOperationAndProfileIfNeeded(OperationContext* opCtx, CurOp* curOp) {
-    // TODO(SERVER-130908): Remove this temporary recording once write counts are tracked with
-    // higher fidelity.
-    recordWriteThrottlerCostForReconciliation(opCtx, curOp);
-
     const bool shouldProfile =
         curOp->completeAndLogOperation({MONGO_LOGV2_DEFAULT_COMPONENT},
                                        DatabaseProfileSettings::get(opCtx->getServiceContext())
@@ -1244,11 +1237,6 @@ WriteResult performInserts(
             // This is the only part of finishCurOp we need to do for inserts because they
             // reuse the top-level curOp. The rest is handled by the top-level entrypoint.
             curOp.done();
-            // Inserts complete here rather than through logOperationAndProfileIfNeeded, so record
-            // their batch-aware write cost for command-end reconciliation at this point.
-            // TODO(SERVER-130908): Remove this temporary recording once write counts are tracked
-            // with higher fidelity.
-            recordWriteThrottlerCostForReconciliation(opCtx, &curOp);
             Top::getDecoration(opCtx).record(opCtx,
                                              actualNs,
                                              LogicalOp::opInsert,
@@ -1286,6 +1274,11 @@ WriteResult performInserts(
     out.results.reserve(wholeOp.getDocuments().size());
 
     bool containsRetry = false;
+    // Update total retryable commands counter if applicable. The retried commands counter is
+    // updated by the below hook.
+    if (opCtx->isRetryableWrite()) {
+        RetryableWritesStats::get(opCtx)->incrementRetryableCommandsCount();
+    }
     ON_BLOCK_EXIT([&] { updateRetryStats(opCtx, containsRetry); });
 
     size_t nextOpIndex = 0;
@@ -1326,8 +1319,10 @@ WriteResult performInserts(
             opCtx, doc, bypassEmptyTsReplacement, &containsDotsAndDollarsField);
 
         const StmtId stmtId = getStmtIdForWriteOp(opCtx, wholeOp, currentOpIndex);
-        const bool wasAlreadyExecuted =
-            opCtx->isRetryableWrite() && txnParticipant.checkStatementExecuted(opCtx, stmtId);
+        const auto timestampIfAlreadyExecuted = opCtx->isRetryableWrite()
+            ? txnParticipant.checkStatementExecutedAndGetWallClockTime(opCtx, stmtId)
+            : boost::none;
+        const bool wasAlreadyExecuted = bool(timestampIfAlreadyExecuted);
 
         if (!fixedDoc.isOK()) {
             // Handled after we insert anything in the batch to be sure we report errors in the
@@ -1355,6 +1350,7 @@ WriteResult performInserts(
                 continue;  // Add more to batch before inserting.
         }
 
+        admitKnownWrites(opCtx, source, batch.size());
         out.canContinue = insertBatchAndHandleErrors(opCtx,
                                                      actualNs,
                                                      preConditions,
@@ -1397,6 +1393,8 @@ WriteResult performInserts(
         } else if (wasAlreadyExecuted) {
             containsRetry = true;
             RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
+            RetryableWritesStats::get(opCtx)->recordRetriedWriteDelay(
+                opCtx->fastClockSource().now() - *timestampIfAlreadyExecuted);
             out.retriedStmtIds.push_back(stmtId);
             out.results.emplace_back(makeWriteResultForInsertOrDeleteRetry());
         }
@@ -1854,7 +1852,19 @@ WriteResult performUpdates(
 
     LastOpFixer lastOpFixer(opCtx);
 
+    // Count retryable commands for all types of operations except for user-facing
+    // time-series updates on a non-sharded cluster. For non-sharded user time-series
+    // updates, handles the metrics of the command at the caller since each statement
+    // will run as a command through the internal transaction API.
+    bool couldCountAsRetryableCommand = source != OperationSource::kTimeseriesUpdate ||
+        !preConditions.getIsTimeseriesLogicalRequest() || wholeOp.getShardVersion();
+
     bool containsRetry = false;
+    // Update total retryable commands counter if applicable. The retried commands counter is
+    // updated by the below hook.
+    if (opCtx->isRetryableWrite() && couldCountAsRetryableCommand) {
+        RetryableWritesStats::get(opCtx)->incrementRetryableCommandsCount();
+    }
     ON_BLOCK_EXIT([&] { updateRetryStats(opCtx, containsRetry); });
 
     size_t nextOpIndex = 0;
@@ -1889,13 +1899,10 @@ WriteResult performUpdates(
         if (opCtx->isRetryableWrite()) {
             if (auto entry =
                     txnParticipant.checkStatementExecutedAndFetchOplogEntry(opCtx, stmtId)) {
-                // Set containsRetry to true for all types of operations except for user-facing
-                // time-series updates on a non-sharded cluster. For non-sharded user time-series
-                // updates, handles the metrics of the command at the caller since each statement
-                // will run as a command through the internal transaction API.
-                containsRetry = source != OperationSource::kTimeseriesUpdate ||
-                    !preConditions.getIsTimeseriesLogicalRequest() || wholeOp.getShardVersion();
+                containsRetry = couldCountAsRetryableCommand;
                 RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
+                RetryableWritesStats::get(opCtx)->recordRetriedWriteDelay(
+                    opCtx->fastClockSource().now() - entry->getWallClockTime());
                 // Returns the '_id' of the user measurement for time-series upserts.
                 boost::optional<BSONElement> upsertedId;
                 if (entry->getOpType() == repl::OpTypeEnum::kInsert &&
@@ -1957,6 +1964,7 @@ WriteResult performUpdates(
                 timer.emplace();
             }
 
+            admitKnownWrites(opCtx, source, 1);
             const SingleWriteResult&& reply =
                 performSingleUpdateOpWithDupKeyRetry(opCtx,
                                                      ns,
@@ -2212,6 +2220,9 @@ WriteResult performDeletes(
     LastOpFixer lastOpFixer(opCtx);
 
     bool containsRetry = false;
+    if (opCtx->isRetryableWrite()) {
+        RetryableWritesStats::get(opCtx)->incrementRetryableCommandsCount();
+    }
     ON_BLOCK_EXIT([&] { updateRetryStats(opCtx, containsRetry); });
 
     size_t nextOpIndex = 0;
@@ -2234,9 +2245,14 @@ WriteResult performDeletes(
 
         const auto currentOpIndex = nextOpIndex++;
         const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, currentOpIndex);
-        if (opCtx->isRetryableWrite() && txnParticipant.checkStatementExecuted(opCtx, stmtId)) {
+        const auto alreadyExecutedTime = opCtx->isRetryableWrite()
+            ? txnParticipant.checkStatementExecutedAndGetWallClockTime(opCtx, stmtId)
+            : boost::none;
+        if (alreadyExecutedTime) {
             containsRetry = true;
             RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
+            RetryableWritesStats::get(opCtx)->recordRetriedWriteDelay(
+                opCtx->fastClockSource().now() - *alreadyExecutedTime);
             out.results.emplace_back(makeWriteResultForInsertOrDeleteRetry());
             out.retriedStmtIds.push_back(stmtId);
             continue;
@@ -2285,6 +2301,7 @@ WriteResult performDeletes(
                 timer.emplace();
             }
 
+            admitKnownWrites(opCtx, source, 1);
             const SingleWriteResult&& reply = performSingleDeleteOp(opCtx,
                                                                     ns,
                                                                     stmtId,
@@ -2353,6 +2370,28 @@ bool matchContainsOnlyAndedEqualityNodes(const MatchExpression& root) {
 
     return false;
 }
+
+bool queryCollatorMatchesIndexCollation(OperationContext* opCtx,
+                                        const CollatorInterface* queryCollator,
+                                        const BSONObj& indexCollation) {
+    const bool queryHasSimpleCollator = CollatorInterface::isSimpleCollator(queryCollator);
+    const bool indexHasSimpleCollator = indexCollation.isEmpty();
+    if (queryHasSimpleCollator != indexHasSimpleCollator) {
+        return false;
+    }
+
+    if (indexHasSimpleCollator) {
+        return true;
+    }
+
+    const auto serviceCtx = opCtx->getServiceContext();
+    const auto collatorFactory = CollatorFactoryInterface::get(serviceCtx);
+    const auto indexCollator = collatorFactory->makeFromBSON(indexCollation);
+    tassert(indexCollator.getStatus().withContext(
+        "Duplicate key error contained an invalid index collation"));
+    return CollatorInterface::collatorsMatch(queryCollator, indexCollator.getValue().get());
+}
+
 }  // namespace
 
 bool shouldRetryDuplicateKeyException(OperationContext* opCtx,
@@ -2375,7 +2414,7 @@ bool shouldRetryDuplicateKeyException(OperationContext* opCtx,
 
     // There was a bug where an upsert sending a document into a partial/sparse unique index would
     // retry indefinitely. To avoid this, cap the number of retries.
-    int upsertMaxRetryAttemptsOnDuplicateKeyError =
+    const int upsertMaxRetryAttemptsOnDuplicateKeyError =
         write_ops::gUpsertMaxRetryAttemptsOnDuplicateKeyError.load();
     if (retryAttempts > upsertMaxRetryAttemptsOnDuplicateKeyError) {
         LOGV2(9552300,
@@ -2409,37 +2448,25 @@ bool shouldRetryDuplicateKeyException(OperationContext* opCtx,
         return false;
     }
 
-    // Check that collation of the query matches the unique index. To avoid calling
-    // CollatorFactoryInterface when possible, first check the simple collator case.
-    bool queryHasSimpleCollator = CollatorInterface::isSimpleCollator(cq.getCollator());
-    bool indexHasSimpleCollator = errorInfo.getCollation().isEmpty();
-    if (queryHasSimpleCollator != indexHasSimpleCollator) {
+    if (!queryCollatorMatchesIndexCollation(opCtx, cq.getCollator(), errorInfo.getCollation())) {
         return false;
     }
 
-    if (!indexHasSimpleCollator) {
-        auto indexCollator =
-            uassertStatusOK(CollatorFactoryInterface::get(cq.getOpCtx()->getServiceContext())
-                                ->makeFromBSON(errorInfo.getCollation()));
-        if (!CollatorInterface::collatorsMatch(cq.getCollator(), indexCollator.get())) {
-            return false;
-        }
-    }
-
-    const auto& keyValue = errorInfo.getDuplicatedKeyValue();
-
+    // A retry is safe only if the query equality predicates match the duplicate-key error's index
+    // fields and values.
+    const BSONObj& duplicatedKeyValue = errorInfo.getDuplicatedKeyValue();
+    const bool indexHasSimpleCollator = errorInfo.getCollation().isEmpty();
+    const BSONElementComparator comparator{BSONElementComparator::FieldNamesMode::kIgnore, nullptr};
     BSONObjIterator keyPatternIter(keyPattern);
-    BSONObjIterator keyValueIter(keyValue);
+    BSONObjIterator keyValueIter(duplicatedKeyValue);
     while (keyPatternIter.more() && keyValueIter.more()) {
-        auto keyPatternElem = keyPatternIter.next();
-        auto keyValueElem = keyValueIter.next();
-
-        auto keyName = keyPatternElem.fieldNameStringData();
-        auto equalityIt = equalities.find(keyName);
-        if (equalityIt == equalities.end()) {
+        const auto keyPatternElem = keyPatternIter.next();
+        const auto it = equalities.find(keyPatternElem.fieldNameStringData());
+        if (it == equalities.end()) {
             return false;
         }
-        const BSONElement& equalityElem = equalityIt->second->getData();
+        const auto equalityElem = it->second->getData();
+        const auto keyValueElem = keyValueIter.next();
 
         // If the index have collation and we are comparing strings, we need to compare
         // ComparisonStrings instead of the raw value to respect collation.
@@ -2447,26 +2474,23 @@ bool shouldRetryDuplicateKeyException(OperationContext* opCtx,
             if (keyValueElem.type() != BSONType::string) {
                 return false;
             }
-            auto equalityComparisonString =
-                cq.getCollator()->getComparisonString(equalityElem.valueStringData());
-            if (equalityComparisonString != keyValueElem.valueStringData()) {
+            const auto* collator = cq.getCollator();
+            tassert(13424100, "Expected a query collator for a collated index", collator);
+            if (collator->getComparisonString(equalityElem.valueStringData()) !=
+                keyValueElem.valueStringData()) {
                 return false;
             }
-        } else {
-            // Comparison which obeys field ordering but ignores field name.
-            BSONElementComparator cmp{BSONElementComparator::FieldNamesMode::kIgnore, nullptr};
-            if (cmp.evaluate(equalityElem != keyValueElem)) {
-                return false;
-            }
+        } else if (comparator.evaluate(equalityElem != keyValueElem)) {
+            return false;
         }
     }
+
     tassert(11052017,
             fmt::format("Expected number of elements in keyPattern {} to match number of elements "
                         "in keyValue {}",
                         keyPattern.toString(),
-                        keyValue.toString()),
+                        duplicatedKeyValue.toString()),
             !keyPatternIter.more() && !keyValueIter.more());
-
     return true;
 }
 

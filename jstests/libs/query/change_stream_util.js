@@ -10,6 +10,17 @@ import {getCollectionNameFromFullNamespace} from "jstests/libs/namespace_utils.j
 import {removeShard} from "jstests/sharding/libs/remove_shard_util.js";
 import {ReplSetTest} from "jstests/libs/replsettest.js";
 
+// The resume-token monotonicity checks in this file assume a consistent v2 change stream
+// implementation. Mixed-version clusters may observe non-monotonic tokens, so the checks are disabled in multiversion tests.
+// TODO SERVER-134853 Enable the check in multiversion tests as well.
+const isMultiversion = Boolean(
+    jsTest.options().useRandomBinVersionsWithinReplicaSet ||
+        (TestData &&
+            (TestData.multiversionBinVersion ||
+                TestData.mixedBinVersions ||
+                TestData.mongosBinVersion)),
+);
+
 /**
  * Enumeration of the possible types of change streams.
  */
@@ -28,6 +39,27 @@ export function watchModeToString(watchMode) {
         case ChangeStreamWatchMode.kCluster:
             return "cluster";
     }
+}
+
+/**
+ * Returns the value of the first pipeline stage's '$changeStream' key if 'cmdObj' is an
+ * 'aggregate' command with a non-empty pipeline whose first stage has that key, regardless of the
+ * value's type (so a malformed request, e.g. '$changeStream: 1', is still detected). Returns
+ * undefined otherwise.
+ */
+export function getChangeStreamStage(cmdObj) {
+    if (
+        !cmdObj ||
+        !cmdObj.aggregate ||
+        !Array.isArray(cmdObj.pipeline) ||
+        cmdObj.pipeline.length === 0 ||
+        typeof cmdObj.pipeline[0] !== "object" ||
+        cmdObj.pipeline[0] === null ||
+        !("$changeStream" in cmdObj.pipeline[0])
+    ) {
+        return undefined;
+    }
+    return cmdObj.pipeline[0].$changeStream;
 }
 
 /**
@@ -225,7 +257,65 @@ export function assertChangeStreamEventEq(actualEvent, expectedEvent, eventModif
             tojsonMaybeTruncate(expectedEvent) +
             ", Actual: " +
             tojsonMaybeTruncate(actualEvent),
+        {
+            expectedEvent,
+            actualEvent,
+        },
     );
+}
+
+/**
+ * Asserts that 'actualChanges' and 'expectedChanges' contain the same change events, in any order.
+ *
+ * This is a multiset comparison: each actual event must match a distinct expected event (per
+ * assertChangeStreamEventEq semantics), so a duplicate actual event cannot stand in for a missing
+ * expected one. Use it where event order is not guaranteed, e.g. on sharded topologies where
+ * cross-shard event order may not match client issue order.
+ */
+export function assertChangeStreamEventsEqUnordered(actualChanges, expectedChanges, eventModifier) {
+    assert.eq(
+        actualChanges.length,
+        expectedChanges.length,
+        "Change event count mismatch (order ignored)",
+        {actualChanges, expectedChanges},
+    );
+
+    const remaining = [...expectedChanges];
+    for (const actual of actualChanges) {
+        const i = remaining.findIndex((expected) =>
+            isChangeStreamEventEq(actual, expected, eventModifier),
+        );
+        assert.neq(i, -1, "No expected event matched the observed event (order ignored)", {
+            actual,
+            remaining,
+        });
+        remaining.splice(i, 1);
+    }
+}
+
+/**
+ * Asserts that the observed change events equal the expected ones, with deployment awareness:
+ * ordered on replica sets and standalone, unordered on sharded clusters, where cross-shard event
+ * order may not match client issue order.
+ *
+ * The array-based counterpart of ChangeStreamTest.assertNextChangesEqualWithDeploymentAwareness,
+ * for tests that drain their cursor themselves (e.g. via plain cursor.next()) rather than through
+ * ChangeStreamTest's batchSize:1 batches.
+ */
+export function assertChangeStreamEventsEqWithDeploymentAwareness(
+    db,
+    actualChanges,
+    expectedChanges,
+    eventModifier,
+) {
+    assert.eq(actualChanges.length, expectedChanges.length, {actualChanges, expectedChanges});
+    if (FixtureHelpers.isMongos(db)) {
+        assertChangeStreamEventsEqUnordered(actualChanges, expectedChanges, eventModifier);
+    } else {
+        for (let i = 0; i < expectedChanges.length; i++) {
+            assertChangeStreamEventEq(actualChanges[i], expectedChanges[i], eventModifier);
+        }
+    }
 }
 
 /**
@@ -281,6 +371,23 @@ export function assertGetMoreFailsWithExpectedError({db, cursorId, collName, exp
     }, msg);
 }
 
+/**
+ * Verify that 'resumeToken' is not a resume token from a control event. Currently only tests for "namespacePlacementChanged" events.
+ */
+export function assertNoControlEventToken(resumeToken) {
+    const decodedPbrt = decodeResumeToken(resumeToken);
+    if (decodedPbrt.tokenType !== highWaterMarkResumeTokenType) {
+        const opType = decodedPbrt.eventIdentifier && decodedPbrt.eventIdentifier.operationType;
+        assert.neq(
+            opType,
+            "namespacePlacementChanged",
+            "postBatchResumeToken is the resume token of an internally swallowed " +
+                "control event and cannot be resumed",
+            {pbrt: resumeToken, decodedPbrt},
+        );
+    }
+}
+
 export function ChangeStreamTest(_db, options) {
     // Keeps track of cursors opened during the test so that we can be sure to
     // clean them up before the test completes.
@@ -296,6 +403,16 @@ export function ChangeStreamTest(_db, options) {
         return isResumableChangeStreamError(error) || _extraRetryableErrors.includes(error.code);
     }
 
+    function _getResumeTokenComparable(token) {
+        assert(token, "Resume token must be present", {token});
+        assert.eq(typeof token, "object", "Resume token must be an object", {token});
+        assert(token.hasOwnProperty("_data"), "Resume token must have _data field", {token});
+        assert.eq(typeof token._data, "string", "Resume token must have string _data field", {
+            token,
+        });
+        return token._data;
+    }
+
     function updateResumeToken(cursor, changeEvents) {
         // This isn't fool proof since anyone can just a getMore command on the raw cursor.
         const cursorId = String(cursor.id);
@@ -304,11 +421,82 @@ export function ChangeStreamTest(_db, options) {
         }
         const cursorInfo = _cursorData.get(cursorId);
 
-        if (changeEvents && changeEvents.length > 0) {
-            cursorInfo.resumeToken =
-                changeEvents[changeEvents.length - 1]._id || cursor.postBatchResumeToken;
-        } else if (cursor.postBatchResumeToken) {
-            cursorInfo.resumeToken = cursor.postBatchResumeToken;
+        const events = changeEvents && changeEvents.length > 0 ? changeEvents : null;
+
+        const getRequestedResumeToken = () => {
+            const cursorInfo = _cursorData.get(String(cursor.id));
+            if (!cursorInfo || !cursorInfo.pipeline || cursorInfo.pipeline.length === 0) {
+                return null;
+            }
+            const stage = cursorInfo.pipeline[0];
+            const options = stage && stage.$changeStream ? stage.$changeStream : {};
+            return options.resumeAfter || options.startAfter || null;
+        };
+
+        // Verify that 'current' sorts greater-or-equal to 'requested'.
+        const assertNotRegressed = (current, requested, label) => {
+            assert.gte(
+                bsonWoCompare(
+                    _getResumeTokenComparable(current),
+                    _getResumeTokenComparable(requested),
+                ),
+                0,
+                label + " regressed below the preceding token",
+                {requested, current},
+            );
+        };
+
+        // Outside of multiversion tests, the server must never return a resume token that sorts
+        // before the resume/start point requested by the caller.
+        // TODO SERVER-134853 Enable the check in multiversion tests as well.
+        if (!isMultiversion) {
+            const requestedToken = getRequestedResumeToken(cursor);
+            let previousToken = requestedToken || cursorInfo.resumeToken || null;
+
+            // Check every event token in order. They must not regress, but need not be strictly
+            // monotonic: some DDL/resharding events (e.g. reshardBlockingWrites) are emitted once
+            // per shard, and the resume token does not include the recipient shard id, so events
+            // from different shards may produce exactly the same resume token.
+            if (events) {
+                for (let i = 0; i < events.length; i++) {
+                    const eventToken = events[i]._id;
+                    if (previousToken) {
+                        assertNotRegressed(eventToken, previousToken, "event token at index " + i);
+                    }
+                    previousToken = eventToken;
+                }
+            }
+
+            // Check the postBatchResumeToken against the previous token (last event, or
+            // requested/previous if no events). PBRT must not regress.
+            if (cursor.postBatchResumeToken) {
+                if (previousToken) {
+                    assertNotRegressed(
+                        cursor.postBatchResumeToken,
+                        previousToken,
+                        "postBatchResumeToken",
+                    );
+                }
+
+                // A PBRT that is an event token must be a resumable event. The v2 change stream
+                // reader swallows internal control events before they reach
+                // DSCSEnsureResumeTokenPresent, so their event tokens are not resumable and must
+                // never be exposed as a PBRT.
+                assertNoControlEventToken(cursor.postBatchResumeToken);
+                previousToken = cursor.postBatchResumeToken;
+            }
+
+            // Persist the latest seen resume token for the next getMore.
+            cursorInfo.resumeToken = previousToken;
+        } else {
+            // In multiversion mode, just track the latest token without validation.
+            // TODO SERVER-134853 Remove this branch.
+            if (events) {
+                const lastEvent = events[events.length - 1];
+                cursorInfo.resumeToken = lastEvent._id;
+            } else {
+                cursorInfo.resumeToken = cursor.postBatchResumeToken || cursorInfo.resumeToken;
+            }
         }
     }
 
@@ -533,7 +721,20 @@ export function ChangeStreamTest(_db, options) {
                 if (attemptNumber === maxRetries || !_isRetryableError(e)) {
                     throw e;
                 }
-                self.restartChangeStream(cursor);
+                try {
+                    self.restartChangeStream(cursor);
+                } catch (restartError) {
+                    // Restarting the stream can itself fail while the underlying condition that
+                    // made the getMore retryable (e.g. the cluster being unavailable) is still in
+                    // effect. Looping back would retry the getMore against the same (possibly
+                    // already-disposed) cursor, which can throw an unlabeled CursorNotFound and
+                    // mask the original, correctly-labeled error. Throw the original instead.
+                    logProgress("ChangeStreamTest.getNextBatch: restart failed", {
+                        code: restartError.code,
+                        error: restartError.message,
+                    });
+                    throw e;
+                }
             }
         }
         throw new Error("Failed to get next batch after retries");
@@ -730,6 +931,30 @@ export function ChangeStreamTest(_db, options) {
     };
 
     /**
+     * Equivalent to the free-standing assertInvalidateOp() for a ChangeStreamTest cursor.
+     * Asserts that the given opType triggers an invalidate entry depending on the type of change
+     * stream ('cursor' must already have been drained up to the invalidating event):
+     *     - single collection streams: drop, rename, and dropDatabase.
+     *     - whole DB streams: dropDatabase.
+     *     - whole cluster streams: none.
+     * Returns the invalidate document if there was one, or null otherwise.
+     */
+    self.assertInvalidateOp = function ({cursor, opType}) {
+        if (
+            !isChangeStreamPassthrough() ||
+            (changeStreamPassthroughType() == ChangeStreamWatchMode.kDb && opType == "dropDatabase")
+        ) {
+            const changes = self.assertNextChangesEqual({
+                cursor,
+                expectedChanges: [{operationType: "invalidate"}],
+                expectInvalidate: true,
+            });
+            return changes[0];
+        }
+        return null;
+    };
+
+    /**
      * Iterates through the change stream and asserts that the next changes are the expected ones.
      * The order of the change events from the cursor relative to their order in the list of
      * expected changes is ignored, however.
@@ -815,12 +1040,26 @@ export function ChangeStreamTest(_db, options) {
 
     /**
      * Returns the document to be used for the value of a $changeStream stage, given a watchMode
-     * of type ChangeStreamWatchMode and optional resumeAfter value.
+     * of type ChangeStreamWatchMode and optional resumeAfter value. Any 'extraOptions' (e.g.
+     * {fullDocument: "updateLookup"}) are merged in; the watchMode-derived and resumeAfter fields
+     * take precedence over them.
      */
-    self.getChangeStreamStage = function (watchMode, resumeAfter) {
-        const changeStreamDoc = {};
+    self.getChangeStreamStage = function (
+        watchMode,
+        resumeAfter,
+        startAtOperationTime,
+        extraOptions = {},
+    ) {
+        if (resumeAfter && startAtOperationTime) {
+            throw new Error("cannot use both resumeAfter and startAtOperationTime");
+        }
+
+        const changeStreamDoc = {...extraOptions};
         if (resumeAfter) {
             changeStreamDoc.resumeAfter = resumeAfter;
+        }
+        if (startAtOperationTime) {
+            changeStreamDoc.startAtOperationTime = startAtOperationTime;
         }
 
         if (watchMode == ChangeStreamWatchMode.kCluster) {
@@ -831,15 +1070,32 @@ export function ChangeStreamTest(_db, options) {
 
     /**
      * Create a change stream of the given watch mode (see ChangeStreamWatchMode) on the given
-     * collection. Will resume from a given point if resumeAfter is specified.
+     * collection. Will resume from a given point if resumeAfter is specified. Any 'options' are
+     * merged into the $changeStream stage (e.g. {fullDocument: "updateLookup"}).
      */
-    self.getChangeStream = function ({watchMode, coll, resumeAfter}) {
+    self.getChangeStream = function ({
+        watchMode,
+        coll,
+        resumeAfter,
+        startAtOperationTime,
+        batchSize = 0,
+        options = {},
+    }) {
         return self.startWatchingChanges({
-            pipeline: [{$changeStream: self.getChangeStreamStage(watchMode, resumeAfter)}],
+            pipeline: [
+                {
+                    $changeStream: self.getChangeStreamStage(
+                        watchMode,
+                        resumeAfter,
+                        startAtOperationTime,
+                        options,
+                    ),
+                },
+            ],
             collection: watchMode == ChangeStreamWatchMode.kCollection ? coll : 1,
-            // Use a batch size of 0 to prevent any notifications from being returned in the first
+            // Use a default batch size of 0 to prevent any notifications from being returned in the first
             // batch. These would be ignored by ChangeStreamTest.getOneChange().
-            aggregateOptions: {cursor: {batchSize: 0}},
+            aggregateOptions: {cursor: {batchSize}},
         });
     };
 
@@ -1142,6 +1398,54 @@ export function advanceClusterTime(db) {
         "Advancing oplog time before waiting for changestream. See SERVER-131399 for motivation";
     for (const primary of FixtureHelpers.getPrimaries(db)) {
         assert.commandWorked(primary.getDB("admin").runCommand({appendOplogNote: 1, data: {msg}}));
+    }
+}
+
+/**
+ * Advance the cluster time on every primary of the test fixture, including the config server
+ * primary, then ensure every router has observed the advanced cluster time. This covers a
+ * dedicated (non-config-shard) config server as well as multi-router fixtures, where a mongos
+ * that served none of the preceding traffic may still hold an older cluster time.
+ */
+export function advanceClusterTimeIncludingConfigServer(db) {
+    const msg =
+        "Advancing oplog time before waiting for changestream. See SERVER-131399 for motivation";
+    // In transaction passthroughs the override may have left a transaction open on the test's
+    // session. Commit it now via a non-transactional command on that session: the commands below
+    // run on other sessions, and the override would otherwise try to commit the open transaction
+    // with the wrong lsid and fail with "transaction that was not started".
+    assert.commandWorked(db.adminCommand({ping: 1}));
+
+    // The cluster appendOplogNote below only targets shards; write directly to every replica set
+    // first so a dedicated config server is covered too. In config-shard mode the config server
+    // is also listed in config.shards, so it may receive a second (harmless) no-op write.
+    // getAllReplicas() constructs fresh connections that have not observed the cluster time
+    // gossiped to 'db', so propagate it explicitly: otherwise the no-op below could be
+    // timestamped below that time, which would defeat the purpose of this helper.
+    const signedClusterTime = db.getMongo().getClusterTime();
+    for (const replSet of FixtureHelpers.getAllReplicas(db, true /* includeConfigServers */)) {
+        const primary = replSet.getPrimary();
+        if (signedClusterTime) {
+            primary.advanceClusterTime(signedClusterTime);
+        }
+        assert.commandWorked(primary.getDB("admin").runCommand({appendOplogNote: 1, data: {msg}}));
+    }
+
+    // Run appendOplogNote through every router: it writes a no-op on all shards, and the shard
+    // responses advance the issuing router's cluster time before the command returns.
+    // Temporarily disable mongos pinning so the individual router connections behind the
+    // multi-router proxy are reachable; with pinning active the proxy only exposes the pinned
+    // router.
+    const conn = db.getMongo();
+    const pinnedBefore = TestData.pinToSingleMongos;
+    TestData.pinToSingleMongos = false;
+    try {
+        const routers = conn.isMultiRouter ? conn._mongoConnections : [conn];
+        for (const router of routers) {
+            assert.commandWorked(router.adminCommand({appendOplogNote: 1, data: {msg}}));
+        }
+    } finally {
+        TestData.pinToSingleMongos = pinnedBefore;
     }
 }
 

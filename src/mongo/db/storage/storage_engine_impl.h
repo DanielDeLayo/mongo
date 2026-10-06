@@ -116,19 +116,23 @@ public:
 
     void setLastMaterializedLsn(uint64_t lsn) override;
 
-    void setRecoveryCheckpointMetadata(std::string_view checkpointMetadata) override;
+    Status setRecoveryCheckpointMetadata(std::string_view checkpointMetadata) override;
 
     void promoteToLeader() override;
 
-    void demoteFromLeader() override;
+    void demoteToFollower() override;
 
     void setStableTimestamp(Timestamp stableTimestamp, bool force = false) override;
 
     Timestamp getStableTimestamp() const override;
 
-    void setStepDownTimestamp(Timestamp stepDownTimestamp) override;
+    void setStepDownTimestamp(WithLock, Timestamp stepDownTimestamp) override;
 
     Timestamp getStepDownTimestamp() const override;
+
+    std::unique_lock<std::mutex> lockStepDown() override {
+        return _engine->lockStepDown();
+    }
 
     void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
 
@@ -186,9 +190,7 @@ public:
     }
 
     void dropIdent(RecoveryUnit& ru, std::string_view ident) override;
-    void addDropPendingIdent(const DropTime& dropTime,
-                             std::shared_ptr<Ident> ident,
-                             DropIdentCallback&& onDrop) override;
+    void addDropPendingIdent(const DropTime& dropTime, std::shared_ptr<Ident> ident) override;
     void dropUnknownIdent(RecoveryUnit& ru,
                           const Timestamp& stableTimestamp,
                           std::string_view ident) override;
@@ -303,9 +305,7 @@ public:
 
     Status fixDatabaseSize() override;
 
-    void pauseOrResumeAutoCompactForWriteBlock(OperationContext* opCtx,
-                                               bool pause,
-                                               std::string_view oplogIdent = {}) override;
+    void pauseAutoCompactForReplicaSetWritesBlock(OperationContext* opCtx) override;
 
     bool underCachePressure(int concurrentOpOuts) override;
 
@@ -317,6 +317,8 @@ public:
 
     StatusWith<int64_t> getIndexStorageSize(
         OperationContext* opCtx, const std::vector<std::string>& indexIdents) const override;
+
+    StatusWith<int64_t> getSharedHistoryStoreStorageSize(OperationContext* opCtx) const override;
 
 private:
     using CollIter = std::list<std::string>::iterator;

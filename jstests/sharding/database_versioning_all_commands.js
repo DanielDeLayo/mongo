@@ -33,6 +33,7 @@
  */
 
 import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {isServerSideJavaScriptEnabled} from "jstests/libs/js_engine_util.js";
 import {ShardingTest} from "jstests/libs/shardingtest.js";
 import {
     commandsAddedToMongodSinceLastLTS,
@@ -495,6 +496,7 @@ const allTestCases = {
             },
         },
         cleanupStructuredEncryptionData: {skip: "requires encrypted collections"},
+        clearJoinPlanCache: {skip: "unversioned and executes on all shards"},
         clearJumboFlag: {skip: "does not forward command to primary shard"},
         clearLog: {skip: "executes locally on mongos (not sent to any remote node)"},
         collMod: {
@@ -713,6 +715,9 @@ const allTestCases = {
         },
         getTransitionToDedicatedConfigServerStatus: {skip: "not on a user database"},
         getLog: {skip: "executes locally on mongos (not sent to any remote node)"},
+        getMetricsFilteringAllowlist: {
+            skip: "executes locally on mongos (not sent to any remote node)",
+        },
         getMore: {skip: "requires a previously established cursor"},
         getParameter: {skip: "executes locally on mongos (not sent to any remote node)"},
         getQueryableEncryptionCountInfo: {
@@ -1040,6 +1045,9 @@ const allTestCases = {
             skip: "executes locally on mongos (not sent to any remote node)",
             conditional: true,
         },
+        updateMetricsFilteringAllowlist: {
+            skip: "executes locally on mongos (not sent to any remote node)",
+        },
         updateRole: {skip: "always targets the config server"},
         updateSearchIndex: {skip: "executes locally on mongos", conditional: true},
         updateUser: {skip: "always targets the config server"},
@@ -1344,6 +1352,7 @@ const allTestCases = {
         checkShardingIndex: {skip: "TODO"},
         cleanupOrphaned: {skip: "TODO"},
         cleanupStructuredEncryptionData: {skip: "TODO"},
+        clearJoinPlanCache: {skip: "not on a user database"},
         clearLog: {skip: "TODO"},
         cloneCollectionAsCapped: {skip: "TODO"},
         clusterAbortTransaction: {skip: "TODO"},
@@ -1413,6 +1422,7 @@ const allTestCases = {
         getESECMKIdentifierListStatus: {skip: "TODO", conditional: true},
         getESERotateActiveKEKStatus: {skip: "TODO", conditional: true},
         getLog: {skip: "TODO"},
+        getMetricsFilteringAllowlist: {skip: "TODO"},
         getMore: {skip: "TODO"},
         getParameter: {skip: "TODO"},
         getQueryableEncryptionCountInfo: {skip: "TODO"},
@@ -1469,6 +1479,7 @@ const allTestCases = {
         releaseMemory: {skip: "TODO"},
         removeQuerySettings: {skip: "TODO"},
         renameCollection: {skip: "TODO"},
+        repairReplicatedMetadata: {skip: "Never routed via mongos"},
         replSetAbortPrimaryCatchUp: {skip: "TODO"},
         replSetFreeze: {skip: "TODO"},
         replSetGetConfig: {skip: "TODO"},
@@ -1515,12 +1526,15 @@ const allTestCases = {
         startTrafficRecording: {skip: "TODO"},
         stopTrafficRecording: {skip: "TODO"},
         streams_getMetrics: {skip: "TODO", conditional: true},
+        streams_getMorePreview: {skip: "TODO", conditional: true},
         streams_getMoreStreamSample: {skip: "TODO", conditional: true},
         streams_getStats: {skip: "TODO", conditional: true},
         streams_listStreamProcessors: {skip: "TODO", conditional: true},
+        streams_previewStream: {skip: "TODO", conditional: true},
         streams_sendEvent: {skip: "TODO", conditional: true},
         streams_startStreamProcessor: {skip: "TODO", conditional: true},
         streams_startStreamSample: {skip: "TODO", conditional: true},
+        streams_stopPreview: {skip: "TODO", conditional: true},
         streams_stopStreamProcessor: {skip: "TODO", conditional: true},
         streams_testOnlyGetFeatureFlags: {skip: "TODO", conditional: true},
         streams_testOnlyInsert: {skip: "TODO", conditional: true},
@@ -1528,7 +1542,7 @@ const allTestCases = {
         streams_updateFeatureFlags: {skip: "TODO", conditional: true},
         streams_writeCheckpoint: {skip: "TODO", conditional: true},
         sysprofile: {skip: "TODO"},
-        testCommandFeatureFlaggedOnLatestFCV83: {skip: "internal command", conditional: true},
+        testCommandFeatureFlaggedOnLatestFCV91: {skip: "internal command", conditional: true},
         testDeprecation: {skip: "TODO", conditional: true},
         testDeprecationInVersion2: {skip: "TODO", conditional: true},
         testInternalTransactions: {skip: "TODO", conditional: true},
@@ -1540,6 +1554,7 @@ const allTestCases = {
         transitionToShardedCluster: {skip: "TODO"},
         update: {skip: "TODO"},
         updateESECMKIdentifierList: {skip: "TODO", conditional: true},
+        updateMetricsFilteringAllowlist: {skip: "admin write command"},
         updateRole: {skip: "TODO"},
         updateSearchIndex: {skip: "TODO"},
         updateUser: {skip: "TODO"},
@@ -1581,6 +1596,19 @@ const doTest = (
     }
 
     const isMultiversion = Boolean(jsTest.options().useRandomBinVersionsWithinReplicaSet);
+
+    // mapReduce with JS map/reduce functions needs a server-side JS engine, which is absent on some
+    // builds (e.g. ppc64le links scripting_none). Skip just that command there so the rest of the
+    // coverage still runs, rather than tagging out the whole test.
+    if (
+        testCases.mapReduce &&
+        testCases.mapReduce.run &&
+        !isServerSideJavaScriptEnabled(connection)
+    ) {
+        testCases.mapReduce = {
+            skip: "mapReduce uses server-side JS, which is unavailable on this build (e.g. PPC)",
+        };
+    }
 
     commandsRemovedSinceLastLTS.forEach(function (cmd) {
         testCases[cmd] = {

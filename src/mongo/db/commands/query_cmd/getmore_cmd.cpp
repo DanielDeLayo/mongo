@@ -21,6 +21,8 @@
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/cursor_in_use_info.h"
 #include "mongo/db/logical_time.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
+#include "mongo/db/memory_tracking/query_memory_load_shedding.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/namespace_string_util.h"
 #include "mongo/db/operation_context.h"
@@ -43,6 +45,7 @@
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/query_knobs/query_knob_configuration.h"
+#include "mongo/db/query/query_latency_accumulator.h"
 #include "mongo/db/read_concern.h"
 #include "mongo/db/read_concern_support_result.h"
 #include "mongo/db/repl/optime.h"
@@ -54,6 +57,7 @@
 #include "mongo/db/shard_role/shard_catalog/raw_data_operation.h"
 #include "mongo/db/shard_role/transaction_resources.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/stats/top.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/db/transaction/transaction_participant.h"
@@ -688,14 +692,12 @@ public:
                 awaitDataState(opCtx).shouldWaitForInserts = true;
             }
 
-            waitWithPinnedCursorDuringGetMoreBatch.execute([&](const BSONObj& data) {
-                CurOpFailpointHelpers::waitWhileFailPointEnabled(
-                    &waitWithPinnedCursorDuringGetMoreBatch,
-                    opCtx,
-                    "waitWithPinnedCursorDuringGetMoreBatch",
-                    []() {}, /*empty function*/
-                    nss);
-            });
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                &waitWithPinnedCursorDuringGetMoreBatch,
+                opCtx,
+                "waitWithPinnedCursorDuringGetMoreBatch",
+                /*whileWaiting=*/nullptr,
+                nss);
 
             const auto shouldSaveCursor = generateBatch(opCtx,
                                                         cursorPin.getCursor(),
@@ -703,6 +705,13 @@ public:
                                                         cursorPin->isTailable(),
                                                         &nextBatch,
                                                         &numResults);
+            // Unlike registerCursor(), the pipeline-level check cannot run here: the flag is only
+            // missing at this point when the mongot stage was established after registration (e.g.
+            // nested in a $lookup/$unionWith sub-pipeline built during this getMore). Testing the
+            // recorded mongotCursorId covers that case.
+            if (CurOp::get(opCtx)->debug().mongotCursorId.has_value()) {
+                cursorPin->setMayHoldMongotTaskExecutor();
+            }
 
             const bool isChangeStream = cursorPin->isChangeStreamQuery();
 
@@ -717,6 +726,16 @@ public:
             exec->getPlanExplainer().getSummaryStats(&postExecutionStats);
             postExecutionStats.totalKeysExamined -= preExecutionStats.totalKeysExamined;
             postExecutionStats.totalDocsExamined -= preExecutionStats.totalDocsExamined;
+
+            // Attribute this getMore's time here, while the cursor's QueryLifespan is still bound:
+            // it unbinds before completeOperation, so that chokepoint can't see getMores.
+            if (auto strategy = postExecutionStats.planSelectionStrategy;
+                strategy && shouldRecordLatencyStats(opCtx)) {
+                auto& queryLatency = QueryLatencyAccumulator::get(opCtx);
+                queryLatency.recordStrategy(*strategy);
+                queryLatency.addLatency(curOp->elapsedTimeExcludingPauses());
+            }
+
             curOp->debug().setPlanSummaryMetrics(std::move(postExecutionStats));
 
             // We do not report 'execStats' for aggregation or other cursors with the
@@ -854,6 +873,8 @@ public:
 
         void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) override {
             const auto& cmd = request();
+            // A memory shedding kill will also kill the underlying cursor, so this can free
+            markOperationQueryMemorySheddingEligible(opCtx);
             // Gets the number of write ops in the current multidocument transaction.
             auto getNumTxnOps = [opCtx]() -> boost::optional<size_t> {
                 if (opCtx->inMultiDocumentTransaction()) {

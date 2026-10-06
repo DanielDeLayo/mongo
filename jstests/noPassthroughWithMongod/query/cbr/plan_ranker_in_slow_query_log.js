@@ -1,6 +1,7 @@
 /**
  * Tests that the slow query log and the profiler report which plan ranker ("planRanker") selected
- * the winning plan: "cbr" when the cost-based ranker chose it, and "mp" when the multi-planner did.
+ * the winning plan: "costBased" when the cost-based ranker chose it, and "multiPlanning" when the
+ * multi-planner did.
  *
  * @tags: [
  *   requires_fcv_90,
@@ -60,7 +61,7 @@ describe("planRanker in slow query log and profiler", function () {
         };
     }
 
-    it("reports 'cbr' when the cost-based ranker chooses the winning plan", function () {
+    it("reports 'costBased' when the cost-based ranker chooses the winning plan", function () {
         // TODO (SERVER-119581): Remove once featureFlagGetExecutorDeferredEngineChoice is removed.
         if (!FeatureFlagUtil.isEnabled(db, "GetExecutorDeferredEngineChoice")) {
             jsTest.log.info(
@@ -75,19 +76,27 @@ describe("planRanker in slow query log and profiler", function () {
             internalQueryCBRCEMode: "samplingCE",
         });
         const {fromLog, fromProfiler} = runAndGetPlanRanker("planRankerMarkerCbr");
-        assert.eq(fromLog, "cbr", "slow query log should report planRanker: cbr");
-        assert.eq(fromProfiler, "cbr", "profiler should report planRanker: cbr");
+        assert.eq(fromLog, "costBased", "slow query log should report planRanker: costBased");
+        assert.eq(fromProfiler, "costBased", "profiler should report planRanker: costBased");
     });
 
-    it("reports 'mp' when the multi-planner chooses the winning plan", function () {
+    it("reports 'multiPlanning' when the multi-planner chooses the winning plan", function () {
         // Disabling CBR forces the multi-planner to select the winning plan at runtime.
         setPlanRankerConfig(db, {featureFlagCostBasedRanker: false});
         const {fromLog, fromProfiler} = runAndGetPlanRanker("planRankerMarkerMp");
-        assert.eq(fromLog, "mp", "slow query log should report planRanker: mp");
-        assert.eq(fromProfiler, "mp", "profiler should report planRanker: mp");
+        assert.eq(
+            fromLog,
+            "multiPlanning",
+            "slow query log should report planRanker: multiPlanning",
+        );
+        assert.eq(
+            fromProfiler,
+            "multiPlanning",
+            "profiler should report planRanker: multiPlanning",
+        );
     });
 
-    it("reports 'none' when a cached plan is used (no ranking took place)", function () {
+    it("reports 'cachedPlan' when a cached plan is used (no ranking took place)", function () {
         setPlanRankerConfig(db, {featureFlagCostBasedRanker: false});
 
         const predicate = {a: 1, b: 6};
@@ -115,13 +124,49 @@ describe("planRanker in slow query log and profiler", function () {
 
         assert.eq(
             JSON.parse(logLine).attr.planRanker,
-            "none",
-            "cache hit should report planRanker: none",
+            "cachedPlan",
+            "cache hit should report planRanker: cachedPlan",
         );
-        assert.eq(profileEntry.planRanker, "none", "cache hit should report planRanker: none");
+        assert.eq(
+            profileEntry.planRanker,
+            "cachedPlan",
+            "cache hit should report planRanker: cachedPlan",
+        );
     });
 
-    it("reports 'none' when only one candidate plan exists (no ranking needed)", function () {
+    it("reports 'none' for the express path, which selects no plan", function () {
+        setPlanRankerConfig(db, {featureFlagCostBasedRanker: false});
+
+        // The express path builds no PlanExecutor plan selection, so nothing populates the strategy
+        // and diagnostics report "none" rather than claiming a single candidate plan existed.
+        const id = coll.findOne()._id;
+        const marker = "planRankerMarkerExpress";
+        try {
+            assert.commandWorked(db.setProfilingLevel(2, {slowms: 0}));
+            assert.eq(coll.find({_id: id}).comment(marker).itcount(), 1);
+        } finally {
+            assert.commandWorked(db.setProfilingLevel(0));
+        }
+
+        const log = assert.commandWorked(db.adminCommand({getLog: "global"})).log;
+        const logLine = findMatchingLogLine(log, {
+            msg: "Slow query",
+            comment: marker,
+            ns: `test.${coll.getName()}`,
+        });
+        assert(logLine, "did not find slow query log line for express query");
+        const profileEntry = getLatestProfilerEntry(db, {op: "query", "command.comment": marker});
+
+        // "none" is the log/profiler rendering of an absent strategy.
+        assert.eq(
+            JSON.parse(logLine).attr.planRanker,
+            "none",
+            "express query should report planRanker: none",
+        );
+        assert.eq(profileEntry.planRanker, "none", "express query should report planRanker: none");
+    });
+
+    it("reports 'singlePlan' when only one candidate plan exists (no ranking needed)", function () {
         setPlanRankerConfig(db, {featureFlagCostBasedRanker: false});
         coll.getPlanCache().clear();
 
@@ -145,13 +190,13 @@ describe("planRanker in slow query log and profiler", function () {
 
         assert.eq(
             JSON.parse(logLine).attr.planRanker,
-            "none",
-            "single-solution query should report planRanker: none",
+            "singlePlan",
+            "single-solution query should report planRanker: singlePlan",
         );
         assert.eq(
             profileEntry.planRanker,
-            "none",
-            "single-solution query should report planRanker: none",
+            "singlePlan",
+            "single-solution query should report planRanker: singlePlan",
         );
     });
 });

@@ -212,13 +212,16 @@ public:
                                             const InsertDeleteOptions& options,
                                             KeyHandlerFn&& onDuplicateKey,
                                             int64_t* keysInserted,
-                                            int64_t* keysDeleted) = 0;
+                                            int64_t* keysDeleted,
+                                            int64_t* bytesInserted,
+                                            int64_t* bytesDeleted) = 0;
 
     //
     // Bulk operations support
     //
 
     using OnNKeysLoadedFn = std::function<void()>;
+    using OnBytesWrittenFn = std::function<void(int64_t bytesWritten)>;
 
     class [[MONGO_MOD_OPEN]] BulkBuilder {
     public:
@@ -257,6 +260,8 @@ public:
          * new CollectionPtr* and IndexCatalogEntry* entry that shall be used from this point on.
          * @param onNKeysLoaded - Called every onNKeysLoadedFnInterval committed
          * keys. Pass a no-op if periodic resume-state writes are not needed.
+         * @param onBytesWritten - Called once per committed batch with the number of bytes that
+         * batch wrote.
          * @param onNKeysLoadedFnInterval - The number of committed keys between invocations of
          * onNKeysLoaded. Must be >= 1.
          * @param keyBatchSize -  The maximum number of index keys that will be batched together
@@ -274,6 +279,7 @@ public:
                               const RecordIdHandlerFn& onDuplicateRecord,
                               const YieldFn& yieldFn,
                               const OnNKeysLoadedFn& onNKeysLoaded,
+                              const OnBytesWrittenFn& onBytesWritten,
                               int64_t onNKeysLoadedFnInterval,
                               size_t keyBatchSize,
                               size_t keyBatchBytes) = 0;
@@ -511,19 +517,6 @@ public:
                           ContainerWriteBehavior::kDoNotReplicate) const;
 
     /**
-     * Gets the keys of the documents 'from' and 'to' and prepares them for the update.
-     * Provides a ticket for actually performing the update.
-     */
-    void prepareUpdate(OperationContext* opCtx,
-                       const CollectionPtr& collection,
-                       const IndexCatalogEntry* entry,
-                       const BSONObj& from,
-                       const BSONObj& to,
-                       const RecordId& loc,
-                       const InsertDeleteOptions& options,
-                       UpdateTicket* ticket) const;
-
-    /**
      * Perform a validated update.  The keys for the 'from' object will be removed, and the keys
      * for the object 'to' will be added.  Returns OK if the update succeeded, failure if it did
      * not.  If an update does not succeed, the index will be unmodified, and the keys for
@@ -683,7 +676,9 @@ public:
                                     const InsertDeleteOptions& options,
                                     KeyHandlerFn&& onDuplicateKey,
                                     int64_t* keysInserted,
-                                    int64_t* keysDeleted) final;
+                                    int64_t* keysDeleted,
+                                    int64_t* bytesInserted,
+                                    int64_t* bytesDeleted) final;
 
     std::unique_ptr<BulkBuilder> initiateBulk(
         OperationContext* opCtx,
@@ -750,9 +745,24 @@ private:
                       bool dupsAllowed,
                       ContainerWriteBehavior containerWriteBehavior) const;
 
+    /**
+     * Gets the keys of the documents 'from' and 'to' and prepares them for the update.
+     * Provides a ticket for actually performing the update if there is anything to do. Returns
+     * false if no updates are needed.
+     */
+    bool _prepareUpdate(OperationContext* opCtx,
+                        const CollectionPtr& collection,
+                        const IndexCatalogEntry* entry,
+                        const BSONObj& from,
+                        const BSONObj& to,
+                        const RecordId& loc,
+                        const InsertDeleteOptions& options,
+                        UpdateTicket* ticket) const;
+
     Status _indexKeysOrWriteToSideTable(OperationContext* opCtx,
                                         const CollectionPtr& coll,
                                         const IndexCatalogEntry* entry,
+                                        const RecordId& recordId,
                                         const KeyStringSet& keys,
                                         const KeyStringSet& multikeyMetadataKeys,
                                         const MultikeyPaths& multikeyPaths,
@@ -763,6 +773,7 @@ private:
     void _unindexKeysOrWriteToSideTable(OperationContext* opCtx,
                                         const CollectionPtr& coll,
                                         const IndexCatalogEntry* entry,
+                                        const RecordId& recordId,
                                         const KeyStringSet& keys,
                                         const BSONObj& obj,
                                         bool logIfError,
@@ -772,5 +783,13 @@ private:
 
     const std::unique_ptr<SortedDataInterface> _newInterface;
 };
+
+/**
+ * Records updates to the metrics tracking keys and key bytes processed during an index build's side
+ * write drain process, as well as time spent, directly incrementing the counters.
+ */
+void recordIndexBuildSideWritesProcessedStats(int64_t keysProcessed,
+                                              int64_t bytesProcessed,
+                                              Microseconds durationMicros);
 
 }  // namespace mongo

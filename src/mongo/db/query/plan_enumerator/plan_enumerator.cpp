@@ -4,11 +4,6 @@
 
 #include "mongo/db/query/plan_enumerator/plan_enumerator.h"
 
-#include <boost/container/flat_set.hpp>
-#include <boost/container/vector.hpp>
-#include <boost/none.hpp>
-
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/field_ref.h"
@@ -28,6 +23,11 @@
 #include <algorithm>
 #include <set>
 #include <string_view>
+
+#include <boost/container/flat_set.hpp>
+#include <boost/container/vector.hpp>
+#include <boost/none.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
@@ -251,9 +251,13 @@ void tagForSort(MatchExpression* tree) {
     }
 }
 
-bool isNodeEligibleForContainedOrPushdown(MatchExpression* node) {
+// 'currentElemMatchExpr' is the $elemMatch context of the $and being enumerated. A negation may
+// still be pushed into a sibling $or under that same $elemMatch, as both see the same array
+// element.
+bool isNodeEligibleForContainedOrPushdown(MatchExpression* node,
+                                          const MatchExpression* currentElemMatchExpr) {
     auto* rt = indexTagCast<RelevantTag>(node->getTag());
-    if (rt->elemMatchExpr && rt->notExpr) {
+    if (rt->elemMatchExpr && rt->notExpr && rt->elemMatchExpr != currentElemMatchExpr) {
         // Do not extract an index predicate which is a negation inside the $elemMatch. For example,
         // do not extract {a.b: {$ne: 2}} from {a: {$elemMatch: {b: {$ne: 2}}}. Due to the potential
         // presence of arrays at "a", the negation predicate itself is an "under-approximation" of
@@ -493,7 +497,7 @@ bool PlanEnumerator::prepMemo(MatchExpression* node, const PrepMemoContext& cont
         if (MONGO_likely(!_disableOrPushdown)) {
             auto& hashIdx = getOutsidePredHashedIdx(childContextCopy.outsidePreds);
             for (auto pred : indexedPreds) {
-                if (!isNodeEligibleForContainedOrPushdown(pred)) {
+                if (!isNodeEligibleForContainedOrPushdown(pred, context.elemMatchExpr)) {
                     continue;
                 }
                 auto [it, inserted] = hashIdx.insert({pred, OutsidePredRoute{}});
@@ -1114,7 +1118,7 @@ void PlanEnumerator::enumerateAndIntersect(const IndexToPredMap& idxToFirst,
         IndexToPredMap::const_iterator secondIt = firstIt;
         secondIt++;
         for (; secondIt != idxToFirst.end(); secondIt++) {
-            const IndexEntry& firstIndex = (*_indices)[secondIt->first];
+            const IndexEntry& firstIndex = (*_indices)[firstIt->first];
             const IndexEntry& secondIndex = (*_indices)[secondIt->first];
 
             // Limit n^2.

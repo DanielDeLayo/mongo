@@ -35,7 +35,7 @@ public:
     void addSpilledDataSize(long long size);
     void addSpilledDataSizeUncompressed(long long size);
 
-    void incrementNumSpilledEntries();
+    void incrementNumSpilledEntries(long long n = 1);
 
     long long bytesSpilled() const {
         return _bytesSpilled.load();
@@ -116,7 +116,10 @@ public:
     void decrementMemUsage(uint64_t memUsage);
     void resetMemUsage();
     void setMemUsage(uint64_t memUsage);
-    uint64_t memUsage() const;
+
+    uint64_t memUsage() const {
+        return _memUsage;
+    }
 
 private:
     uint64_t _spilledRanges = 0;         // Number of spills.

@@ -77,6 +77,9 @@ namespace mongo {
         const std::unique_ptr<StageParams>& stageParams,                               \
         const boost::intrusive_ptr<ExpressionContext>& expCtx) {                       \
         auto* typedParams = dynamic_cast<StageParamsClass*>(stageParams.get());        \
+        tassert(13162200,                                                              \
+                "Stage params for " #registrationName " have unexpected type",         \
+                typedParams != nullptr);                                               \
         return DocSourceClass::createFromBson(typedParams->getOriginalBson(), expCtx); \
     }                                                                                  \
     ALLOCATE_AND_REGISTER_STAGE_PARAMS(registrationName, StageParamsClass)
@@ -88,6 +91,9 @@ namespace mongo {
         const std::unique_ptr<StageParams>& stageParams,                                 \
         const boost::intrusive_ptr<ExpressionContext>& expCtx) {                         \
         auto* typedParams = dynamic_cast<StageParamsClass*>(stageParams.get());          \
+        tassert(12992000,                                                                \
+                "Stage params for " #registrationName " have unexpected type",           \
+                typedParams != nullptr);                                                 \
         return {DocSourceClass::createFromBson(typedParams->getOriginalBson(), expCtx)}; \
     }                                                                                    \
     ALLOCATE_AND_REGISTER_STAGE_PARAMS(registrationName, StageParamsClass)
@@ -379,18 +385,6 @@ public:
      * in this file.
      */
     static Id allocateId(std::string_view name);
-
-    /**
-     * Notifies this stage that the metadata stream has been elided and will not produce documents.
-     */
-    virtual void skipMetadataStream() {}
-
-    /**
-     * Forwards pipeline-suffix dependencies and referenced built-in variable names to a wrapped
-     * stage that the rule-based rewriter's dependency pass does not visit.
-     */
-    virtual void propagatePipelineSuffixDependencies(const DepsTracker& deps,
-                                                     const std::set<std::string>& builtinVarRefs) {}
 
     /**
      * Returns true if the DocumentSource has a query.

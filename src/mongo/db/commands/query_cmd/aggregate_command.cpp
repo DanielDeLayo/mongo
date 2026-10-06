@@ -15,6 +15,8 @@
 #include "mongo/db/database_name.h"
 #include "mongo/db/database_name_util.h"
 #include "mongo/db/feature_flag.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
+#include "mongo/db/memory_tracking/query_memory_load_shedding.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
@@ -184,6 +186,10 @@ public:
             return request().getGenericArguments();
         }
 
+        bool shouldBypassQuerySettingsRejection() const override {
+            return _liteParsedPipeline.shouldBypassQuerySettingsRejection();
+        }
+
     private:
         bool supportsWriteConcern() const override {
             return true;
@@ -218,6 +224,8 @@ public:
 
         void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) override {
             globalOpCounters().gotAggregate();
+
+            markOperationQueryMemorySheddingEligible(opCtx);
 
             if (_liteParsedPipeline.hasChangeStream()) {
                 change_stream::recordCursorOptionMetrics(request().getCursor().getBatchSize(),
@@ -266,8 +274,7 @@ public:
                                          _privileges,
                                          verbosity,
                                          reply,
-                                         _usedExternalDataSources,
-                                         _ifrContext));
+                                         _usedExternalDataSources));
 
             // The aggregate command's response is unstable when 'explain' or 'exchange' fields are
             // set.
@@ -304,8 +311,7 @@ public:
                                          _privileges,
                                          verbosity,
                                          reply,
-                                         _usedExternalDataSources,
-                                         _ifrContext));
+                                         _usedExternalDataSources));
         }
 
         bool canRetryOnStaleShardMetadataError(const OpMsgRequest& /* unused */) const override {

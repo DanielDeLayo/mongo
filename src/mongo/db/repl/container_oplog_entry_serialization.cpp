@@ -1,31 +1,5 @@
-/**
- *    Copyright (C) 2026-present MongoDB, Inc.
- *
- *    This program is free software: you can redistribute it and/or modify
- *    it under the terms of the Server Side Public License, version 1,
- *    as published by MongoDB, Inc.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    Server Side Public License for more details.
- *
- *    You should have received a copy of the Server Side Public License
- *    along with this program. If not, see
- *    <http://www.mongodb.com/licensing/server-side-public-license>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the Server Side Public License in all respects for
- *    all of the code used other than as permitted herein. If you modify file(s)
- *    with this exception, you may extend this exception to your version of the
- *    file(s), but you are not obligated to do so. If you do not wish to do so,
- *    delete this exception statement from your version. If you delete this
- *    exception statement from all source files in the program, then also delete
- *    it in the license file.
- */
+// Copyright (c) MongoDB, Inc.
+// SPDX-License-Identifier: SSPL-1.0
 
 #include "mongo/db/repl/container_oplog_entry_serialization.h"
 
@@ -55,7 +29,7 @@ std::vector<std::span<const char>> unpackBinDataValues(const auto& arr) {
     keys.reserve(arr.nFields());  // Pre-allocate based on number of array elements
     std::transform(arr.begin(), arr.end(), std::back_inserter(keys), [](const BSONElement& val) {
         uassert(ErrorCodes::TypeMismatch,
-                "Container key array must be BinData Generic",
+                "Container array must be BinData Generic",
                 val.isBinData(BinDataType::BinDataGeneral));
         return getBinDataSpan(val);
     });
@@ -102,6 +76,11 @@ ContainerKey ContainerKey::parse(const BSONElement& elem) {
     }
 }
 
+bool ContainerKey::isPacked(const BSONElement& elem) {
+    // Only an array holds more than one key; NumberLong and BinData are both single keys.
+    return elem.type() == BSONType::array;
+}
+
 void ContainerKey::serialize(std::string_view fieldName, BSONObjBuilder* builder) const {
     std::visit(OverloadedVisitor{
                    [&](const std::vector<std::span<const char>>& keys) {
@@ -117,7 +96,7 @@ void ContainerKey::serialize(std::string_view fieldName, BSONObjBuilder* builder
 }
 
 
-std::vector<std::span<const char>> ContainerKey::getArrayKey() const {
+const std::vector<std::span<const char>>& ContainerKey::getArrayKey() const {
     return assertedGet<std::vector<std::span<const char>>>(_key);
 }
 
@@ -127,6 +106,16 @@ int64_t ContainerKey::getIntKey() const {
 
 std::span<const char> ContainerKey::getBytesKey() const {
     return assertedGet<std::span<const char>>(_key);
+}
+
+size_t ContainerVal::count() const {
+    // Provides a count of values wrapped, can be used to determine if any value is needed when
+    // serializing into an oplog object.
+    OverloadedVisitor visitor(
+        [](std::span<const std::span<const char>> data) -> size_t { return data.size(); },
+        [](std::span<const char> data) -> size_t { return data.size() > 0 ? 1ULL : 0ULL; });
+
+    return std::visit(visitor, _data);
 }
 
 ContainerVal ContainerVal::parse(const BSONElement& elem) {
@@ -144,6 +133,11 @@ ContainerVal ContainerVal::parse(const BSONElement& elem) {
     }
 }
 
+bool ContainerVal::isPacked(const BSONElement& elem) {
+    // Only an array holds more than one value; a lone BinData is a single value.
+    return elem.type() == BSONType::array;
+}
+
 void ContainerVal::serialize(std::string_view fieldName, BSONObjBuilder* builder) const {
     std::visit(OverloadedVisitor{
                    [&](const std::vector<std::span<const char>>& values) {
@@ -158,7 +152,7 @@ void ContainerVal::serialize(std::string_view fieldName, BSONObjBuilder* builder
 }
 
 
-std::vector<std::span<const char>> ContainerVal::getArrayVal() const {
+const std::vector<std::span<const char>>& ContainerVal::getArrayVal() const {
     return assertedGet<std::vector<std::span<const char>>>(_data);
 }
 

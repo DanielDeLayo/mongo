@@ -3,9 +3,10 @@
 
 #include "mongo/db/query/compiler/metadata/path_arrayness.h"
 
-#include "mongo/db/commands/server_status/server_status_metric.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/namespace_string_util.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
 
@@ -19,9 +20,6 @@ using namespace mongo::multikey_paths;
 MONGO_FAIL_POINT_DEFINE(pathArraynessYieldInvalidation);
 
 namespace mongo {
-
-auto& pathArraynessQueriesFailedDueToInvalidation =
-    *MetricBuilder<Counter64>{"query.pathArrayness.queriesFailedDueToInvalidation"};
 
 const PathArrayness& PathArrayness::emptyPathArrayness() {
     static const PathArrayness kEmptyPathArrayness;
@@ -68,8 +66,13 @@ void PathArrayness::addPathsFromIndexKeyPattern(const BSONObj& indexKeyPattern,
 
     size_t indexCounter = 0;
     for (const auto& key : indexKeyPattern) {
-        FieldPath path(key.fieldNameStringData());
-        addPath(path, multikeyPaths[indexCounter], isFullRebuild);
+        // Ignore the key path if it doesn't pass the validation, in this case this field path is
+        // considered to be an array by default.
+        StatusWith<FieldPath> fieldPath =
+            fieldPathWithValidationStatus(std::string(key.fieldNameStringData()));
+        if (fieldPath.isOK()) {
+            addPath(fieldPath.getValue(), multikeyPaths[indexCounter], isFullRebuild);
+        }
         ++indexCounter;
     }
 }
@@ -197,8 +200,13 @@ void PathArrayness::TrieNode::insertPath(const FieldPath& path,
 }
 
 boost::optional<FieldPath> PathArrayness::getFirstInvalidatedPath(
-    const MonotonicallyIncreasingFieldPathSet& nonArrayPaths, const PathArrayness& current) {
-    if (MONGO_unlikely(pathArraynessYieldInvalidation.shouldFail())) {
+    const MonotonicallyIncreasingFieldPathSet& nonArrayPaths,
+    const PathArrayness& current,
+    const NamespaceString& ns) {
+    if (MONGO_unlikely(pathArraynessYieldInvalidation.shouldFail([&](const BSONObj& data) {
+            const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "ns");
+            return fpNss.isEmpty() || fpNss == ns;
+        }))) {
         return FieldPath("pathArraynessYieldInvalidationShouldFail");
     }
     for (const auto& path : nonArrayPaths) {
@@ -216,8 +224,8 @@ void PathArraynessChecker::uassertIfInvalidatedAndSyncEpoch(const PathArrayness&
         return;
     }
     prevEpoch = currentEpoch;
-    if (auto invalidated = PathArrayness::getFirstInvalidatedPath(nonArrayPaths, current)) {
-        pathArraynessQueriesFailedDueToInvalidation.increment();
+    if (auto invalidated = PathArrayness::getFirstInvalidatedPath(nonArrayPaths, current, ns)) {
+        pathArraynessCounters.incrementInvalidation();
         uasserted(
             ErrorCodes::QueryPlanKilled,
             str::stream() << "query plan killed :: non-array path became multikey during yield: "

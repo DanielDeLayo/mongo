@@ -64,7 +64,10 @@ public:
         tassert(11974310, "Expected a non-null query solution for non-idhack queries", solution);
 
         // TODO SERVER-130428 remove `internalQueryEnablePlanShapeAnalysis`
-        if (internalQueryEnablePlanShapeAnalysis.load()) {
+        // Only collect plan shape stats for the top-level query. For example we do not collect
+        // the metrics for the foreign side of a $lookup.
+        const bool inTopLevelQuery = _cq->getExpCtxRaw()->getSubPipelineDepth() == 0;
+        if (internalQueryEnablePlanShapeAnalysis.load() && inTopLevelQuery) {
             auto& opDebug = CurOp::get(_opCtx)->debug();
             // Gate on shouldRequestRemoteMetrics, which checks if metrics are requested by
             // mongos or if the local query stats key exists.
@@ -154,7 +157,8 @@ private:
                                                std::move(execState.sbeYieldPolicy),
                                                std::move(remoteCursors),
                                                std::move(remoteExplains),
-                                               _rankingResult.cachedPlanHash);
+                                               _rankingResult.cachedPlanHash,
+                                               _rankingResult.planSelectionStrategy);
         }
 
         auto sbeYieldPolicy =
@@ -197,7 +201,8 @@ private:
                                            std::move(remoteCursors),
                                            std::move(remoteExplains),
                                            extractMps(),
-                                           std::move(_rankingResult.maybeExplainData));
+                                           std::move(_rankingResult.maybeExplainData),
+                                           _rankingResult.planSelectionStrategy);
     }
 
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeClassicExecutor(
@@ -268,7 +273,8 @@ private:
                 ? boost::make_optional<std::string>(
                       std::move(_rankingResult.plannerParams->replanningData->replanReason))
                 : boost::none,
-            std::move(_rankingResult.maybeExplainData));
+            std::move(_rankingResult.maybeExplainData),
+            _rankingResult.planSelectionStrategy);
     }
 
     void buildRejectedExecutableTreesForExplain(const QuerySolution* solution,

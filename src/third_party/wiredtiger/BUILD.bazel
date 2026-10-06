@@ -1,6 +1,7 @@
 load("@bazel_skylib//lib:selects.bzl", "selects")
 load("//bazel:mongo_src_rules.bzl", "TCMALLOC_DEPS", "mongo_cc_binary", "mongo_cc_library", "symlink")
 load("//bazel/config:generate_config_header.bzl", "generate_config_header")
+load(":wt_local.bzl", "WT_LOCAL")
 load(
     "@wiredtiger_local//:dist/filelist.bzl",
     "WT_FILELIST",
@@ -54,7 +55,7 @@ WT_DEFINES = [
 })
 
 WT_CCFLAGS = [
-    "-Iexternal/wiredtiger_local/src/include",
+    "-I" + WT_LOCAL + "/src/include",
     "-Isrc/third_party/wiredtiger/src/include",
 ] + select({
     "@platforms//os:windows": ["/wd4090"],
@@ -62,9 +63,9 @@ WT_CCFLAGS = [
 }) + select({
     "@platforms//os:linux": ["-Isrc/third_party/wiredtiger/build_linux"],
     "@platforms//os:windows": ["-Isrc/third_party/wiredtiger/build_win"],
-    "@platforms//os:macos": ["-Isrc/third_party/wiredtiger/build_darwin", "-Iexternal/wiredtiger_local/oss/apple"],
+    "@platforms//os:macos": ["-Isrc/third_party/wiredtiger/build_darwin", "-I" + WT_LOCAL + "/oss/apple"],
 }) + select({
-    "@platforms//cpu:s390x": ["-Iexternal/wiredtiger_local/src/checksum/zseries", "-Isrc/third_party/wiredtiger/src/checksum/zseries"],
+    "@platforms//cpu:s390x": ["-I" + WT_LOCAL + "/src/checksum/zseries", "-Isrc/third_party/wiredtiger/src/checksum/zseries"],
     "//conditions:default": [],
 }) + select({
     "@platforms//os:linux": [

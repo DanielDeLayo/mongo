@@ -11,7 +11,7 @@
 #include "mongo/db/query/compiler/ce/sampling/sampling_estimator.h"
 #include "mongo/db/query/compiler/ce/sampling/sampling_estimator_impl.h"
 #include "mongo/db/query/compiler/optimizer/cost_based_ranker/estimates.h"
-#include "mongo/db/query/plan_ranking/plan_ranker_method.h"
+#include "mongo/db/query/plan_ranking/plan_ranker_reason.h"
 #include "mongo/db/query/planner_analysis.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/util/assert_util.h"
@@ -94,7 +94,7 @@ StatusWith<PlanRankingResult> CBRPlanRankingStrategy::rankPlans(
     PlanYieldPolicy::YieldPolicy yieldPolicy,
     const MultipleCollectionAccessor& collections,
     QuerySolutionVector solutions,
-    StringSet topLevelSampleFieldNames,
+    ce::TopLevelSampleFields topLevelSampleFieldNames,
     bool hasRelevantMultikeyIndex) const {
     using namespace cost_based_ranker;
 
@@ -117,9 +117,8 @@ StatusWith<PlanRankingResult> CBRPlanRankingStrategy::rankPlans(
     }
 
     if (ceMode == QueryCBRCEModeEnum::kSamplingCE) {
-        auto meTopLevelFields =
-            ce::extractTopLevelFieldsFromMatchExpression(query.getPrimaryMatchExpression());
-        topLevelSampleFieldNames.merge(meTopLevelFields);
+        topLevelSampleFieldNames.merge(
+            ce::extractTopLevelFieldsFromMatchExpression(query.getPrimaryMatchExpression()));
     }
 
     // Start timer for server status metrics
@@ -150,10 +149,7 @@ StatusWith<PlanRankingResult> CBRPlanRankingStrategy::rankPlans(
         // If we do not have any fields that we want to sample then we just include all the
         // fields in the sample. This can occur for primary match expressions which are
         // not trivially estimable yet have no top-level fields (eg. $geoNear or $expr).
-        samplingEstimator->generateSample(
-            topLevelSampleFieldNames.empty()
-                ? ce::ProjectionParams{ce::NoProjection{}}
-                : ce::TopLevelFieldsProjection{std::move(topLevelSampleFieldNames)});
+        samplingEstimator->generateSample(std::move(topLevelSampleFieldNames).toProjectionParams());
 
         auto samplingDurationMicros =
             tickSource->ticksTo<Microseconds>(tickSource->getTicks() - startSamplingTicks);
@@ -177,8 +173,37 @@ StatusWith<PlanRankingResult> CBRPlanRankingStrategy::rankPlans(
     microsHistogram.increment(durationCount<Microseconds>(durationMicros));
     microsTotal.increment(durationMicros);
 
-    if (planRankingResult.isOK() && planRankingResult.getValue().needsWorksMeasuredForPlanCache) {
-        CurOp::get(opCtx)->debug().planRankerMethod = PlanRankerMethod::kCostBasedRanker;
+    // planWithCostBasedRanking() sets planSelectionStrategy from whether CBR chose a winner among
+    // competing candidates; a sole candidate is kSinglePlan, as there was nothing to rank. Only the
+    // rankerChoice.reason is recorded here.
+    if (planRankingResult.isOK()) {
+        auto& result = planRankingResult.getValue();
+        if (result.needsWorksMeasuredForPlanCache) {
+            // CBR chose a single winning plan.
+            // When CBR choice was prescribed by configuration (planRanker == kCostBased) record
+            // that fact as rankerChoice.reason = kQueryPlanRankerKnob.
+            // When running as the inner engine of a mixed strategy (planRanker == kMixed, called
+            // via getBestCBRPlan) the config reason resolves to none and the calling strategy
+            // records the reason for its own decision.
+            if (result.maybeExplainData) {
+                const auto reason = plannerParams.getPlanRankerReasonFromConfig();
+                if (reason.has_value()) {
+                    result.maybeExplainData->planRankerReason = reason;
+                }
+            }
+        } else if (result.solutions.size() > 1) {
+            // CBR could not estimate all plans (a node rejected with UnsupportedCbrNode) and
+            // returned multiple solutions to be ranked by the multi-planner, so MP - not CBR -
+            // decides the winner.
+            // All three callers of this strategy - the strict costBased knob, and the two mixed
+            // strategies (NoMultiplanningResults, EstimateRankingEffort) calling via
+            // getBestCBRPlan - report the same reason for this outcome, so this inner site
+            // records it unconditionally; the callers leave it untouched when the multi-planner
+            // finishes ranking downstream.
+            if (result.maybeExplainData) {
+                result.maybeExplainData->planRankerReason = PlanRankerReason::kCBRInestimableNode;
+            }
+        }
     }
 
     return planRankingResult;

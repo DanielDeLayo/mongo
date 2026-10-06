@@ -26,29 +26,6 @@ public:
                                    ReplicatedFastCountTestPersistenceProvider>())) {}
 };
 
-// A persistence provider that reports both shouldUseReplicatedFastCount() and
-// mustUseContainerWrites() as true.
-// TODO(SERVER-126250): The shared test helper currently only flips shouldUseReplicatedFastCount()
-// so we override it here.
-class ListCollectionsFastCountProvider
-    : public replicated_fast_count::test_helpers::ReplicatedFastCountTestPersistenceProvider {
-public:
-    bool shouldUseReplicatedFastCount() const override {
-        return true;
-    }
-
-    bool mustUseContainerWrites() const override {
-        return true;
-    }
-};
-
-class IsReplicatedFastCountListCollectionsWithProviderTest : public CatalogTestFixture {
-public:
-    IsReplicatedFastCountListCollectionsWithProviderTest()
-        : CatalogTestFixture(Options().setPersistenceProvider(
-              std::make_unique<ListCollectionsFastCountProvider>())) {}
-};
-
 TEST_F(IsReplicatedFastCountEnabledTest, DisabledWhenFeatureFlagOff) {
     unittest::ServerParameterGuard featureFlag("featureFlagReplicatedFastCount", false);
     EXPECT_FALSE(isReplicatedFastCountEnabled(operationContext()));
@@ -105,16 +82,6 @@ TEST(ReplicatedFastCountEligibleNsTest, ImplicitlyReplicatedNotEligible) {
     EXPECT_FALSE(isReplicatedFastCountEligible(configImageCollectionNss));
 }
 
-TEST(ReplicatedFastCountEligibleNsTest, SizeCountAndTimestampStoresNotEligible) {
-    const NamespaceString fastCountStoreNss =
-        NamespaceString::makeGlobalConfigCollection(NamespaceString::kReplicatedFastCountStore);
-    EXPECT_FALSE(isReplicatedFastCountEligible(fastCountStoreNss));
-
-    const NamespaceString fastCountTimestampStoreNss = NamespaceString::makeGlobalConfigCollection(
-        NamespaceString::kReplicatedFastCountStoreTimestamps);
-    EXPECT_FALSE(isReplicatedFastCountEligible(fastCountTimestampStoreNss));
-}
-
 TEST(ReplicatedFastCountEligibleNsTest, AdminSystemVersionNotEligible) {
     EXPECT_FALSE(isReplicatedFastCountEligible(NamespaceString::kServerConfigurationNamespace));
 }
@@ -125,37 +92,30 @@ TEST(ReplicatedFastCountEligibleNsTest, SystemProfileNotEligible) {
     EXPECT_FALSE(isReplicatedFastCountEligible(systemProfileNss));
 }
 
-TEST(ReplicatedFastCountEligibleNsTest, OplogEligible) {
+TEST(ReplicatedFastCountEligibleNsTest, OplogEligibleWhenTruncationFFOn) {
+    unittest::ServerParameterGuard ffTruncation("featureFlagSizeBasedOplogTruncationForDisagg",
+                                                true);
     EXPECT_TRUE(isReplicatedFastCountEligible(NamespaceString::kRsOplogNamespace));
 }
 
-TEST_F(IsReplicatedFastCountEnabledTest, ListCollectionsDisabledWhenBothFlagsOff) {
+TEST(ReplicatedFastCountEligibleNsTest, OplogIneligibleWhenTruncationFFOff) {
+    unittest::ServerParameterGuard ffTruncation("featureFlagSizeBasedOplogTruncationForDisagg",
+                                                false);
+    EXPECT_FALSE(isReplicatedFastCountEligible(NamespaceString::kRsOplogNamespace));
+}
+
+TEST_F(IsReplicatedFastCountEnabledTest, ListCollectionsDisabledWhenFlagOff) {
     unittest::ServerParameterGuard ffReplicatedFastCount("featureFlagReplicatedFastCount", false);
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", false);
     EXPECT_FALSE(isReplicatedFastCountListCollectionsEnabled(operationContext()));
 }
 
-TEST_F(IsReplicatedFastCountEnabledTest, ListCollectionsDisabledWhenOnlyReplicatedFastCountOn) {
+TEST_F(IsReplicatedFastCountEnabledTest, ListCollectionsEnabledWhenFlagOn) {
     unittest::ServerParameterGuard ffReplicatedFastCount("featureFlagReplicatedFastCount", true);
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", false);
-    EXPECT_FALSE(isReplicatedFastCountListCollectionsEnabled(operationContext()));
-}
-
-TEST_F(IsReplicatedFastCountEnabledTest, ListCollectionsDisabledWhenOnlyContainerWritesOn) {
-    unittest::ServerParameterGuard ffReplicatedFastCount("featureFlagReplicatedFastCount", false);
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", true);
-    EXPECT_FALSE(isReplicatedFastCountListCollectionsEnabled(operationContext()));
-}
-
-TEST_F(IsReplicatedFastCountEnabledTest, ListCollectionsEnabledWhenBothFlagsOn) {
-    unittest::ServerParameterGuard ffReplicatedFastCount("featureFlagReplicatedFastCount", true);
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", true);
     EXPECT_TRUE(isReplicatedFastCountListCollectionsEnabled(operationContext()));
 }
 
 TEST_F(IsReplicatedFastCountEnabledTest, ListCollectionsDisabledWhenTestCommandsOff) {
     unittest::ServerParameterGuard ffReplicatedFastCount("featureFlagReplicatedFastCount", true);
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", true);
     setTestCommandsEnabled(false);
     const auto restoreTestCommands = ScopeGuard([] { setTestCommandsEnabled(true); });
     EXPECT_FALSE(isReplicatedFastCountListCollectionsEnabled(operationContext()));
@@ -189,34 +149,17 @@ TEST_F(IsReplicatedFastCountEnabledTest,
 }
 
 // The following tests verify that listCollections fast count emission is gated solely on the
-// feature flags and is NOT enabled by persistence provider traits.
-TEST_F(IsReplicatedFastCountListCollectionsWithProviderTest,
-       ListCollectionsDisabledWithProviderWhenBothFlagsOff) {
+// feature flag and is NOT enabled by persistence provider traits.
+TEST_F(IsReplicatedFastCountEnabledWithProviderTest,
+       ListCollectionsDisabledWithProviderWhenFlagOff) {
     unittest::ServerParameterGuard ffReplicatedFastCount("featureFlagReplicatedFastCount", false);
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", false);
     EXPECT_FALSE(isReplicatedFastCountListCollectionsEnabled(operationContext()));
 }
 
-TEST_F(IsReplicatedFastCountListCollectionsWithProviderTest,
-       ListCollectionsDisabledWithProviderWhenOnlyReplicatedFastCountOn) {
-    unittest::ServerParameterGuard ffReplicatedFastCount("featureFlagReplicatedFastCount", true);
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", false);
-    EXPECT_FALSE(isReplicatedFastCountListCollectionsEnabled(operationContext()));
-}
-
-TEST_F(IsReplicatedFastCountListCollectionsWithProviderTest,
-       ListCollectionsDisabledWithProviderWhenOnlyContainerWritesOn) {
-    unittest::ServerParameterGuard ffReplicatedFastCount("featureFlagReplicatedFastCount", false);
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", true);
-    EXPECT_FALSE(isReplicatedFastCountListCollectionsEnabled(operationContext()));
-}
-
-// Sanity check: with the provider present and both flags on, emission is still enabled (the
+// Sanity check: with the provider present and the flag on, emission is still enabled (the
 // provider neither enables nor disables the feature on its own).
-TEST_F(IsReplicatedFastCountListCollectionsWithProviderTest,
-       ListCollectionsEnabledWithProviderWhenBothFlagsOn) {
+TEST_F(IsReplicatedFastCountEnabledWithProviderTest, ListCollectionsEnabledWithProviderWhenFlagOn) {
     unittest::ServerParameterGuard ffReplicatedFastCount("featureFlagReplicatedFastCount", true);
-    unittest::ServerParameterGuard ffContainerWrites("featureFlagContainerWrites", true);
     EXPECT_TRUE(isReplicatedFastCountListCollectionsEnabled(operationContext()));
 }
 
@@ -248,6 +191,8 @@ TEST_P(ShouldReadFromReplicatedFastCountTestWithParams, ShouldReadFromReplicated
     const auto& p = GetParam();
 
     unittest::ServerParameterGuard flag("featureFlagReplicatedFastCount", p.featureFlagOn);
+    unittest::ServerParameterGuard ffTruncation("featureFlagSizeBasedOplogTruncationForDisagg",
+                                                true);
 
     for (const auto& [dbName, collName, expected] : p.testCases) {
         const auto nss = NamespaceString::createNamespaceString_forTest(dbName, collName);
@@ -275,10 +220,6 @@ INSTANTIATE_TEST_SUITE_P(
                 {"config", "system.preimages", false},
                 {"config", "image_collection", false},
                 {"config", "system.profile", false},
-                {"config", std::string{NamespaceString::kReplicatedFastCountStore}, false},
-                {"config",
-                 std::string{NamespaceString::kReplicatedFastCountStoreTimestamps},
-                 false},
                 {NamespaceString::kRsOplogNamespace.dbName().toString_forTest(),
                  std::string{NamespaceString::kRsOplogNamespace.coll()},
                  false},
@@ -303,10 +244,6 @@ INSTANTIATE_TEST_SUITE_P(
                 {"config", "system.preimages", false},
                 {"config", "image_collection", false},
                 {"config", "system.profile", false},
-                {"config", std::string{NamespaceString::kReplicatedFastCountStore}, false},
-                {"config",
-                 std::string{NamespaceString::kReplicatedFastCountStoreTimestamps},
-                 false},
             },
         },
         ShouldReadFromReplicatedFastCountParams{
@@ -326,10 +263,6 @@ INSTANTIATE_TEST_SUITE_P(
                 {"config", "system.preimages", false},
                 {"config", "image_collection", false},
                 {"config", "system.profile", false},
-                {"config", std::string{NamespaceString::kReplicatedFastCountStore}, false},
-                {"config",
-                 std::string{NamespaceString::kReplicatedFastCountStoreTimestamps},
-                 false},
             },
         },
         ShouldReadFromReplicatedFastCountParams{
@@ -349,10 +282,6 @@ INSTANTIATE_TEST_SUITE_P(
                 {"config", "system.preimages", false},
                 {"config", "image_collection", false},
                 {"config", "system.profile", false},
-                {"config", std::string{NamespaceString::kReplicatedFastCountStore}, false},
-                {"config",
-                 std::string{NamespaceString::kReplicatedFastCountStoreTimestamps},
-                 false},
             },
         }),
     [](const ::testing::TestParamInfo<ShouldReadFromReplicatedFastCountParams>& info) {

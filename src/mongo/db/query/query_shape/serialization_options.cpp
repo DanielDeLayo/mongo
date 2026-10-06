@@ -9,7 +9,6 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
-#include "mongo/db/query/query_shape/serialization_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/string_map.h"
@@ -525,7 +524,7 @@ bool SerializationOptions::isSerializingForExplain() const {
     return verbosity.has_value();
 }
 
-bool SerializationOptions::isSerializingForQueryStats() const {
+bool SerializationOptions::isShapifying() const {
     return literalPolicy != LiteralSerializationPolicy::kUnchanged || transformIdentifiers;
 }
 

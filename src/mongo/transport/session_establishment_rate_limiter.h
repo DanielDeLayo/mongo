@@ -14,6 +14,7 @@
 #include "mongo/util/versioned_value.h"
 
 #include <cstdint>
+#include <string_view>
 
 namespace mongo::transport {
 /**
@@ -28,13 +29,15 @@ namespace mongo::transport {
  * - ingressConnectionEstablishmentMaxQueueDepth
  * - ingressConnectionEstablishmentRateLimiterBypass
  *
- * SessionEstablishmentRateLimiter is used in SessionWorkflow if the following feature flag
- * server parameter is true:
+ * SessionEstablishmentRateLimiter is used in SessionWorkflow if the following server parameter is
+ * true:
  *
- * - featureFlagRateLimitIngressConnectionEstablishment
+ * - ingressConnectionEstablishmentRateLimiterEnabled
  */
 class [[MONGO_MOD_PUBLIC]] SessionEstablishmentRateLimiter {
 public:
+    static constexpr std::string_view kRateLimiterName = "SessionEstablishmentRateLimiter";
+
     SessionEstablishmentRateLimiter();
 
     virtual ~SessionEstablishmentRateLimiter() = default;

@@ -146,8 +146,8 @@ public:
      * failing hello requests with ShutdownInProgress. Returns true if the server entered quiesce
      * mode.
      *
-     * We take in quiesceTime only for reporting purposes. The waiting during quiesce mode happens
-     * external to the ReplicationCoordinator.
+     * We take in quiesceTime for reporting and to bound any waiting this function does. The grace
+     * window wait happens external to the ReplicationCoordinator.
      */
     virtual bool enterQuiesceModeIfSecondary(Milliseconds quiesceTime) = 0;
 
@@ -828,7 +828,8 @@ public:
      * Handles an incoming heartbeat command with arguments 'args'. Populates 'response';
      * returns a Status with either OK or an error message.
      */
-    virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
+    virtual Status processHeartbeatV1(OperationContext* opCtx,
+                                      const ReplSetHeartbeatArgsV1& args,
                                       ReplSetHeartbeatResponse* response) = 0;
 
 
@@ -1056,7 +1057,10 @@ public:
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
         WriteConcernOptions wc) = 0;
 
-    virtual Status stepUpIfEligible(OperationContext* opCtx, bool skipDryRun) = 0;
+    virtual Status stepUpIfEligible(
+        OperationContext* opCtx,
+        bool skipDryRun,
+        boost::optional<Date_t> priorPrimaryStopAcceptingWritesTime = boost::none) = 0;
 
     virtual ServiceContext* getServiceContext() = 0;
 
@@ -1291,11 +1295,12 @@ public:
     virtual void addAppliedOpTimeObserver(std::unique_ptr<OpTimeObserver> observer) = 0;
 
     /**
-     * Returns a future that becomes ready the next time lastApplied advances on this node.
-     * The default implementation returns an already-ready future; nodes that support push-based
-     * exhaust heartbeat notifications should override this to return a pending future.
+     * Returns a future that becomes ready the next time a value reported in this node's heartbeat
+     * response advances (lastApplied or the last installed checkpoint timestamp). The default
+     * implementation returns an already-ready future; nodes that support push-based exhaust
+     * heartbeat notifications should override this to return a pending future.
      */
-    virtual SharedSemiFuture<void> getNextAppliedOpTimeFuture() {
+    virtual SharedSemiFuture<void> getNextHeartbeatNotificationFuture() {
         return SemiFuture<void>::makeReady().share();
     }
 

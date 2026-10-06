@@ -36,13 +36,6 @@ public:
                 stats->spillingStats);
         }
     }
-    void visit(tree_walker::MaybeConstPtr<true, sbe::WindowStats> stats) final {
-        if (stats->spillingStats.getSpills() > 0) {
-            _summary.usedDisk = true;
-            _summary.spillingStatsPerStage[PlanSummaryStats::SpillingStage::SET_WINDOW_FIELDS]
-                .accumulate(stats->spillingStats);
-        }
-    }
     void visit(tree_walker::MaybeConstPtr<true, NearStats> stats) final {
         if (stats->spillingStats.getSpills() > 0) {
             _summary.usedDisk = true;
@@ -137,12 +130,12 @@ private:
      * Helper method to accumulate the plan summary stats from the input source.
      */
     void accumulate(const PlanSummaryStats& statsIn) {
-        // Attributes replanReason and fromMultiPlanner have been intentionally skipped as they
-        // always describe the left-hand side (or "local") collection.
+        // Attributes replanReason, fromMultiPlanner and planSelectionStrategy have been
+        // intentionally skipped as they always describe the left-hand side (or "local") collection.
         // Consider $lookup case. $lookup runtime plan selection may happen against the foreign
-        // collection an arbitrary number of times. A single value of 'replanReason' and
-        // 'fromMultiPlanner' can't really report correctly on the behavior of arbitrarily many
-        // occurrences of runtime planning for a single query.
+        // collection an arbitrary number of times. A single value of 'replanReason',
+        // 'fromMultiPlanner' or 'planSelectionStrategy' can't really report correctly on the
+        // behavior of arbitrarily many occurrences of runtime planning for a single query.
 
         _summary.nReturned += statsIn.nReturned;
         _summary.totalKeysExamined += statsIn.totalKeysExamined;

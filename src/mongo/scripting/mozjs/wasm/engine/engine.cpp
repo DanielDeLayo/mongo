@@ -28,6 +28,7 @@
 #include "mongo/scripting/mozjs/common/valuereader.h"
 #include "mongo/scripting/mozjs/common/valuewriter.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/timer.h"
 
 #include <cstring>
 #include <ctime>
@@ -1299,6 +1300,27 @@ err_code_t MozJSScriptEngine::setGlobalValue(const char* name,
     return SM_OK;
 }
 
+err_code_t MozJSScriptEngine::deleteGlobal(const char* name,
+                                           size_t name_len,
+                                           wasm_mozjs_error_t* err) {
+    clear_error(err);
+    if (!_initialized || !_cx || !_global)
+        return SM_E_BAD_STATE;
+    if (!name || name_len == 0)
+        return SM_E_INVALID_ARG;
+
+    JSAutoRealm ar(_cx, _global);
+    ExecutionCheck chk(_cx, err);
+
+    std::string nameStr(name, name_len);
+    // Performs a best effort delete. A non-configurable global delete is a silent no-op rather than
+    // an error.
+    if (!chk.ok(JS_DeleteProperty(_cx, _global, nameStr.c_str()), SM_E_INTERNAL)) {
+        return err ? err->code : SM_E_INTERNAL;
+    }
+    return SM_OK;
+}
+
 err_code_t MozJSScriptEngine::reset(wasm_mozjs_error_t* err) {
     clear_error(err);
     if (!_initialized || !_cx || !_global)
@@ -1561,15 +1583,23 @@ void MozJSScriptEngine::sleep(Milliseconds ms) {
     // slices. nanosleep is a blocking host call — the WASM epoch check only
     // triggers when control returns to WASM code. Slicing keeps sleep
     // interruptible by the DeadlineMonitor on the host side.
-    auto remaining = ms;
-    constexpr Milliseconds kSlice{1};
-    while (remaining > Milliseconds{0}) {
-        auto slice = std::min(remaining, kSlice);
+    //
+    // Note that due to clock granularity and scheduling, the number of slices in a given duration
+    // is not guaranteed to be 'duration / slice'. Practically, there will be fewer slices than
+    // expected due to scheduling jitter causing the sleep to be longer than the slice time.
+    // While it is possible for nanosleep to return early due to signal interruption, it is less
+    // likely.
+    constexpr Microseconds kSlice{Milliseconds{1}};
+    Timer timer;
+    Microseconds elapsed{0};
+    while (elapsed < ms) {
+        const Microseconds remaining = ms - elapsed;
+        const auto slice = std::min(remaining, kSlice);
         struct timespec ts;
         ts.tv_sec = 0;
-        ts.tv_nsec = static_cast<long>(slice.count() * 1'000'000L);
+        ts.tv_nsec = static_cast<long>(slice.count() * 1'000L);
         nanosleep(&ts, nullptr);
-        remaining -= slice;
+        elapsed = timer.elapsed();
     }
 }
 

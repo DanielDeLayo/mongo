@@ -2,15 +2,13 @@
 // SPDX-License-Identifier: SSPL-1.0
 
 
-#include <boost/filesystem/path.hpp>
-#include <boost/move/utility_core.hpp>
-// IWYU pragma: no_include "cxxabi.h"
+#include "mongo/db/ftdc/controller.h"
+
 #include "mongo/base/counter.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status/server_status_metric.h"
 #include "mongo/db/ftdc/collector.h"
-#include "mongo/db/ftdc/controller.h"
 #include "mongo/db/ftdc/ftdc_controller_gen.h"
 #include "mongo/db/ftdc/util.h"
 #include "mongo/db/service_context.h"
@@ -28,6 +26,10 @@
 #include <memory>
 #include <mutex>
 #include <tuple>
+
+#include <boost/filesystem/path.hpp>
+#include <boost/move/utility_core.hpp>
+// IWYU pragma: no_include "cxxabi.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
@@ -360,21 +362,20 @@ void FTDCController::doLoop(Service* service) try {
                 uasserted(ErrorCodes::BSONObjectTooLarge,
                           "Injected BSONObjectTooLarge exception for testing");
             }
-            auto collectSample = feature_flags::gFeatureFlagGaplessFTDC.isEnabled()
+            auto [sample, startTime] = feature_flags::gFeatureFlagGaplessFTDC.isEnabled()
                 ? _asyncPeriodicCollectors->collect(client, sectionSizes)
                 : _periodicCollectors.collect(client, sectionSizes);
 
-            lastSampleSizeBytes.set(std::get<0>(collectSample).objsize());
+            lastSampleSizeBytes.set(sample.objsize());
 
-            Status s = _mgr->writeSampleAndRotateIfNeeded(
-                client, std::get<0>(collectSample), std::get<1>(collectSample));
+            Status s = _mgr->writeSampleAndRotateIfNeeded(client, sample, startTime);
 
             uassertStatusOK(s);
 
             // Store a reference to the most recent document from the periodic collectors
             {
                 std::lock_guard<std::mutex> lock(_mutex);
-                _mostRecentPeriodicDocument = std::get<0>(collectSample);
+                _mostRecentPeriodicDocument = sample;
             }
         } catch (const DBException& e) {
             logCollectionError(e.toStatus(), sectionSizes);
@@ -395,9 +396,10 @@ void FTDCController::doLoop(Service* service) try {
             metadataCaptureFrequencyCountdown = _config.metadataCaptureFrequency;
             sectionSizes.clear();
             try {
-                auto collectSample = _periodicMetadataCollectors.collect(client, sectionSizes);
-                Status s = _mgr->writePeriodicMetadataSampleAndRotateIfNeeded(
-                    client, std::get<0>(collectSample), std::get<1>(collectSample));
+                auto [sample, startTime] =
+                    _periodicMetadataCollectors.collect(client, sectionSizes);
+                Status s =
+                    _mgr->writePeriodicMetadataSampleAndRotateIfNeeded(client, sample, startTime);
                 iassert(s);
 
             } catch (const DBException& e) {

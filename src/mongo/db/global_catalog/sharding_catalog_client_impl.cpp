@@ -43,7 +43,6 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/sharding_environment/client/shard.h"
 #include "mongo/db/sharding_environment/grid.h"
-#include "mongo/db/sharding_environment/shard_ref.h"
 #include "mongo/db/topology/cluster_parameters/sharding_cluster_parameters_gen.h"
 #include "mongo/db/topology/cluster_role.h"
 #include "mongo/db/topology/shard_registry.h"
@@ -184,11 +183,13 @@ StatusWith<std::vector<KeyDocumentType>> _getNewKeys(OperationContext* opCtx,
 
 }  // namespace
 
-AggregateCommandRequest makeCollectionAndChunksAggregation(OperationContext* opCtx,
-                                                           const NamespaceString& collectionsNss,
-                                                           const NamespaceString& chunksNss,
-                                                           const NamespaceString& nss,
-                                                           const ChunkVersion& sinceVersion) {
+AggregateCommandRequest makeCollectionAndChunksAggregation(
+    OperationContext* opCtx,
+    const NamespaceString& collectionsNss,
+    const NamespaceString& chunksNss,
+    const NamespaceString& nss,
+    const ChunkVersion& sinceVersion,
+    const boost::optional<ExpiredHistoryFilter>& expiredFilter) {
     ResolvedNamespaceMap resolvedNamespaces;
     resolvedNamespaces[collectionsNss] = {collectionsNss, std::vector<BSONObj>()};
     resolvedNamespaces[chunksNss] = {chunksNss, std::vector<BSONObj>()};
@@ -252,6 +253,13 @@ AggregateCommandRequest makeCollectionAndChunksAggregation(OperationContext* opC
     //                                 },
     //                             }
     //                         },
+    //                         // Only when expiredHistoryFilter is set
+    //                         {
+    //                           $match: { $or : [
+    //                             { shard: <shardId> },
+    //                             { onCurrentShardSince: { $gt: <oldest WT timestamp> } }
+    //                           ] }
+    //                         },
     //                         { $match: { lastmod: { $gte: <sinceVersion> } } },
     //                         {
     //                             $sort: {
@@ -291,6 +299,13 @@ AggregateCommandRequest makeCollectionAndChunksAggregation(OperationContext* opC
     //                                 },
     //                             }
     //                         },
+    //                         // Only when expiredHistoryFilter is set
+    //                         {
+    //                           $match: { $or : [
+    //                             { shard: <shardId> },
+    //                             { onCurrentShardSince: { $gt: <oldest WT timestamp> } }
+    //                           ] }
+    //                         },
     //                         {
     //                             $sort: {
     //                                 lastmod: 1
@@ -318,6 +333,16 @@ AggregateCommandRequest makeCollectionAndChunksAggregation(OperationContext* opC
         const auto uuidExpr =
             Arr{Value{"$" + ChunkType::collectionUUID.name()}, Value{"$$local_uuid"sv}};
 
+        const auto expiredFilterExpr = expiredFilter
+            ? Value{Doc{
+                  {"$match",
+                   Doc{{"$or",
+                        Value{Arr{Value{Doc{{ChunkType::shard.name(),
+                                             expiredFilter->shardId.toString()}}},
+                                  Value{Doc{{ChunkType::onCurrentShardSince.name(),
+                                             Doc{{"$gt", expiredFilter->oldestTimestamp}}}}}}}}}}}}
+            : Value{/*noop*/};
+
         constexpr auto chunksLookupOutputFieldName = "chunks"sv;
 
         const auto lookupPipeline = [&]() {
@@ -327,6 +352,7 @@ AggregateCommandRequest makeCollectionAndChunksAggregation(OperationContext* opC
                 {"let", letExpr},
                 {"pipeline",
                  Arr{Value{Doc{{"$match", Doc{{"$expr", Doc{{"$eq", uuidExpr}}}}}}},
+                     expiredFilterExpr,
                      incremental
                          ? Value{Doc{{"$match",
                                       Doc{{ChunkType::lastmod.name(),
@@ -387,14 +413,12 @@ DatabaseType ShardingCatalogClientImpl::getDatabase(OperationContext* opCtx,
 
     // The admin database is always hosted on the config server.
     if (dbName.isAdminDB()) {
-        return DatabaseType(
-            dbName, ShardRef{ShardId::kConfigServerId}, DatabaseVersion::makeFixed());
+        return DatabaseType(dbName, ShardId::kConfigServerId, DatabaseVersion::makeFixed());
     }
 
     // The config database's primary shard is always config, and it is always sharded.
     if (dbName.isConfigDB()) {
-        return DatabaseType(
-            dbName, ShardRef{ShardId::kConfigServerId}, DatabaseVersion::makeFixed());
+        return DatabaseType(dbName, ShardId::kConfigServerId, DatabaseVersion::makeFixed());
     }
 
     // If config only mode is enabled, we are not allowed to access any databases other than the

@@ -53,6 +53,10 @@ std::vector<BSONObj> buildResolvedPipelineForSimpleCase(
     // Mongot user pipelines are a unique case: $_internalSearchIdLookup applies the view pipeline.
     // For this reason, we do not expand the aggregation request to include the view pipeline.
     // Caller is expected to use LiteParsedPipeline::handleView() for such cases.
+    // TODO SERVER-117168: Remove the isExtensionMongotPipeline check. Extension search stages
+    // declare FirstStageViewApplicationPolicy::kDoNothing via
+    // get_first_stage_view_application_policy (other extension stages default to kDefaultPrepend),
+    // so the policy-driven handleView() paths handle them without stage-name special-casing.
     if (search_helper_bson_obj::isMongotPipeline(ifrContext, userPipeline) ||
         search_helper_bson_obj::isExtensionMongotPipeline(ifrContext, userPipeline)) {
         return userPipeline;
@@ -149,7 +153,11 @@ buildResolvedPipelineForRegularView(OperationContext* opCtx,
     auto pipeline =
         Pipeline::parseFromLiteParsed(lpp, expCtx, nullptr, false, true /* useStubInterface */);
 
-    query_shape::SerializationOptions wireOpts{.isSerializingForRemoteDispatch = true};
+    // The serialized BSON will be soon re-parsed when we restart the agg path with the resolved
+    // pipeline. We set the serializeForReparse flag so search stages emit user-form rather than the
+    // full IDL form (which would trip the LiteParse-layer internal-field check).
+    query_shape::SerializationOptions wireOpts{.isSerializingForRemoteDispatch = true,
+                                               .serializeForReparse = true};
     return {pipeline->serializeToBson(wireOpts), std::move(lpp)};
 }
 
@@ -233,7 +241,8 @@ void PipelineResolver::validateStagesOnView(LiteParsedPipeline* userLPP,
     auto view = ResolvedNamespace::makeForView(
         viewNss, resolvedView.getResolvedNamespace(), resolvedView.getBsonPipeline(), options);
     view.desugarViewPipeline();
-    userLPP->bindResolvedNamespaceToStages(view, resolvedNamespaces);
+    userLPP->bindResolvedNamespaceToStages(
+        view, resolvedNamespaces, 0, userLPP->getStages().size());
 }
 
 PipelineResolver::MongosViewRequestResult PipelineResolver::buildResolvedMongosViewRequest(
@@ -266,6 +275,10 @@ PipelineResolver::MongosViewRequestResult PipelineResolver::buildResolvedMongosV
         // first stage handles view resolution itself, but subsequent extension stages still need
         // view validation. Timeseries views are skipped; their pipeline is fully resolved above via
         // buildResolvedPipelineForSimpleCase.
+        // TODO SERVER-115069: this binds the view to top-level stages only. Not user-visible
+        // today — mongot sub-pipelines on views resolve shard-side via the sharded view kickback,
+        // where the recursive mongod path runs. Fold into the recursive resolver with the
+        // bindResolvedNamespace() migration.
         if (!resolvedView->isTimeseries()) {
             LiteParserOptions options{.ifrContext = ifrContext};
             auto lpp = LiteParsedPipeline(request, true, options);
@@ -301,7 +314,9 @@ namespace {
 bool resolveInvolvedNamespacesImpl(LiteParsedPipeline* lpp,
                                    const NamespaceString& mainNss,
                                    const ResolvedNamespaceMap& resolvedNamespaces,
-                                   stdx::unordered_set<NamespaceString>& inProgress) {
+                                   stdx::unordered_set<NamespaceString>& inProgress,
+                                   bool bindOnly,
+                                   size_t bindOnlyStart) {
     auto isView = [&](const NamespaceString& nss) {
         auto it = resolvedNamespaces.find(nss);
         return it != resolvedNamespaces.end() && it->second.isInvolvedNamespaceAView();
@@ -322,8 +337,22 @@ bool resolveInvolvedNamespacesImpl(LiteParsedPipeline* lpp,
     // The delta (post - pre) is the number of newly prepended stages iterated in Pass A below.
     const size_t originalSize = lpp->getStages().size();
 
-    if (search_helpers::isMongotLiteParsedPipeline(*lpp)) {
-        lpp->bindResolvedNamespaceToStages(view, resolvedNamespaces);
+    if (bindOnly || search_helpers::isMongotLiteParsedPipeline(*lpp)) {
+        // bindOnly: bind view/namespace info onto the stages without prepending the view pipeline
+        // (the view is already materialized in the resolved pipeline; prepending would
+        // double-apply it). Mongot pipelines likewise handle first-stage view resolution
+        // themselves and must not have the view prepended here.
+        if (bindOnly && bindOnlyStart > 0) {
+            // The materialized prefix must still resolve secondary namespaces, but must not bind
+            // the top-level view onto its own source/idLookup stages.
+            lpp->bindResolvedNamespaceToStages(
+                ResolvedNamespace{}, resolvedNamespaces, 0, bindOnlyStart);
+            lpp->bindResolvedNamespaceToStages(
+                view, resolvedNamespaces, bindOnlyStart, lpp->getStages().size());
+        } else {
+            lpp->bindResolvedNamespaceToStages(
+                view, resolvedNamespaces, bindOnly ? bindOnlyStart : 0, lpp->getStages().size());
+        }
     } else {
         lpp->handleView(view, resolvedNamespaces);
     }
@@ -331,7 +360,7 @@ bool resolveInvolvedNamespacesImpl(LiteParsedPipeline* lpp,
     // NOTE: lpp->getStages() must be obtained AFTER handleView/_stitchFront, which replaces
     // the internal vector, invalidating any reference taken before the call.
     const auto& stages = lpp->getStages();
-    const size_t viewStageCount = stages.size() - originalSize;
+    const size_t viewStageCount = bindOnly ? bindOnlyStart : stages.size() - originalSize;
 
     // Recurse into the sub-pipeline views of every stage in the index range [begin, end).
     // Returns true if any nested view was bound.
@@ -360,7 +389,7 @@ bool resolveInvolvedNamespacesImpl(LiteParsedPipeline* lpp,
                     continue;
                 }
                 bound |= resolveInvolvedNamespacesImpl(
-                    sub.operator->(), subNss, resolvedNamespaces, inProgress);
+                    sub.operator->(), subNss, resolvedNamespaces, inProgress, bindOnly, 0);
                 if (isRunningAgainstAView) {
                     inProgress.erase(cycleNss);
                 }
@@ -399,9 +428,12 @@ bool resolveInvolvedNamespacesImpl(LiteParsedPipeline* lpp,
 bool PipelineResolver::resolveInvolvedNamespacesOnLiteParsedPipeline(
     LiteParsedPipeline* lpp,
     const NamespaceString& mainNss,
-    const ResolvedNamespaceMap& resolvedNamespaces) {
+    const ResolvedNamespaceMap& resolvedNamespaces,
+    bool bindOnly,
+    size_t bindOnlyStart) {
     stdx::unordered_set<NamespaceString> inProgress;
-    return resolveInvolvedNamespacesImpl(lpp, mainNss, resolvedNamespaces, inProgress);
+    return resolveInvolvedNamespacesImpl(
+        lpp, mainNss, resolvedNamespaces, inProgress, bindOnly, bindOnlyStart);
 }
 
 void PipelineResolver::insertTopLevelViewEntry(

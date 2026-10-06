@@ -36,6 +36,18 @@ static const absl::flat_hash_set<NamespaceString> globallyUniqueConfigDbCollecti
     NamespaceString::kConfigMongosNamespace,
     NamespaceString::kLogicalSessionsNamespace};
 
+bool startsWithCollectionNameModel(std::string_view collectionName, std::string_view model) {
+    if (collectionName.size() < model.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < model.size(); ++i) {
+        if (model[i] != '%' && model[i] != collectionName[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 bool NamespaceString::isListCollectionsCursorNS() const {
@@ -310,7 +322,7 @@ bool NamespaceString::isFLE2StateCollection(std::string_view coll) {
 }
 
 bool NamespaceString::isSystemStatsCollection() const {
-    return coll().starts_with(kStatisticsCollectionPrefix);
+    return coll().starts_with(kStatisticsCollectionPrefix) || isFieldStatsCollection();
 }
 
 bool NamespaceString::isOutStageTmpCollection() const {
@@ -319,6 +331,21 @@ bool NamespaceString::isOutStageTmpCollection() const {
     return coll().starts_with(kOutTmpCollectionPrefix) ||
         (isTimeseriesBucketsCollection() &&
          getTimeseriesViewNamespace().coll().starts_with(kOutTmpCollectionPrefix));
+}
+
+bool NamespaceString::isConvertToCappedTmpCollection() const {
+    const auto c = coll();
+    return c.size() > kConvertToCappedTmpCollectionModelPrefix.size() &&
+        startsWithCollectionNameModel(c, kConvertToCappedTmpCollectionModelPrefix);
+}
+
+bool NamespaceString::isRenameCollectionTmpCollection() const {
+    auto c = coll();
+    if (isTimeseriesBucketsCollection()) {
+        c.remove_prefix(kTimeseriesBucketsCollectionPrefix.size());
+    }
+    return c.size() == kRenameCollectionTmpCollectionModel.size() &&
+        startsWithCollectionNameModel(c, kRenameCollectionTmpCollectionModel);
 }
 
 // TODO SERVER-101784: Remove this once 9.0 is LTS and viewful time-series collections no longer

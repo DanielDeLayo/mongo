@@ -20,6 +20,19 @@ set -o pipefail
 bazel_evergreen_shutils::activate_and_cd_src
 bazel_evergreen_shutils::export_ssl_paths_if_needed
 
+# Builds that must link against a system OpenSSL installed outside the toolchain (for
+# example custom builds) can set the mongo_openssl_root expansion to the installation
+# prefix; the toolchain repository rules then prepend its include/lib directories to the
+# toolchain's search paths. This must be exported because repository rules read the
+# environment of the Bazel server process.
+if [[ -n "${mongo_openssl_root:-}" ]]; then
+    export MONGO_OPENSSL_ROOT="${mongo_openssl_root}"
+fi
+
+# These files are generated only for tasks that consume a provenance invocation. Remove any
+# leftover copies before deciding whether this compile should create one.
+rm -f .bazel_provenance_build_invocation .bazel_crypt_build_invocation
+
 # if build_patch_id is passed, try to download binaries from specified
 # evergreen patch.
 build_patch_id="${build_patch_id:-${reuse_compile_from}}"
@@ -127,6 +140,13 @@ BEP_FULL="build_events_full.json"
 BEP_OUT="build_events.json"
 BASE_FLAGS="--verbose_failures ${LOCAL_ARG} ${MONGO_VERSION_ARG} ${bazel_args:-}"
 BASE_FLAGS+=" ${bazel_compile_flags:-} ${task_compile_flags:-} ${patch_compile_flags:-}"
+GDB_INDEX_FLAGS=""
+if bazel_evergreen_shutils::should_disable_gdb_index "${task_name:-}"; then
+    # Append this after all task and patch flags so CI configuration cannot
+    # accidentally re-enable the expensive index generation action.
+    GDB_INDEX_FLAGS=" --//bazel/config:gdb_index=False"
+    echo "Disabling GDB index for CI task ${task_name}"
+fi
 RELEASE_EXECUTION_LOG_FLAGS=""
 RELEASE_LOCAL_SAFETY_FLAGS=""
 SHOULD_ENFORCE_RELEASE_LOCAL_BUILD=false
@@ -157,13 +177,21 @@ if [[ "${SHOULD_ENFORCE_RELEASE_LOCAL_BUILD}" == "true" ]]; then
     fi
 fi
 
-ALL_FLAGS="${BASE_FLAGS}"
+ALL_FLAGS="${BASE_FLAGS}${GDB_INDEX_FLAGS}"
 ALL_FLAGS+=" --build_event_json_file=${BEP_FULL}"
 ALL_FLAGS+=" ${RELEASE_EXECUTION_LOG_FLAGS}"
 echo "${ALL_FLAGS}" >.bazel_build_flags
 
 # Save the entire bazel build invocation to attach to the task for re-running locally
-echo "bazel build ${ALL_FLAGS} ${targets} ${RELEASE_LOCAL_SAFETY_FLAGS}" >.bazel_build_invocation
+BUILD_INVOCATION="bazel build ${ALL_FLAGS} ${targets} ${RELEASE_LOCAL_SAFETY_FLAGS}"
+echo "${BUILD_INVOCATION}" >.bazel_build_invocation
+
+PROVENANCE_BUILD_INVOCATION_FILE="$(
+    bazel_evergreen_shutils::get_provenance_build_invocation_file "${task_name:-}" "${project:-}"
+)"
+if [[ -n "${PROVENANCE_BUILD_INVOCATION_FILE}" ]]; then
+    echo "${BUILD_INVOCATION}" >"${PROVENANCE_BUILD_INVOCATION_FILE}"
+fi
 
 set +o errexit
 

@@ -36,6 +36,7 @@
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/logv2/log.h"
 #include "mongo/otel/telemetry_context_holder.h"
+#include "mongo/otel/traces/span/span.h"
 #include "mongo/otel/traces/telemetry_context_serialization.h"
 #include "mongo/otel/traces/tracing_enablement.h"
 #include "mongo/rpc/factory.h"
@@ -184,10 +185,10 @@ void appendMetadata(OperationContext* opCtx,
     // A kLocal connection talks to the local server in-process, so there is no need to propagate a
     // telemetry context as it will be available on OperationContext.
     const bool isLocalConnection = connectionType == ConnectionString::ConnectionType::kLocal;
-    if (targetAcceptsTelemetrySection && !isLocalConnection &&
-        otel::traces::isTracingEnabled(opCtx)) {
+    if (targetAcceptsTelemetrySection && !isLocalConnection && opCtx) {
         auto& holder = otel::TelemetryContextHolder::getDecoration(opCtx);
-        request.telemetryContext = otel::traces::toWireType(holder.getTelemetryContext().get());
+        request.telemetryContext =
+            otel::traces::TelemetryContextSerializer::toSection(holder.getTelemetryContext().get());
     }
 }
 }  // namespace
@@ -201,17 +202,44 @@ auth::ValidatedTenancyScope DBClientBase::_createInnerRequestVTS(
     return auth::ValidatedTenancyScope::kNotRequired;
 }
 
+namespace {
+/** Starts a span for the given command name if it will not be executed locally. */
+boost::optional<otel::traces::Span> maybeStartSpan(OperationContext* opCtx,
+                                                   ConnectionString::ConnectionType connectionType,
+                                                   std::string_view commandName,
+                                                   otel::traces::SpanKind kind) {
+    // For local connections, we will maintain the same opCtx and start a span when the command
+    // starts, so we don't need to start a span here that would have the same name.
+    if (connectionType == ConnectionString::ConnectionType::kLocal) {
+        return boost::none;
+    }
+    return otel::traces::Span::startEgressSpan(
+        opCtx,
+        otel::traces::getOrRegisterCommandSpanName(commandName),
+        otel::traces::SpanOptions{.kind = kind});
+}
+}  // namespace
+
 DBClientBase* DBClientBase::runFireAndForgetCommand(OpMsgRequest request) {
     // Make sure to reconnect if needed before building our request.
     ensureConnection();
 
-    // TODO(SERVER-130312): Start a span here if the type is not kLocal.
-
     auto opCtx = haveClient() ? cc().getOperationContext() : nullptr;
+    // Fire-and-forget sets moreToCome on the wire; use PRODUCER per OTel messaging conventions.
+    boost::optional<otel::traces::Span> span =
+        maybeStartSpan(opCtx, type(), request.getCommandName(), otel::traces::SpanKind::kProducer);
+
     appendMetadata(opCtx, _metadataWriter, _apiParameters, getMaxWireVersion(), type(), request);
     auto requestMsg = request.serialize();
     OpMsg::setFlag(&requestMsg, OpMsg::kMoreToCome);
-    say(requestMsg);
+    try {
+        say(requestMsg);
+    } catch (const DBException& e) {
+        if (span.has_value()) {
+            span->setStatus(e.toStatus());
+        }
+        throw;
+    }
     return this;
 }
 
@@ -220,12 +248,13 @@ std::pair<rpc::UniqueReply, DBClientBase*> DBClientBase::runCommandWithTarget(
     // Make sure to reconnect if needed before building our request.
     ensureConnection();
 
-    // TODO(SERVER-130312): Start a span here if the type is not kLocal.
-
     // call() oddly takes this by pointer, so we need to put it on the stack.
     auto host = getServerAddress();
 
     auto opCtx = haveClient() ? cc().getOperationContext() : nullptr;
+    boost::optional<otel::traces::Span> span =
+        maybeStartSpan(opCtx, type(), request.getCommandName(), otel::traces::SpanKind::kClient);
+
     appendMetadata(opCtx, _metadataWriter, _apiParameters, getMaxWireVersion(), type(), request);
 
     auto requestMsg = request.serialize();
@@ -237,16 +266,29 @@ std::pair<rpc::UniqueReply, DBClientBase*> DBClientBase::runCommandWithTarget(
         e.addContext(str::stream() << str::stream() << "network error while attempting to run "
                                    << "command '" << request.getCommandName() << "' "
                                    << "on host '" << host << "' ");
+        if (span.has_value()) {
+            span->setStatus(e.toStatus());
+        }
         throw;
     }
 
     auto commandReply = parseCommandReplyMessage(host, replyMsg);
 
-    uassert(ErrorCodes::RPCProtocolNegotiationFailed,
-            str::stream() << "Mismatched RPC protocols - request was '"
+    if (rpc::protocolForMessage(requestMsg) != commandReply->getProtocol()) {
+        Status status(ErrorCodes::RPCProtocolNegotiationFailed,
+                      str::stream()
+                          << "Mismatched RPC protocols - request was '"
                           << networkOpToString(requestMsg.operation()) << "' '"
-                          << " but reply was '" << networkOpToString(replyMsg.operation()) << "' ",
-            rpc::protocolForMessage(requestMsg) == commandReply->getProtocol());
+                          << " but reply was '" << networkOpToString(replyMsg.operation()) << "' ");
+        if (span.has_value()) {
+            span->setStatus(status);
+        }
+        uassertStatusOK(status);
+    }
+
+    if (span.has_value()) {
+        span->setStatus(getStatusFromCommandResult(commandReply->getCommandReply()));
+    }
 
     return {std::move(commandReply), this};
 }

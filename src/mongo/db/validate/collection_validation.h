@@ -29,15 +29,31 @@ namespace collection_validation {
                                                bool equalLength);
 
 /**
+ * The target number of records per record store slice to use when splitting a collection for
+ * parallel traversal, or boost::none when parallel validation is not enabled.
+ */
+boost::optional<int64_t> getTargetRecordsPerRecordStoreSlice();
+
+/**
+ * The maximum number of slices to use when splitting a collection or 1 when parallel validation is
+ * not enabled.
+ */
+int64_t getMaxRecordStoreSlices();
+
+/**
  * Parses and checks the command object and returns a 'ValidationOptions' object used for collection
  * validation.
  * Optionally skips parsing 'atClusterTime' for unreplicated collections, which is desired with
  * modal validation usage.
+ * When 'enableSizeStats' is true and the validation is a collHash validation, a storage size
+ * summary is accumulated and logged. This is reserved for the offline startup '--validate' path
+ * (fleet validation); it is intentionally not exposed as a command option.
  */
 ValidationOptions parseValidateOptions(OperationContext* opCtx,
                                        NamespaceString nss,
                                        const BSONObj& cmdObj,
-                                       bool skipAtClusterTime = false);
+                                       bool skipAtClusterTime = false,
+                                       bool enableSizeStats = false);
 
 /**
  * Expects the caller to hold no locks.
@@ -49,7 +65,7 @@ ValidationOptions parseValidateOptions(OperationContext* opCtx,
 Status validate(OperationContext* opCtx,
                 const NamespaceString& nss,
                 ValidationOptions options,
-                ValidateResults* results);
+                ValidateResults& results);
 
 /**
  * Checks whether a failpoint has been hit in the above validate() code..

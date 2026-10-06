@@ -101,7 +101,13 @@ public:
      * Returns whether replica set deletions blocking is enabled, disregarding a specific namespace
      * and the state of WriteBlockBypass. Used for serverStatus.
      */
-    [[MONGO_MOD_FILE_PRIVATE]] bool isReplicaSetDeletionsBlockingEnabled_forTest() const;
+    bool isReplicaSetDeletionsBlockingEnabled() const;
+
+    /**
+     * Increments the per-reason enable counter without changing whether write blocking is active.
+     * Used when an active block's allowDeletions policy changes.
+     */
+    void incrementReplicaSetWritesBlockCounter(ReplicaSetWritesBlockReasonEnum reason);
 
     /**
      * Reports replica set write blocking counters, specifying one counter per blocking reason.
@@ -146,9 +152,9 @@ private:
     Atomic<bool> _deletionsBlocked{false};
     std::array<Atomic<std::uint64_t>, idlEnumCount<ReplicaSetWritesBlockReasonEnum>>
         _replicaSetWritesBlockCounters{};
-    mutable Atomic<std::uint64_t> _replicaSetWriteBlockRejectedInserts{0};
-    mutable Atomic<std::uint64_t> _replicaSetWriteBlockRejectedUpdates{0};
-    mutable Atomic<std::uint64_t> _replicaSetWriteBlockRejectedDeletes{0};
+    mutable Atomic<std::uint64_t> _replicaSetWritesBlockRejectedInserts{0};
+    mutable Atomic<std::uint64_t> _replicaSetWritesBlockRejectedUpdates{0};
+    mutable Atomic<std::uint64_t> _replicaSetWritesBlockRejectedDeletes{0};
     Atomic<bool> _userIndexBuildsBlocked{false};
 };
 

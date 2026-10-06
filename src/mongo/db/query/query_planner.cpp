@@ -2,15 +2,8 @@
 // SPDX-License-Identifier: SSPL-1.0
 
 
-#include <cstring>
+#include "mongo/db/query/query_planner.h"
 
-#include <s2cellid.h>
-
-#include <boost/none.hpp>
-#include <boost/optional.hpp>
-#include <boost/optional/optional.hpp>
-#include <boost/smart_ptr/intrusive_ptr.hpp>
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonelement.h"
@@ -29,7 +22,6 @@
 #include "mongo/db/pipeline/document_source_internal_replace_root.h"
 #include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
 #include "mongo/db/pipeline/document_source_lookup.h"
-#include "mongo/db/pipeline/document_source_set_window_fields.h"
 #include "mongo/db/pipeline/document_source_skip.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
@@ -55,26 +47,36 @@
 #include "mongo/db/query/plan_enumerator/plan_enumerator.h"
 #include "mongo/db/query/plan_enumerator/plan_enumerator_explain_info.h"
 #include "mongo/db/query/plan_ranking/plan_ranker.h"
+#include "mongo/db/query/plan_ranking/plan_selection_strategy.h"
 #include "mongo/db/query/planner_access.h"
 #include "mongo/db/query/planner_analysis.h"
 #include "mongo/db/query/planner_ixselect.h"
 #include "mongo/db/query/query_execution_knobs_gen.h"
 #include "mongo/db/query/query_knobs/query_knob_configuration.h"
 #include "mongo/db/query/query_optimization_knobs_gen.h"
-#include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/query/search/mongot_cursor.h"
 #include "mongo/db/shard_role/shard_catalog/clustered_collection_options_gen.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_severity_suppressor.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
+#include <cstring>
 #include <deque>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <s2cellid.h>
+
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
@@ -104,6 +106,11 @@ namespace {
 using namespace std::literals::string_view_literals;
 MONGO_FAIL_POINT_DEFINE(queryPlannerAlwaysFails);
 MONGO_FAIL_POINT_DEFINE(planFromCacheAlwaysFails);
+
+// Rate-limits rejection logging per namespace: first at Info, subsequent within the window at
+// Debug(2).
+logv2::KeyedSeveritySuppressor<std::string> maxEstimatedScanBytesRejectionLogSeverity{
+    Seconds{1}, logv2::LogSeverity::Info(), logv2::LogSeverity::Debug(2)};
 
 /**
  * Attempts to apply the index tags from 'branchCacheData' to 'orChild'. If the index assignments
@@ -196,7 +203,7 @@ bool isSolutionBoundedCollscan(const QuerySolution* querySoln) {
                               << numCollscanNodes,
                 count == 1);
         auto collscan = static_cast<const CollectionScanNode*>(node);
-        return collscan->minRecord || collscan->maxRecord;
+        return !collscan->rangeList.isUnbounded();
     }
     return false;
 }
@@ -239,10 +246,6 @@ StatusWith<std::unique_ptr<QuerySolution>> tryToBuildSearchQuerySolution(
         tassert(7816300,
                 "Pushing down $search into SBE but forceClassicEngine is on"sv,
                 !query.getExpCtx()->getQueryKnobConfiguration().isForceClassicEngineEnabled());
-
-        tassert(7816301,
-                "Pushing down $search into SBE but featureFlagSearchInSbe is disabled."sv,
-                feature_flags::gFeatureFlagSearchInSbe.isEnabled());
 
         // Build a SearchNode in order to retrieve the search info.
         auto searchNode =
@@ -753,16 +756,32 @@ StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::planFromCache(
         // runtime takes effect even for queries whose COLLSCAN was already cached.
         if (rejectsUnboundedCollscan(query, params, soln.get())) {
             if (QueryPlannerCommon::isMaxEstimatedScanBytesDryRun(params.mainCollectionInfo)) {
-                LOGV2(10130231,
-                      "maxEstimatedScanBytesDryRun: query would be rejected by "
-                      "maxEstimatedScanBytes",
-                      "namespace"_attr = query.nss().toStringForErrorMsg(),
-                      "estimatedSize"_attr =
-                          params.mainCollectionInfo.maxEstimatedScanBytesCollectionSize,
-                      "threshold"_attr = params.mainCollectionInfo.maxEstimatedScanBytesThreshold);
-                maxEstimatedScanBytesMetrics::maxEstimatedScanDryRunWouldReject.increment();
+                if (query.getExpCtx()->tryClaimMaxEstimatedScanBytesMetric()) {
+                    LOGV2(10130231,
+                          "maxEstimatedScanBytesDryRun: query would be rejected by "
+                          "maxEstimatedScanBytes",
+                          "namespace"_attr = query.nss().toStringForErrorMsg(),
+                          "estimatedSize"_attr =
+                              params.mainCollectionInfo.maxEstimatedScanBytesCollectionSize,
+                          "threshold"_attr =
+                              params.mainCollectionInfo.maxEstimatedScanBytesThreshold);
+                    maxEstimatedScanBytesMetrics::maxEstimatedScanDryRunWouldReject.increment();
+                }
             } else {
-                maxEstimatedScanBytesMetrics::maxEstimatedScanRejected.increment();
+                if (query.getExpCtx()->tryClaimMaxEstimatedScanBytesMetric()) {
+                    LOGV2_DEBUG(
+                        13466400,
+                        maxEstimatedScanBytesRejectionLogSeverity(query.nss().toStringForErrorMsg())
+                            .toInt(),
+                        "Query rejected by maxEstimatedScanBytes: plan requires an unbounded "
+                        "COLLSCAN on a collection that exceeds the configured size threshold",
+                        "namespace"_attr = query.nss().toStringForErrorMsg(),
+                        "estimatedSize"_attr =
+                            params.mainCollectionInfo.maxEstimatedScanBytesCollectionSize,
+                        "threshold"_attr =
+                            params.mainCollectionInfo.maxEstimatedScanBytesThreshold);
+                    maxEstimatedScanBytesMetrics::maxEstimatedScanRejected.increment();
+                }
                 return Status(
                     ErrorCodes::NoQueryExecutionPlans,
                     "Query rejected by maxEstimatedScanBytes: plan requires an unbounded "
@@ -930,16 +949,30 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> attemptCollectionScan(
     // scans (minRecord/maxRecord) and resumeScanPoint from rejection.
     if (soln && rejectsUnboundedCollscan(query, params, soln.get())) {
         if (QueryPlannerCommon::isMaxEstimatedScanBytesDryRun(params.mainCollectionInfo)) {
-            LOGV2(10130232,
-                  "maxEstimatedScanBytesDryRun: query would be rejected by "
-                  "maxEstimatedScanBytes",
-                  "namespace"_attr = query.nss().toStringForErrorMsg(),
-                  "estimatedSize"_attr =
-                      params.mainCollectionInfo.maxEstimatedScanBytesCollectionSize,
-                  "threshold"_attr = params.mainCollectionInfo.maxEstimatedScanBytesThreshold);
-            maxEstimatedScanBytesMetrics::maxEstimatedScanDryRunWouldReject.increment();
+            if (query.getExpCtx()->tryClaimMaxEstimatedScanBytesMetric()) {
+                LOGV2(10130232,
+                      "maxEstimatedScanBytesDryRun: query would be rejected by "
+                      "maxEstimatedScanBytes",
+                      "namespace"_attr = query.nss().toStringForErrorMsg(),
+                      "estimatedSize"_attr =
+                          params.mainCollectionInfo.maxEstimatedScanBytesCollectionSize,
+                      "threshold"_attr = params.mainCollectionInfo.maxEstimatedScanBytesThreshold);
+                maxEstimatedScanBytesMetrics::maxEstimatedScanDryRunWouldReject.increment();
+            }
         } else {
-            maxEstimatedScanBytesMetrics::maxEstimatedScanRejected.increment();
+            if (query.getExpCtx()->tryClaimMaxEstimatedScanBytesMetric()) {
+                LOGV2_DEBUG(
+                    13466401,
+                    maxEstimatedScanBytesRejectionLogSeverity(query.nss().toStringForErrorMsg())
+                        .toInt(),
+                    "Query rejected by maxEstimatedScanBytes: plan requires an unbounded "
+                    "COLLSCAN on a collection that exceeds the configured size threshold",
+                    "namespace"_attr = query.nss().toStringForErrorMsg(),
+                    "estimatedSize"_attr =
+                        params.mainCollectionInfo.maxEstimatedScanBytesCollectionSize,
+                    "threshold"_attr = params.mainCollectionInfo.maxEstimatedScanBytesThreshold);
+                maxEstimatedScanBytesMetrics::maxEstimatedScanRejected.increment();
+            }
             return Status(ErrorCodes::NoQueryExecutionPlans,
                           "Query rejected by maxEstimatedScanBytes: plan requires an unbounded "
                           "COLLSCAN on a collection that exceeds the configured size threshold");
@@ -1495,8 +1528,9 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
                           "need exactly one text index for $text query");
         }
 
-        // Error if the text node is tagged with zero indices.
-        if (0 == tag->first.size() && 0 == tag->notFirst.size()) {
+        // Error if the text node is untagged (e.g. nested inside a kOther operator such as
+        // $_internalSchemaCond that rateIndices does not recurse into) or tagged with zero indices.
+        if (!tag || (0 == tag->first.size() && 0 == tag->notFirst.size())) {
             // Don't leave tags on query tree.
             query.getPrimaryMatchExpression()->resetTag();
             return Status(ErrorCodes::NoQueryExecutionPlans,
@@ -1785,16 +1819,32 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         !isClusteredIDXScan) {
         if (!QueryPlannerCommon::hasEffectiveLimit(query)) {
             if (QueryPlannerCommon::isMaxEstimatedScanBytesDryRun(params.mainCollectionInfo)) {
-                LOGV2(10130233,
-                      "maxEstimatedScanBytesDryRun: query would be rejected by "
-                      "maxEstimatedScanBytes",
-                      "namespace"_attr = query.nss().toStringForErrorMsg(),
-                      "estimatedSize"_attr =
-                          params.mainCollectionInfo.maxEstimatedScanBytesCollectionSize,
-                      "threshold"_attr = params.mainCollectionInfo.maxEstimatedScanBytesThreshold);
-                maxEstimatedScanBytesMetrics::maxEstimatedScanDryRunWouldReject.increment();
+                if (query.getExpCtx()->tryClaimMaxEstimatedScanBytesMetric()) {
+                    LOGV2(10130233,
+                          "maxEstimatedScanBytesDryRun: query would be rejected by "
+                          "maxEstimatedScanBytes",
+                          "namespace"_attr = query.nss().toStringForErrorMsg(),
+                          "estimatedSize"_attr =
+                              params.mainCollectionInfo.maxEstimatedScanBytesCollectionSize,
+                          "threshold"_attr =
+                              params.mainCollectionInfo.maxEstimatedScanBytesThreshold);
+                    maxEstimatedScanBytesMetrics::maxEstimatedScanDryRunWouldReject.increment();
+                }
             } else {
-                maxEstimatedScanBytesMetrics::maxEstimatedScanRejected.increment();
+                if (query.getExpCtx()->tryClaimMaxEstimatedScanBytesMetric()) {
+                    LOGV2_DEBUG(
+                        13466402,
+                        maxEstimatedScanBytesRejectionLogSeverity(query.nss().toStringForErrorMsg())
+                            .toInt(),
+                        "Query rejected by maxEstimatedScanBytes: plan requires an unbounded "
+                        "COLLSCAN on a collection that exceeds the configured size threshold",
+                        "namespace"_attr = query.nss().toStringForErrorMsg(),
+                        "estimatedSize"_attr =
+                            params.mainCollectionInfo.maxEstimatedScanBytesCollectionSize,
+                        "threshold"_attr =
+                            params.mainCollectionInfo.maxEstimatedScanBytesThreshold);
+                    maxEstimatedScanBytesMetrics::maxEstimatedScanRejected.increment();
+                }
                 return Status(
                     ErrorCodes::NoQueryExecutionPlans,
                     "Query rejected by maxEstimatedScanBytes: plan requires an unbounded "
@@ -1890,6 +1940,8 @@ StatusWith<PlanRankingResult> QueryPlanner::planWithCostBasedRanking(
     // explain to show all rejected plans.
     std::vector<std::unique_ptr<QuerySolution>> rejectedSoln;
 
+    const size_t numCandidates = allSoln.size();
+
     CostEstimate bestCost = maxCost;
     std::unique_ptr<QuerySolution> bestSoln;
     for (auto&& soln : allSoln) {
@@ -1938,7 +1990,7 @@ StatusWith<PlanRankingResult> QueryPlanner::planWithCostBasedRanking(
     }
     tassert(9751901,
             "Some plan has fallen into the gray zone between accepted and rejected QSNs.",
-            acceptedSoln.size() + rejectedSoln.size() == allSoln.size());
+            acceptedSoln.size() + rejectedSoln.size() == numCandidates);
 
     // If only the best plan is in the accepted solutions, CBR successfully chose a winner.
     bool successfullyChoseWinner = acceptedSoln.size() == 1;
@@ -1946,10 +1998,16 @@ StatusWith<PlanRankingResult> QueryPlanner::planWithCostBasedRanking(
         cbrChoseWinningPlan.increment();
     }
 
+    // With a sole candidate there is nothing to rank even if CBR was called to
+    // estimate it for explain purposes.
+    auto strategy = numCandidates == 1 ? PlanSelectionStrategy::kSinglePlan
+        : successfullyChoseWinner      ? PlanSelectionStrategy::kCostBasedRanker
+                                       : PlanSelectionStrategy::kMultiPlanner;
     auto planRankingResult =
         PlanRankingResult{.solutions = std::move(acceptedSoln),
                           .maybeExplainData = PlanExplainerData{.estimates = std::move(estimates)},
-                          .needsWorksMeasuredForPlanCache = successfullyChoseWinner};
+                          .needsWorksMeasuredForPlanCache = successfullyChoseWinner,
+                          .planSelectionStrategy = strategy};
     if (query.getExplain()) {
         std::vector<SolutionWithPlanStage> rejectedSolnWithStages;
         rejectedSolnWithStages.reserve(rejectedSoln.size());
@@ -1962,10 +2020,15 @@ StatusWith<PlanRankingResult> QueryPlanner::planWithCostBasedRanking(
         planRankingResult.maybeExplainData->rejectedPlansWithStages =
             std::move(rejectedSolnWithStages);
         if (samplingEstimator) {
+            const std::string serializedNss = NamespaceStringUtil::serialize(
+                query.nss(), query.getExpCtx()->getSerializationContext());
             planRankingResult.maybeExplainData->ceSamplingMetadata.emplace(
-                NamespaceStringUtil::serialize(query.nss(),
-                                               query.getExpCtx()->getSerializationContext()),
-                samplingEstimator->getSamplingMetadata());
+                serializedNss, samplingEstimator->getSamplingMetadata());
+            if (auto ndvMetadata = samplingEstimator->getPersistedNDVMetadata();
+                !ndvMetadata.empty()) {
+                planRankingResult.maybeExplainData->fieldStatsMetadata.emplace(
+                    serializedNss, std::move(ndvMetadata));
+            }
         }
     }
     return std::move(planRankingResult);
@@ -2027,13 +2090,44 @@ std::unique_ptr<QuerySolution> QueryPlanner::extendWithAggPipeline(
                 strategy == EqLookupNode::LookupStrategy::kDynamicIndexedLoopJoin) {
                 auto ixScan =
                     std::make_unique<IndexScanNode>(lookupStage->getFromNs(), std::move(*idxEntry));
+                if (ixScan->index.type == IndexType::INDEX_WILDCARD) {
+                    // The expanded wildcard IndexEntry's keyPattern is the logical
+                    // {foreignField: 1}, but on-disk keys are {$_path: 1, foreignField: 1}.
+                    // Insert '$_path' so the key pattern (and the 'iets' below) match reality.
+                    BSONObjBuilder newKeyPattern;
+                    size_t idx = 0;
+                    for (auto&& elem : ixScan->index.keyPattern) {
+                        if (idx == ixScan->index.wildcardFieldPos) {
+                            newKeyPattern.append("$_path", 1);
+                        }
+                        newKeyPattern.append(elem);
+                        idx++;
+                    }
+                    ixScan->index.keyPattern = newKeyPattern.obj();
+                    // 'multikeyPaths' must stay the same size as 'keyPattern'.
+                    ixScan->index.multikeyPaths.insert(ixScan->index.multikeyPaths.begin() +
+                                                           ixScan->index.wildcardFieldPos,
+                                                       MultikeyComponents{});
+                    ixScan->index.wildcardFieldPos++;
+                    // 'multikey' on an expanded wildcard entry can't be trusted, and dedup is
+                    // needed across the searched local keys, so force both.
+                    ixScan->index.multikey = true;
+                    ixScan->shouldDedup = true;
+                }
                 BSONObjIterator it(ixScan->index.keyPattern);
-                // For each field in the key add an entry to the interval evaluation tree using a
-                // new input parameter (when the index field is the foreign field) or a full range
-                // otherwise.
+                // For each key field, add an IET entry: a constant point interval for '$_path', a
+                // new input parameter for the foreign field, or a full range otherwise.
                 while (it.more()) {
                     BSONElement kpElt = it.next();
-                    if (lookupStage->getForeignField()->fullPath() == kpElt.fieldNameStringData()) {
+                    if (kpElt.fieldNameStringData() == "$_path"sv) {
+                        OrderedIntervalList oil("$_path");
+                        oil.intervals.push_back(IndexBoundsBuilder::makePointInterval(
+                            lookupStage->getForeignField()->fullPath()));
+                        ixScan->iets.push_back(
+                            interval_evaluation_tree::IET::make<
+                                interval_evaluation_tree::ConstNode>(std::move(oil)));
+                    } else if (lookupStage->getForeignField()->fullPath() ==
+                               kpElt.fieldNameStringData()) {
                         ixScan->iets.push_back(
                             interval_evaluation_tree::IET::make<interval_evaluation_tree::EvalNode>(
                                 nextInternalParam++, MatchExpression::EQ));
@@ -2156,16 +2250,6 @@ std::unique_ptr<QuerySolution> QueryPlanner::extendWithAggPipeline(
             // In the $search case, we create the $search query solution node in
             // QueryPlanner::Plan instead of here. The empty branch here assures that we don't
             // hit the tassert below and continue in creating the query plan.
-            continue;
-        }
-
-        auto windowStage = dynamic_cast<DocumentSourceInternalSetWindowFields*>(innerStage);
-        if (windowStage) {
-            auto windowNode = std::make_unique<WindowNode>(std::move(solnForAgg),
-                                                           windowStage->getPartitionBy(),
-                                                           windowStage->getSortBy(),
-                                                           windowStage->getOutputFields());
-            solnForAgg = std::move(windowNode);
             continue;
         }
 

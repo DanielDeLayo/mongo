@@ -99,6 +99,18 @@ public:
     virtual bool shouldUseReplicatedFastCount() const = 0;
 
     /**
+     * If true, per-document validation hashes are stored on oplog entries and verified against the
+     * applied document during oplog application.
+     */
+    virtual bool shouldUseContinuousInternodeValidation() const = 0;
+
+    /**
+     * If true, applying replicated container operations (ci/cu/cd) tolerates state mismatches by
+     * converting between insert/update and ignoring deletes of missing keys.
+     */
+    virtual bool relaxContainerOplogConstraints() const = 0;
+
+    /**
      * If true, writes to the oplog should be used as the unit of progress for flow control
      * sampling.
      */
@@ -152,6 +164,13 @@ public:
     virtual bool supportsTableLogging() const = 0;
 
     /**
+     * If true, the provider supports opening WiredTiger version cursors, which iterate the history
+     * of values for a given key. These are debug-only cursors, used to print record and index entry
+     * metadata when validation finds an inconsistency.
+     */
+    virtual bool supportsVersionCursor() const = 0;
+
+    /**
      * If true, the provider supports cross-shard transactions.
      */
     virtual bool supportsCrossShardTransactions() const = 0;
@@ -179,6 +198,12 @@ public:
      */
     virtual bool supportsOplogSampling() const = 0;
 
+    /**
+     * If true, the provider supports a full collection scan over the oplog collection when
+     * initializing truncation markers.
+     */
+    virtual bool supportsOplogScanning() const = 0;
+
     virtual bool supportsWriteConcernOptions(
         const WriteConcernOptions& writeConcernOptions) const = 0;
 
@@ -199,6 +224,12 @@ public:
      * The default memory_page_max value to set on WT for the oplog in string format.
      */
     virtual const char* getWTMemoryPageMaxForOplogStrValue() const = 0;
+
+    /**
+     * The smallest oplog size, in MB, that the provider accepts when the oplog is resized via
+     * replSetResizeOplog.
+     */
+    virtual double getMinOplogSizeMB() const = 0;
 
     /**
      * If true, the provider supports compaction.
@@ -272,9 +303,31 @@ public:
     virtual bool supportsLegacyReplSetCommands() const = 0;
 
     /**
+     * If true, the provider supports external usage of dbHash.
+     */
+    virtual bool supportsDBHashExternalCall() const = 0;
+
+    /**
      * Creates and returns a new policy that governs checkpoint scheduling for this provider.
      */
     virtual std::unique_ptr<CheckpointSchedulePolicy> makeCheckpointSchedulePolicy() const = 0;
+
+    /**
+     * If true, the provider supports the apply ops user-facing command.
+     */
+    virtual bool supportsApplyOpsCommand() const = 0;
+
+    /**
+     * If true, the provider supports external usage of the getDiagnosticData command.
+     */
+    virtual bool supportsGetDiagnosticDataExternalCall() const = 0;
+
+    /**
+     * Reports the current number of active layered data handles to any provider-specific metrics
+     * sink. Default is a no-op; only providers that expose a metric derived from this count
+     * override it.
+     */
+    virtual void reportLayeredDataHandleCount(int64_t count) const {}
 };
 
 }  // namespace rss

@@ -35,7 +35,6 @@
 #include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
 #include "mongo/db/shard_role/shard_role.h"
 #include "mongo/db/sharding_environment/shard_id.h"
-#include "mongo/db/sharding_environment/shard_ref.h"
 #include "mongo/db/sharding_environment/shard_server_op_observer.h"
 #include "mongo/db/sharding_environment/shard_server_test_fixture.h"
 #include "mongo/db/sharding_environment/sharding_mongod_test_fixture.h"
@@ -208,7 +207,8 @@ public:
     static repl::OplogEntry makeInvalidateCollectionMetadataOplogEntry(
         const NamespaceString& nss, const UUID& uuid, bool forDroppedCollection = false) {
         // Fixed OpTime used for synthetic oplog entries. These tests should never read it because
-        // CollectionCacheRecoverer is not installed, so reusing the same value everywhere is fine.
+        // CollectionMetadataSynchronizer is not installed, so reusing the same value everywhere is
+        // fine.
         return repl::makeCommandOplogEntry(repl::OpTime(Timestamp(1, 1), 1),
                                            nss.getCommandNS(),
                                            BSON("invalidateCollectionMetadata"
@@ -226,7 +226,8 @@ public:
         }
 
         // Fixed OpTime used for synthetic oplog entries. These tests should never read it because
-        // CollectionCacheRecoverer is not installed, so reusing the same value everywhere is fine.
+        // CollectionMetadataSynchronizer is not installed, so reusing the same value everywhere is
+        // fine.
         return repl::makeCommandOplogEntry(repl::OpTime(Timestamp(1, 1), 1),
                                            nss,
                                            BSON("updateCollectionMetadata"
@@ -1208,16 +1209,12 @@ public:
                                         const UUID& uuid,
                                         const Timestamp& timestamp) {
         auto range1 = ChunkRange(BSON(kShardKey << MINKEY), BSON(kShardKey << 5));
-        ChunkType chunk1(uuid,
-                         range1,
-                         ChunkVersion({epoch, timestamp}, {1, 0}),
-                         ShardRef{kShardList[0].getName()});
+        ChunkType chunk1(
+            uuid, range1, ChunkVersion({epoch, timestamp}, {1, 0}), kShardList[0].getName());
 
         auto range2 = ChunkRange(BSON(kShardKey << 5), BSON(kShardKey << MAXKEY));
-        ChunkType chunk2(uuid,
-                         range2,
-                         ChunkVersion({epoch, timestamp}, {1, 1}),
-                         ShardRef{kShardList[0].getName()});
+        ChunkType chunk2(
+            uuid, range2, ChunkVersion({epoch, timestamp}, {1, 1}), kShardList[0].getName());
 
         return {chunk1, chunk2};
     }
@@ -1270,34 +1267,7 @@ TEST_F(CollectionShardingRuntimeTestWithMockedLoader, CheckCriticalSectionMetric
     ASSERT_EQ(metrics["totalTimeWaiting"].safeNumberLong(), 0);
 }
 
-class CollectionShardingRuntimeUniqueShardIdentifiersTestWithMockedLoader
-    : public CollectionShardingRuntimeTestWithMockedLoader,
-      public testing::WithParamInterface<bool> {
-protected:
-    void setUp() override {
-        _featureFlagScope.emplace("featureFlagUniqueShardIdentifiers", GetParam());
-        CollectionShardingRuntimeTestWithMockedLoader::setUp();
-    }
-
-    void tearDown() override {
-        CollectionShardingRuntimeTestWithMockedLoader::tearDown();
-        _featureFlagScope.reset();
-    }
-
-private:
-    boost::optional<unittest::ServerParameterGuard> _featureFlagScope;
-};
-
-INSTANTIATE_TEST_SUITE_P(UniqueShardIdentifiers,
-                         CollectionShardingRuntimeUniqueShardIdentifiersTestWithMockedLoader,
-                         testing::Bool(),
-                         [](const testing::TestParamInfo<bool>& info) {
-                             return info.param ? "WithUniqueShardIdentifiers"
-                                               : "WithoutUniqueShardIdentifiers";
-                         });
-
-TEST_P(CollectionShardingRuntimeUniqueShardIdentifiersTestWithMockedLoader,
-       CriticalSectionMetricsReportWaiters) {
+TEST_F(CollectionShardingRuntimeTestWithMockedLoader, CriticalSectionMetricsReportWaiters) {
     const BSONObj criticalSectionReason = BSON("reason" << 1);
     {
         // Enter the critical section.
@@ -1328,7 +1298,7 @@ TEST_P(CollectionShardingRuntimeUniqueShardIdentifiersTestWithMockedLoader,
             ASSERT_EQ(kNss, exInfo->getNss());
             ASSERT_EQ(shardVersionShardedCollection1, exInfo->getVersionReceived());
             ASSERT_EQ(boost::none, exInfo->getVersionWanted());
-            ASSERT_EQ(kMyShardHandle.toShardRef(operationContext()), exInfo->getShardRef());
+            ASSERT_EQ(kMyShardName, exInfo->getShardId());
             const auto& signal = exInfo->getCriticalSectionSignal();
             sleepmillis(10);
             auto metrics = getStatistics();
@@ -1675,7 +1645,7 @@ TEST_F(ShardingMongoDTestFixture, ShardingStateEnabledReturnsTrackedVersion) {
     // CollectionShardingRuntime will throw StaleConfig because the metadata needs to be recovered.
     ShardingState::RecoveredClusterRole rcr;
     rcr.role = ClusterRole::ShardServer;
-    rcr.shardHandle = ShardHandle(ShardId("0"), UUID::gen());
+    rcr.shardId = ShardId("0");
     ShardingState::get(opCtx)->setRecoveryCompleted(rcr);
     ASSERT_THROWS_CODE(csr.getCollectionDescription(opCtx), DBException, ErrorCodes::StaleConfig);
     ASSERT_THROWS_CODE(csr.checkShardVersionOrThrow(opCtx), DBException, ErrorCodes::StaleConfig);

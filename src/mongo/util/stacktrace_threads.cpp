@@ -6,6 +6,22 @@
 
 #if defined(MONGO_STACKTRACE_CAN_DUMP_ALL_THREADS)
 
+#include "mongo/base/parse_number.h"
+#include "mongo/base/static_assert.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/logv2/log.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/future.h"
+#include "mongo/util/stacktrace_details.h"
+#include "mongo/util/stacktrace_somap.h"
+
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -29,24 +45,6 @@
 #include <boost/filesystem/path.hpp>
 #include <boost/iterator/iterator_facade.hpp>
 #include <fmt/format.h>
-// IWYU pragma: no_include <syscall.h>
-// IWYU pragma: no_include "bits/types/siginfo_t.h"
-
-#include "mongo/base/parse_number.h"
-#include "mongo/base/static_assert.h"
-#include "mongo/base/status.h"
-#include "mongo/bson/bsonelement.h"
-#include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/bsontypes.h"
-#include "mongo/bson/json.h"
-#include "mongo/bson/oid.h"
-#include "mongo/config.h"  // IWYU pragma: keep
-#include "mongo/logv2/log.h"
-#include "mongo/stdx/unordered_map.h"
-#include "mongo/util/future.h"
-#include "mongo/util/stacktrace_details.h"
-#include "mongo/util/stacktrace_somap.h"
 
 #if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
 #include <unistd.h>
@@ -390,24 +388,31 @@ void State::collectStacks(std::vector<ThreadBacktrace>& messageStorage,
     }
     LOGV2(23396, "Signalled threads", "numThreads"_attr = pendingTids.size());
 
-    size_t napMicros = 0;
+    const auto startTime = Date_t::now();
+    Milliseconds requestedNap{0};
     while (!pendingTids.empty()) {
         if (ThreadBacktrace* message = collection.results.tryPop(); message) {
-            napMicros = 0;
+            requestedNap = Milliseconds{0};
             if (pendingTids.erase(message->tid) != 0) {
                 received.push_back(message);
             } else {
                 collection.pool.push(message);
             }
-        } else if (napMicros < 50'000) {
+        } else if (requestedNap < Milliseconds{50}) {
             // Results queue is dry and we haven't napped enough to justify a reap.
-            napMicros += 1'000;
-            sleepMicros(1'000);
+            static constexpr Milliseconds napInterval{1};
+            requestedNap += napInterval;
+            sleepFor(napInterval);
         } else {
-            napMicros = 0;
+            requestedNap = Milliseconds{0};
             // Prune dead threads from the pendingTids set before retrying.
             for (auto iter = pendingTids.begin(); iter != pendingTids.end();) {
                 if (!stacktrace_details::tidExists(*iter)) {
+                    const Milliseconds elapsed = Date_t::now() - startTime;
+                    LOGV2(13424301,
+                          "Thread exited while attempting stack collection, skipping",
+                          "tid"_attr = *iter,
+                          "waited"_attr = elapsed);
                     missedTids.push_back(*iter);
                     iter = pendingTids.erase(iter);
                 } else {
@@ -655,3 +660,5 @@ void markAsStackTraceProcessingThread() {
 
 }  // namespace mongo
 #endif  // !defined(MONGO_STACKTRACE_CAN_DUMP_ALL_THREADS)
+// IWYU pragma: no_include <syscall.h>
+// IWYU pragma: no_include "bits/types/siginfo_t.h"

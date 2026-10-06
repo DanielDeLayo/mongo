@@ -5,11 +5,8 @@
 // IWYU pragma: no_include "bits/types/__sigset_t.h"
 // IWYU pragma: no_include "bits/types/siginfo_t.h"
 // IWYU pragma: no_include "bits/types/stack_t.h"
-#include <fmt/format.h>
-#include <fmt/printf.h>  // IWYU pragma: keep
-#include <fmt/ranges.h>  // IWYU pragma: keep
-// IWYU pragma: no_include "syscall.h"
-// IWYU pragma: no_include "cxxabi.h"
+#include "mongo/util/stacktrace.h"
+
 #include "mongo/base/parse_number.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/json.h"
@@ -22,7 +19,6 @@
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/pcre.h"
 #include "mongo/util/signal_handlers_synchronous.h"
-#include "mongo/util/stacktrace.h"
 #include "mongo/util/stacktrace_test_helpers.h"
 
 #include <algorithm>
@@ -44,9 +40,14 @@
 #include <thread>
 #include <vector>
 
+#include <fmt/format.h>
+#include <fmt/printf.h>  // IWYU pragma: keep
+#include <fmt/ranges.h>  // IWYU pragma: keep
+
 #if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
 #include <unistd.h>
 #endif
+#include <sys/syscall.h>
 
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
@@ -623,6 +624,7 @@ public:
         reapWorkers();
 
         std::set<int> seenTids;
+        std::set<int> missedTids;
 
         // Make some assertions about `dumped`.
         BSONObj jsonObj = fromjson(dumped);
@@ -633,8 +635,35 @@ public:
             ASSERT(obj.hasElement("backtrace"));
         }
 
-        for (auto&& w : workers)
-            ASSERT(seenTids.find(w.tid) != seenTids.end()) << "missing tid:" << w.tid;
+        // Collect missing thread ids. Check after we've checked for lost thread ids, since lost is
+        // worse than missing.
+        for (const auto& el : jsonObj.getObjectField("missedThreadIds")) {
+            missedTids.insert(el.Int());
+        }
+        // Confirm all the threads we spawned are accounted for in either seenTids or missedTids.
+        //
+        // Since non-test controlled threads may be running, we can only assert behavior for the
+        // worker threads spawned.
+        //
+        // TODO(SERVER-134299): It's rare but possible some worker threads have exited before we
+        // dump them during testing, leading to test flakiness.
+        std::set<int> lostTids;
+        std::set<int> missedWorkerTids;
+        for (auto&& w : workers) {
+            const int tid = w.tid;
+            if (missedTids.contains(tid)) {
+                missedWorkerTids.insert(tid);
+            } else if (!seenTids.contains(tid)) {
+                lostTids.insert(tid);
+            }
+        }
+        ASSERT_THAT(lostTids, ::testing::IsEmpty())
+            << "spawned threads unaccounted for. Recorded missedTids:" << LogVec(missedTids)
+            << ", Recorded seenTids:" << LogVec(seenTids);
+        ASSERT_THAT(missedWorkerTids, ::testing::IsEmpty()) << "spawned threads missing backtraces";
+        for (auto&& w : workers) {
+            ASSERT_TRUE(seenTids.contains(w.tid));
+        }
     }
 
     std::mutex mutex;

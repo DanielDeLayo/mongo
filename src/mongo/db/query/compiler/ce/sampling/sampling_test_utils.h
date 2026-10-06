@@ -17,6 +17,7 @@
 #include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
 #include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/unittest/server_parameter_guard.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/modules.h"
 
@@ -56,10 +57,6 @@ public:
      */
     void setPersistentSampleMethodForTesting(SamplingCEMethodEnum method) {
         _persistentSampleMethod = method;
-    }
-
-    static size_t calculateSampleSize(SamplingConfidenceIntervalEnum ci, double marginOfError) {
-        return SamplingEstimatorImpl::calculateSampleSize(ci, marginOfError);
     }
 
     static bool matches(const OrderedIntervalList& oil, BSONElement val) {
@@ -208,6 +205,14 @@ struct PlanRankingExecutionStatistics {
     std::vector<double> selectivities;
 };
 
+/**
+ * Sets the confidence interval, margin of error, and sample size override knobs to the given values
+ * and returns the sample size that the sampling estimator derives from them.
+ */
+size_t sampleSizeForKnobs(SamplingConfidenceIntervalEnum ci,
+                          double marginOfError,
+                          int sampleSizeOverride = 0);
+
 size_t translateSampleDefToActualSampleSize(SampleSizeDef sampleSizeDef);
 
 std::pair<SamplingCEMethodEnum, boost::optional<int>> iniitalizeSamplingAlgoBasedOnChunks(
@@ -249,10 +254,15 @@ bool dataConfigurationCoversQueryWorkload(DataConfiguration& dataConfig,
 void initializeSamplingEstimator(DataConfiguration& configuration,
                                  SamplingEstimatorTest& samplingEstimatorTest);
 
-
+/**
+ * Create a collection with the given name and insert the given documents.
+ * Persistent sample docs must be stored in a clustered collection indexed on _id, so clustered =
+ * true must be passed when this helper is used to simulate the persisted samples collection.
+ */
 void createCollAndInsertDocuments(OperationContext* opCtx,
                                   const NamespaceString& nss,
-                                  const std::vector<BSONObj>& docs);
+                                  const std::vector<BSONObj>& docs,
+                                  bool clustered = false);
 
 /**
  * Given a MatchExpression and a vector of BSONObj, evaluate the MatchExpression against all the
@@ -316,5 +326,12 @@ BSONObj buildPersistentSampleDoc(const UUID& collUuid,
                                  const std::vector<BSONObj>& docs,
                                  boost::optional<int> numChunks = boost::none,
                                  int schemaVersion = kPersistentSampleSchemaVersion,
-                                 BSONObj overrides = BSONObj());
+                                 BSONObj overrides = BSONObj(),
+                                 int pageNo = 0);
+
+/**
+ * Build a BSON document of size `sizeBytes`, or at minimum the size of the BSON overhead of the
+ * field names if `sizeBytes` is less than that.
+ */
+BSONObj makeSizedDoc(int id, size_t sizeBytes);
 }  // namespace mongo::ce

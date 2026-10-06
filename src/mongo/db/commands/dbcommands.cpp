@@ -24,6 +24,8 @@
 #include "mongo/db/global_catalog/sharding_catalog_client.h"
 #include "mongo/db/global_catalog/type_collection.h"
 #include "mongo/db/keypattern.h"
+#include "mongo/db/metrics_filtering_util.h"
+#include "mongo/db/metrics_policy_manager.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/namespace_string_util.h"
 #include "mongo/db/operation_context.h"
@@ -354,11 +356,23 @@ public:
             uassert(
                 ErrorCodes::OperationFailed, "No collection name specified", !nss.coll().empty());
 
-            auto result = reply->getBodyBuilder();
-            // We need to use the serialization context from the request when calling
-            // NamespaceStringUtil to build the reply.
+            auto inputResultBuilder = reply->getBodyBuilder();
+            // If filtering is required by the metrics policy, append the metrics to a temporary
+            // result builder and filter them at the end. Otherwise, append directly to the input
+            // result builder to avoid additional costs in the non-filtering case.
+            auto& metricsPolicyManager = MetricsPolicyManager::get(opCtx);
+            bool requireFiltering = metricsPolicyManager.requiresFiltering(
+                opCtx, MetricsCategoryEnum::kCollStats, /*forceFiltered=*/false);
+
             auto serializationCtx =
                 SerializationContext::stateCommandReply(request().getSerializationContext());
+
+            boost::optional<BSONObjBuilder> tmpResultBuilder;
+            if (requireFiltering) {
+                tmpResultBuilder.emplace();
+            }
+            BSONObjBuilder& result = requireFiltering ? *tmpResultBuilder : inputResultBuilder;
+
             result.append("ns", NamespaceStringUtil::serialize(nss, serializationCtx));
 
             const auto& spec = request().getStorageStatsSpec();
@@ -366,6 +380,16 @@ public:
                 appendCollectionStorageStats(opCtx, nss, spec, serializationCtx, &result);
             if (!status.isOK() && (status.code() != ErrorCodes::NamespaceNotFound)) {
                 uassertStatusOK(status);  // throws
+            }
+
+            // If filtering is required, we appended the metrics in a temporary result builder.
+            // Now extract and append only the ones matching the allowlist to the input result
+            // builder.
+            if (requireFiltering) {
+                const auto& matcher =
+                    metricsPolicyManager.getAllowlistMatcher(MetricsCategoryEnum::kCollStats);
+                metrics_filtering_util::appendPaths(
+                    inputResultBuilder, tmpResultBuilder->obj(), matcher);
             }
         }
     };
@@ -473,6 +497,18 @@ public:
                 }
 
                 db->getStats(opCtx, &reply, cmd.getFreeStorage(), cmd.getScale());
+            }
+
+            // If filtering is required by the metrics policy, filter the reply before returning.
+            auto& metricsPolicyManager = MetricsPolicyManager::get(opCtx);
+            if (metricsPolicyManager.requiresFiltering(
+                    opCtx, MetricsCategoryEnum::kDbStats, /*forceFiltered=*/false)) {
+                BSONObj replyBSON = reply.toBSON();
+                BSONObjBuilder filteredBuilder;
+                const auto& matcher =
+                    metricsPolicyManager.getAllowlistMatcher(MetricsCategoryEnum::kDbStats);
+                metrics_filtering_util::appendPaths(filteredBuilder, replyBSON, matcher);
+                reply = Reply::parseOwned(filteredBuilder.obj());
             }
 
             return reply;

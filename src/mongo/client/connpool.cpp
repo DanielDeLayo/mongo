@@ -4,10 +4,8 @@
 // _ todo: reconnect?
 
 
-#include <boost/move/utility_core.hpp>
-#include <boost/optional/optional.hpp>
-#include <fmt/format.h>
-// IWYU pragma: no_include "cxxabi.h"
+#include "mongo/client/connpool.h"
+
 #include "mongo/base/error_codes.h"
 #include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/base/initializer.h"
@@ -16,7 +14,6 @@
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/connection_string.h"
-#include "mongo/client/connpool.h"
 #include "mongo/client/dbclient_connection.h"
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/config.h"  // IWYU pragma: keep
@@ -42,9 +39,14 @@
 #include <string>
 #include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
 #if __has_feature(address_sanitizer)
 #include <sanitizer/lsan_interface.h>
 #endif
+// IWYU pragma: no_include "cxxabi.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
@@ -52,9 +54,6 @@
 namespace mongo {
 
 namespace {
-const int kDefaultIdleTimeout = std::numeric_limits<int>::max();
-const int kDefaultMaxInUse = std::numeric_limits<int>::max();
-
 auto makeDuration(double secs) {
     return Milliseconds(static_cast<Milliseconds::rep>(1000 * secs));
 }
@@ -73,17 +72,6 @@ using std::string;
 using std::vector;
 
 // ------ PoolForHost ------
-
-PoolForHost::PoolForHost()
-    : _created(0),
-      _minValidCreationTimeMicroSec(0),
-      _type(ConnectionString::ConnectionType::kInvalid),
-      _maxPoolSize(kPoolSizeUnlimited),
-      _maxInUse(kDefaultMaxInUse),
-      _checkedOut(0),
-      _badConns(0),
-      _parentDestroyed(false),
-      _inShutdown(false) {}
 
 PoolForHost::~PoolForHost() {
     clear();
@@ -334,17 +322,7 @@ public:
 
 // ------ DBConnectionPool ------
 
-const int PoolForHost::kPoolSizeUnlimited(-1);
-
-DBConnectionPool::DBConnectionPool()
-    : _name("dbconnectionpool"),
-      _maxPoolSize(PoolForHost::kPoolSizeUnlimited),
-      _maxInUse(kDefaultMaxInUse),
-      _idleTimeout(kDefaultIdleTimeout),
-      _inShutdown(false),
-      _hooks(new list<DBConnectionHook*>())
-
-{}
+DBConnectionPool::DBConnectionPool() : _hooks(new list<DBConnectionHook*>()) {}
 
 void DBConnectionPool::shutdown() {
     if (!_inShutdown.swap(true)) {

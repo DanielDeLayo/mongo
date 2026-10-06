@@ -5,6 +5,8 @@
 
 #include "mongo/db/operation_context.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/time_support.h"
 
 #include <string_view>
 
@@ -15,7 +17,23 @@ using namespace std::literals::string_view_literals;
 static constexpr std::string_view kNormalString = "normal"sv;
 static constexpr std::string_view kLowString = "low"sv;
 static constexpr std::string_view kExemptString = "exempt"sv;
+
+MONGO_FAIL_POINT_DEFINE(sleepInWaitingForAdmissionGuard);
+
+struct AggregateQueueingStats {
+    Atomic<int64_t> totalTimeQueuedMicros{0};
+};
+
+const auto aggregateQueueingStats = OperationContext::declareDecoration<AggregateQueueingStats>();
+
+void recordAggregateQueueTime(OperationContext* opCtx, Microseconds waitTime) {
+    aggregateQueueingStats(opCtx).totalTimeQueuedMicros.fetchAndAddRelaxed(waitTime.count());
+}
 }  // namespace
+
+Microseconds AdmissionContext::getTotalTimeQueuedForAdmission(const OperationContext* opCtx) {
+    return Microseconds{aggregateQueueingStats(opCtx).totalTimeQueuedMicros.loadRelaxed()};
+}
 
 AdmissionContext::AdmissionContext(const AdmissionContext& other)
     : _admissions(other._admissions.load()),
@@ -24,6 +42,9 @@ AdmissionContext::AdmissionContext(const AdmissionContext& other)
       _startQueueingTime(other._startQueueingTime.load()) {}
 
 AdmissionContext& AdmissionContext::operator=(const AdmissionContext& other) {
+    if (this == &other) {
+        return *this;
+    }
     _admissions.store(other._admissions.load());
     _priority.store(other._priority.load());
     _totalTimeQueuedMicros.store(other._totalTimeQueuedMicros.load());
@@ -70,6 +91,10 @@ void AdmissionContext::recordAdmission() {
 
 void AdmissionContext::setAdmission_forTest(int32_t admissions) {
     _admissions.store(admissions);
+}
+
+bool AdmissionContext::waitUntilQueued_forTest(Nanoseconds timeout) {
+    return bool(_startQueueingTime.waitFor(kNotQueueing, timeout));
 }
 
 void AdmissionContext::setTotalTimeQueuedMicros_forTest(int64_t micros) {
@@ -123,13 +148,21 @@ WaitingForAdmissionGuard::WaitingForAdmissionGuard(AdmissionContext* admCtx, Tic
     invariant(_admCtx->_startQueueingTime.swap(_tickSource->getTicks()) ==
               AdmissionContext::kNotQueueing);
     _admCtx->_startQueueingTime.notifyAll();
+
+    // When enabled, sleep for data["ms"] milliseconds while this context is marked as queueing so
+    // the injected wait is attributed to whichever admission gate constructed this guard.
+    sleepInWaitingForAdmissionGuard.execute(
+        [](const BSONObj& data) { sleepmillis(data["ms"].numberInt()); });
 }
 
 WaitingForAdmissionGuard::~WaitingForAdmissionGuard() {
     auto startQueueingTime = _admCtx->_startQueueingTime.loadRelaxed();
     invariant(startQueueingTime != AdmissionContext::kNotQueueing);
-    _admCtx->_totalTimeQueuedMicros.fetchAndAdd(durationCount<Microseconds>(
-        _tickSource->ticksTo<Microseconds>(_tickSource->getTicks() - startQueueingTime)));
+    auto waitTime = _tickSource->ticksTo<Microseconds>(_tickSource->getTicks() - startQueueingTime);
+    _admCtx->_totalTimeQueuedMicros.fetchAndAdd(durationCount<Microseconds>(waitTime));
+    if (auto* opCtx = _admCtx->getOperationContext()) {
+        recordAggregateQueueTime(opCtx, waitTime);
+    }
     _admCtx->_startQueueingTime.store(AdmissionContext::kNotQueueing);
     _admCtx->_startQueueingTime.notifyAll();
 }

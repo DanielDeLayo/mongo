@@ -596,6 +596,14 @@ BSONObj TransactionRouter::Participant::attachTxnFieldsIfNeeded(
                       *sharedOptions.txnNumberAndRetryCounter.getTxnRetryCounter());
     }
 
+    if (mustStartTransaction && sharedOptions.isServerInitiatedTransaction &&
+        feature_flags::gServerInitiatedTransactionClassification
+            .isEnabledUseLastLTSFCVWhenUninitialized(
+                VersionContext::getDecoration(opCtx),
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        newCmd.append(GenericArguments::kIsServerInitiatedTransactionFieldName, true);
+    }
+
     return newCmd.obj();
 }
 
@@ -814,6 +822,9 @@ void TransactionRouter::Router::processParticipantResponse(
         if (!additionalParticipants)
             return;
 
+        // Enroll every additional participant before any term validation (deferred to
+        // 'validateAdditionalParticipantTerms' below): a raise must not skip enrollment, or the
+        // follow-up abort would not reach the skipped shards.
         for (auto&& participantElem : *additionalParticipants) {
             auto participantToAdd = participantElem.getShardId();
             Participant::ReadOnly currentReadOnly;
@@ -842,12 +853,9 @@ void TransactionRouter::Router::processParticipantResponse(
                 // participants.
                 _updateParticipant(opCtx, participantToAdd, readOnlyValue, false /* isSubRouter */);
             }
-
-            // Validate the term the sub-router observed for this participant against the
-            // term we already recorded for it (if any).
-            _validateAndRecordParticipantTerm(opCtx, participantToAdd, participantElem.getTerm());
         }
     };
+
     boost::optional<Participant::ReadOnly> readOnlyValue = boost::none;
     const auto& commandStatus = parsedMetadata.status;
     // WouldChangeOwningShard errors don't abort their transaction and the responses containing them
@@ -870,6 +878,21 @@ void TransactionRouter::Router::processParticipantResponse(
         parsedMetadata.txnResponseMetadata.getAdditionalParticipants()->size() > 0;
 
     _updateParticipant(opCtx, shardId, readOnlyValue, shardIsSubRouter);
+
+    // Every participant in this response is now enrolled and up to date, so a term mismatch raised
+    // below cannot leave the participant list incomplete for the follow-up abort.
+    auto validateAdditionalParticipantTerms = [&]() {
+        const auto& additionalParticipants =
+            parsedMetadata.txnResponseMetadata.getAdditionalParticipants();
+        if (!additionalParticipants)
+            return;
+
+        for (auto&& participantElem : *additionalParticipants) {
+            _validateAndRecordParticipantTerm(
+                opCtx, participantElem.getShardId(), participantElem.getTerm());
+        }
+    };
+    validateAdditionalParticipantTerms();
 
     // Validate the responder's own replication term against the one we previously recorded.
     _validateAndRecordParticipantTerm(opCtx, shardId, parsedMetadata.observedTerm);
@@ -1021,7 +1044,8 @@ TransactionRouter::Participant TransactionRouter::Router::_createParticipant(
                                               os.readConcernArgs,
                                               os.atClusterTimeForSnapshotReadConcern,
                                               os.placementConflictTimeForNonSnapshotReadConcern,
-                                              isInternalSessionForRetryableWrite(_sessionId())};
+                                              isInternalSessionForRetryableWrite(_sessionId()),
+                                              os.isServerInitiatedTransaction};
 
     std::lock_guard<Client> lk(*opCtx->getClient());
     auto resultPair = o(lk).participants.try_emplace(
@@ -1533,6 +1557,12 @@ void TransactionRouter::Router::beginOrContinueTxn(OperationContext* opCtx,
     _updateLastClientInfo(opCtx->getClient());
 }
 
+void TransactionRouter::Router::setIsServerInitiatedTransaction(OperationContext* opCtx) {
+    invariant(isInitialized());
+    std::lock_guard<Client> lk(*opCtx->getClient());
+    o(lk).isServerInitiatedTransaction = true;
+}
+
 void TransactionRouter::Router::stash(OperationContext* opCtx, StashReason reason) {
     if (!isInitialized()) {
         return;
@@ -1932,6 +1962,10 @@ void TransactionRouter::Router::implicitlyAbortTransaction(OperationContext* opC
         return;
     }
 
+    // Consume any deferred abort latched by a cursor-cleanup drain. When this point is reached the
+    // abort actually runs, so the latch is fulfilled and a follow-up raise must not fire a
+    // redundant second abort.
+    p().deferredAbort.reset();
     p().terminationInitiated = true;
 
     auto abortCmd = BSON("abortTransaction" << 1 << WriteConcernOptions::kWriteConcernField
@@ -1971,6 +2005,40 @@ void TransactionRouter::Router::implicitlyAbortTransaction(OperationContext* opC
     }
 }
 
+void TransactionRouter::Router::recordDeferredAbort(const Status& status) {
+    if (!isInitialized() || p().terminationInitiated || o().subRouter) {
+        return;
+    }
+    // First failure wins: a later cleanup drain must not overwrite the original cause.
+    if (!p().deferredAbort) {
+        p().deferredAbort = status;
+        // Logged at default verbosity on purpose: this dooms a live transaction, and it is the only
+        // breadcrumb explaining why the observing command (whose own work may have succeeded)
+        // fails with NoSuchTransaction. It is rare enough not to be a log-volume concern.
+        LOGV2(13412902,
+              "Recording a deferred abort: a fatal transaction metadata error was observed on a "
+              "non-throwing path; the observing command will fail with this error and the "
+              "transaction will be aborted",
+              "sessionId"_attr = _sessionId(),
+              "txnNumber"_attr = o().txnNumberAndRetryCounter.getTxnNumber(),
+              "error"_attr = redact(status));
+    }
+}
+
+void TransactionRouter::Router::raiseDeferredAbortIfNeeded() {
+    if (!p().deferredAbort) {  // Lock-free fast path: no deferred abort pending.
+        return;
+    }
+    // A latch can only exist on an initialized router: isInitialized() is monotonic (the txn number
+    // is only ever advanced from kUninitializedTxnNumber), and the latch is destroyed with the
+    // router itself.
+    tassert(
+        13412903, "Deferred abort latched on an uninitialized transaction router", isInitialized());
+    // Do not consume the latch here: the caller's error path runs the implicit abort, which
+    // consumes it.
+    uassertStatusOK(*p().deferredAbort);
+}
+
 std::string TransactionRouter::Router::txnIdToString() const {
     return str::stream() << _sessionId() << ":" << o().txnNumberAndRetryCounter.getTxnNumber();
 }
@@ -2006,6 +2074,13 @@ void TransactionRouter::Router::_resetRouterState(
         o(lk).txnNumberAndRetryCounter.setTxnRetryCounter(
             *txnNumberAndRetryCounter.getTxnRetryCounter());
         o(lk).commitType = CommitType::kNotInitiated;
+        // A client with no network session is server-internal (e.g. the transaction API runs on a
+        // sessionless client), so classify this as a server-initiated transaction. A genuine
+        // end-user connection has a network session. This is only authoritative on the top-level
+        // router: a sub-router runs on the internal connection from its parent router, so it always
+        // computes 'external' regardless of the original client and its value must not be relied
+        // on.
+        o(lk).isServerInitiatedTransaction = !opCtx->getClient()->session();
         p().isRecoveringCommit = false;
         o(lk).participants.clear();
         o(lk).coordinatorId.reset();
@@ -2017,6 +2092,7 @@ void TransactionRouter::Router::_resetRouterState(
         o(lk).abortCause = std::string();
         o(lk).metricsTracker.emplace(opCtx->getServiceContext());
         p().terminationInitiated = false;
+        p().deferredAbort.reset();
         p().createdDatabases.clear();
         p().disallowSingleWriteShardCommit = false;
 
@@ -2232,8 +2308,11 @@ void TransactionRouter::Router::_onStartCommit(WithLock wl, OperationContext* op
     }
 
     auto tickSource = opCtx->getServiceContext()->getTickSource();
-    o(wl).metricsTracker->startCommit(
-        tickSource, tickSource->getTicks(), o().commitType, o().participants.size());
+    o(wl).metricsTracker->startCommit(tickSource,
+                                      tickSource->getTicks(),
+                                      o().commitType,
+                                      o().participants.size(),
+                                      o().isServerInitiatedTransaction);
 }
 
 void TransactionRouter::Router::_onNonRetryableCommitError(OperationContext* opCtx,
@@ -2276,8 +2355,12 @@ void TransactionRouter::Router::_endTransactionTrackingIfNecessary(
         // active transactions.
         o(lk).metricsTracker->trySetActive(tickSource, curTicks);
 
-        o(lk).metricsTracker->endTransaction(
-            tickSource, curTicks, terminationCause, o().commitType, o().abortCause);
+        o(lk).metricsTracker->endTransaction(tickSource,
+                                             curTicks,
+                                             terminationCause,
+                                             o().commitType,
+                                             o().abortCause,
+                                             o().isServerInitiatedTransaction);
     }
 
     const auto& timingStats = o().metricsTracker->getTimingStats();
@@ -2426,14 +2509,15 @@ void TransactionRouter::MetricsTracker::trySetInactive(TickSource* tickSource,
 void TransactionRouter::MetricsTracker::startCommit(TickSource* tickSource,
                                                     TickSource::Tick curTicks,
                                                     TransactionRouter::CommitType commitType,
-                                                    std::size_t numParticipantsAtCommit) {
+                                                    std::size_t numParticipantsAtCommit,
+                                                    bool isServerInitiated) {
     dassert(isActive());
 
     timingStats.commitStartTime = tickSource->getTicks();
     timingStats.commitStartWallClockTime = _service->getPreciseClockSource()->now();
 
     auto routerTxnMetrics = RouterTransactionsMetrics::get(_service);
-    routerTxnMetrics->incrementCommitInitiated(commitType);
+    routerTxnMetrics->incrementCommitInitiated(commitType, isServerInitiated);
     if (commitType != CommitType::kRecoverWithToken) {
         // We only know the participant list if we're not recovering a decision.
         routerTxnMetrics->addToTotalParticipantsAtCommit(numParticipantsAtCommit);
@@ -2445,7 +2529,8 @@ void TransactionRouter::MetricsTracker::endTransaction(
     TickSource::Tick curTicks,
     TransactionRouter::TerminationCause terminationCause,
     TransactionRouter::CommitType commitType,
-    std::string_view abortCause) {
+    std::string_view abortCause,
+    bool isServerInitiated) {
     dassert(isActive());
 
     timingStats.timeActiveMicros +=
@@ -2466,7 +2551,7 @@ void TransactionRouter::MetricsTracker::endTransaction(
         dassert(commitType != CommitType::kNotInitiated);
         routerTxnMetrics->incrementTotalCommitted();
         routerTxnMetrics->incrementCommitSuccessful(
-            commitType, timingStats.getCommitDuration(tickSource, curTicks));
+            commitType, timingStats.getCommitDuration(tickSource, curTicks), isServerInitiated);
     }
 }
 

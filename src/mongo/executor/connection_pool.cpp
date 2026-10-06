@@ -10,6 +10,9 @@
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_severity_suppressor.h"
+#include "mongo/otel/metrics/metric_names.h"
+#include "mongo/otel/metrics/metric_unit.h"
+#include "mongo/otel/metrics/metrics_service.h"
 #include "mongo/platform/atomic.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/cancellation.h"
@@ -38,7 +41,6 @@
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kConnectionPool
 
-
 // One interesting implementation note herein concerns how setup() and
 // refresh() are invoked outside of the global lock, but setTimeout is not.
 // This implementation detail simplifies mocks, allowing them to return
@@ -47,6 +49,7 @@
 // ourselves to operations over the connection).
 
 namespace mongo {
+namespace executor {
 
 namespace {
 
@@ -59,6 +62,46 @@ MONGO_FAIL_POINT_DEFINE(connectionPoolRejectsConnectionRequests);
 // This does not guarantee that a new connection will be returned, but rather that a request for one
 // will be submitted.
 MONGO_FAIL_POINT_DEFINE(connectionPoolAlwaysRequestsNewConn);
+
+auto& egressConnectionsCreatedCounter =
+    otel::metrics::MetricsService::instance()
+        .createInt64Counter<std::string_view, std::string_view>(
+            otel::metrics::MetricNames::kNetworkEgressConnectionsCreated,
+            "Cumulative count of egress connections created by acquisition purpose",
+            otel::metrics::MetricUnit::kConnections,
+            otel::metrics::AttributeDefinition<std::string_view>{
+                .name = "purpose",
+                .values = {kNormalConnectionPurpose, kKillOperationConnectionPurpose}},
+            otel::metrics::AttributeDefinition<std::string_view>{
+                .name = "connection_pool",
+                .values = {kTaskExecutorPoolConnectionPoolAttribute,
+                           kShardingFixedConnectionPoolAttribute,
+                           kOtherConnectionPoolAttribute}},
+            otel::metrics::CounterOptions{
+                .serverStatusOptions = otel::metrics::ServerStatusOptions{
+                    .dottedPath = "network.egress.connectionsCreated", .role = ClusterRole::None}});
+
+std::string_view connectionAcquisitionPurposeToAttributeValue(
+    executor::ConnectionAcquisitionPurpose purpose) {
+    switch (purpose) {
+        case executor::ConnectionAcquisitionPurpose::kNormal:
+            return kNormalConnectionPurpose;
+        case executor::ConnectionAcquisitionPurpose::kKillOperation:
+            return kKillOperationConnectionPurpose;
+    }
+    MONGO_UNREACHABLE;
+}
+
+/** Determines the value of the "connection_pool" metric attribute from the pool name. */
+std::string_view connectionPoolNameToAttributeValue(std::string_view name) {
+    if (name.find(kTaskExecutorPoolConnectionPoolAttribute) != std::string_view::npos) {
+        return kTaskExecutorPoolConnectionPoolAttribute;
+    }
+    if (name.find(kShardingFixedConnectionPoolAttribute) != std::string_view::npos) {
+        return kShardingFixedConnectionPoolAttribute;
+    }
+    return kOtherConnectionPoolAttribute;
+}
 
 static const Status kCancelledStatus{ErrorCodes::CallbackCanceled,
                                      "Cancelled acquiring connection"};
@@ -88,7 +131,6 @@ bool shouldInvariantOnPoolCorrectness() {
 
 }  // namespace
 
-namespace executor {
 using namespace std::literals::string_view_literals;
 
 void ConnectionPool::ConnectionInterface::indicateUsed() {
@@ -313,7 +355,8 @@ public:
     Future<ConnectionHandle> getConnection(WithLock,
                                            Milliseconds timeout,
                                            bool lease,
-                                           const CancellationToken& token);
+                                           const CancellationToken& token,
+                                           ConnectionAcquisitionPurpose purpose);
 
     /**
      * Completely shuts down this pool. Use `initiateShutdown` and `processFailure` for
@@ -479,13 +522,19 @@ private:
     using OwnershipPool = stdx::unordered_map<ConnectionInterface*, OwnedConnection>;
     using LRUOwnershipPool = LRUCache<OwnershipPool::key_type, OwnershipPool::mapped_type>;
     struct Request {
-        Request(std::uint64_t i, Promise<ConnectionHandle>&& p, bool l, const CancellationToken& t)
-            : id(i), promise(std::move(p)), lease(l), source(t) {}
+        Request(std::uint64_t i,
+                Promise<ConnectionHandle>&& p,
+                bool l,
+                const CancellationToken& t,
+                ConnectionAcquisitionPurpose purpose)
+            : id(i), promise(std::move(p)), lease(l), source(t), purpose(purpose) {}
         std::uint64_t id;
         Promise<ConnectionHandle> promise;
         // Whether or not the requested connection should be "leased".
         bool lease;
         CancellationSource source;
+        ConnectionAcquisitionPurpose purpose;
+        bool hasPendingConnection = false;
     };
     using Requests = std::multimap<Date_t, Request>;
 
@@ -673,6 +722,7 @@ ConnectionPool::ConnectionPool(std::shared_ptr<DependentTypeFactoryInterface> im
                                std::string name,
                                Options options)
     : _name(std::move(name)),
+      _connectionPoolAttribute(connectionPoolNameToAttributeValue(_name)),
       _factory(std::move(impl)),
       _options(std::move(options)),
       _controller(_options.controllerFactory()),
@@ -808,11 +858,13 @@ void ConnectionPool::lease_forTest(const HostAndPort& hostAndPort,
     retrieve_forTest(getConnectionFunc, std::move(cb));
 }
 
-SemiFuture<ConnectionPool::ConnectionHandle> ConnectionPool::_get(const HostAndPort& hostAndPort,
-                                                                  transport::ConnectSSLMode sslMode,
-                                                                  Milliseconds timeout,
-                                                                  bool lease,
-                                                                  const CancellationToken& token) {
+SemiFuture<ConnectionPool::ConnectionHandle> ConnectionPool::_get(
+    const HostAndPort& hostAndPort,
+    transport::ConnectSSLMode sslMode,
+    Milliseconds timeout,
+    bool lease,
+    const CancellationToken& token,
+    ConnectionAcquisitionPurpose purpose) {
     auto connRequestedAt = _factory->now();
 
     std::unique_lock lk(_mutex);
@@ -849,7 +901,7 @@ SemiFuture<ConnectionPool::ConnectionHandle> ConnectionPool::_get(const HostAndP
         timeout = _controller->pendingTimeout();
     }
 
-    auto connFuture = pool->getConnection(lk, timeout, lease, token);
+    auto connFuture = pool->getConnection(lk, timeout, lease, token, purpose);
     pool->updateState(lk);
 
     if (lease) {
@@ -1039,7 +1091,11 @@ size_t ConnectionPool::SpecificPool::getCachedCreatedConnections(WithLock) const
 }
 
 Future<ConnectionPool::ConnectionHandle> ConnectionPool::SpecificPool::getConnection(
-    WithLock lk, Milliseconds timeout, bool lease, const CancellationToken& token) {
+    WithLock lk,
+    Milliseconds timeout,
+    bool lease,
+    const CancellationToken& token,
+    ConnectionAcquisitionPurpose purpose) {
 
     if (MONGO_unlikely(connectionPoolReturnsErrorOnGet.shouldFail())) {
         return Future<ConnectionPool::ConnectionHandle>::makeReady(
@@ -1096,7 +1152,8 @@ Future<ConnectionPool::ConnectionHandle> ConnectionPool::SpecificPool::getConnec
     auto pf = makePromiseFuture<ConnectionHandle>();
 
     auto requestId = _nextRequestId++;
-    auto it = pushRequest(lk, expiration, Request(requestId, std::move(pf.promise), lease, token));
+    auto it = pushRequest(
+        lk, expiration, Request(requestId, std::move(pf.promise), lease, token, purpose));
 
     it->second.source.token()
         .onCancel()
@@ -1188,7 +1245,26 @@ void ConnectionPool::SpecificPool::finishRefresh(std::unique_lock<ObservableMute
         return;
     }
 
-    // If the error can be contained to one connection, drop the one connection.
+    // Drop only the failing connection without calling processFailure when the failure is
+    // isolated to the new connection attempt and existing connections are unaffected.
+    //
+    // Case 1 — ConnectionError (SERVER-68329): an ASIO in-progress race or similar transient
+    //   error that occurs before the new connection ever touched the remote host. The pool
+    //   state is intact; always single-drop regardless of how many connections are established.
+    //
+    // Case 2 — ConnectionClosedByPeer / ConnectionEstablishmentTimeout during setup, when the pool
+    //   already has established connections:
+    //     - ConnectionClosedByPeer: the remote accepted the connection then closed it (e.g. its
+    //       connection establishment rate limiter rejected the new attempt).
+    //     - ConnectionEstablishmentTimeout: establishing the new connection timed out (e.g. new
+    //       attempts queued behind the remote's connection establishment rate limiter).
+    //   Both are transient capacity signals, not structural failures, so single-drop the new
+    //   attempt and leave the healthy established connections in place. Without established
+    //   connections there is nothing to protect; fall through to processFailure so pending requests
+    //   fail promptly rather than queuing indefinitely.
+    //
+    // All other failures (DNS, TLS validation, auth, plain HostUnreachable, handshake/auth-phase
+    // timeouts, refresh failures) fall through to processFailure to preserve SDAM-spec behavior.
     if (status.code() == ErrorCodes::ConnectionError) {
         LOGV2_DEBUG(6832901,
                     kDiagnosticLogLevel,
@@ -1196,6 +1272,17 @@ void ConnectionPool::SpecificPool::finishRefresh(std::unique_lock<ObservableMute
                     "hostAndPort"_attr = _hostAndPort,
                     "error"_attr = redact(status),
                     "numOpenConns"_attr = openConnections(lk));
+        return;
+    } else if (onSetup && establishedConnections(lk) > 0 &&
+               (status.code() == ErrorCodes::ConnectionClosedByPeer ||
+                status.code() == ErrorCodes::ConnectionEstablishmentTimeout)) {
+        LOGV2_DEBUG(10864501,
+                    kDiagnosticLogLevel,
+                    "Ignoring single establishment failure since the pool contains other "
+                    "already established connections",
+                    "hostAndPort"_attr = _hostAndPort,
+                    "error"_attr = redact(status),
+                    "numEstablishedConns"_attr = establishedConnections(lk));
         return;
     }
 
@@ -1206,27 +1293,6 @@ void ConnectionPool::SpecificPool::finishRefresh(std::unique_lock<ObservableMute
                     "Dropping late refreshed connection",
                     "hostAndPort"_attr = _hostAndPort);
         return;
-    }
-
-    if (onSetup) {
-        // If a new connection fails to establish while there are already established connections in
-        // the pool, we'll react as if the connection was rejected by the target's rate limiter.
-        // Therefore, we won't drop any open connection and just continue. If the node is truly
-        // down, future refreshes of idle connections, attempts to use connections, or higher levels
-        // like the RSM will detect it and process the failure normally.
-        if ((status.code() == ErrorCodes::HostUnreachable ||
-             status.code() == ErrorCodes::SocketException ||
-             status.code() == ErrorCodes::NetworkTimeout) &&
-            establishedConnections(lk) > 0) {
-            LOGV2_DEBUG(10864501,
-                        kDiagnosticLogLevel,
-                        "Ignoring single establishment failure since the pool contains other "
-                        "already established connections",
-                        "hostAndPort"_attr = _hostAndPort,
-                        "error"_attr = redact(status),
-                        "numEstablishedConns"_attr = establishedConnections(lk));
-            return;
-        }
     }
 
     // Pass a failure on through
@@ -1518,7 +1584,8 @@ Future<ConnectionPool::ConnectionHandle> ConnectionPool::SpecificPool::setGetCon
         return Future<ConnectionPool::ConnectionHandle>::makeReady(failpointStatus);
     }
     auto pf = makePromiseFuture<ConnectionHandle>();
-    auto request = std::make_shared<Request>(0, std::move(pf.promise), false, token);
+    auto request = std::make_shared<Request>(
+        0, std::move(pf.promise), false /*lease*/, token, ConnectionAcquisitionPurpose::kNormal);
     auto timeoutTimer = _parent->_factory->makeTimer();
     timeoutTimer->setTimeout(failpointTimeout, [request, timeoutTimer, failpointStatus]() mutable {
         request->promise.setError(failpointStatus);
@@ -1583,6 +1650,26 @@ void ConnectionPool::SpecificPool::spawnConnections(WithLock lk) {
                 "connAllowance"_attr = allowance,
                 "hostAndPort"_attr = _hostAndPort);
 
+    // Requests stay queued until setup completes, so reserve each request once before starting
+    // its connection attempt, which prevents a later batch from reusing an earlier purpose. The
+    // marker is attribution-only, it does not affect pool behavior. An isolated setup failure can
+    // leave a reserved request queued, so its replacement may be counted as normal, but such cases
+    // should be very rare (e.g., peer beginning shutdown while the connection is establishing).
+    // A potential fix would be to plumb an id for each request through, and un-mark the request
+    // as pending in such a failure case, but this is a lot of bookkeeping to handle a case that is
+    // not likely to change the conclusions we will draw from the affected metric.
+    std::vector<ConnectionAcquisitionPurpose> purposes;
+    purposes.reserve(allowance);
+    for (auto request = _requests.begin();
+         request != _requests.end() && purposes.size() < allowance;
+         ++request) {
+        if (!request->second.hasPendingConnection) {
+            request->second.hasPendingConnection = true;
+            purposes.push_back(request->second.purpose);
+        }
+    }
+    purposes.resize(allowance, ConnectionAcquisitionPurpose::kNormal);
+
     for (decltype(allowance) i = 0; i < allowance; ++i) {
         OwnedConnection handle;
         try {
@@ -1599,6 +1686,10 @@ void ConnectionPool::SpecificPool::spawnConnections(WithLock lk) {
         handle = makeDeathNotificationWrapper(std::move(handle));
         _processingPool[handle.get()] = handle;
         ++_created;
+        egressConnectionsCreatedCounter.add(
+            1,
+            {connectionAcquisitionPurposeToAttributeValue(purposes[i]),
+             _parent->_connectionPoolAttribute});
 
         // Run the setup callback
         handle->setup(_parent->_controller->pendingTimeout(),

@@ -4,6 +4,7 @@
  * excluded from API version 1. Note "geoHaystack" index has been deprecated after 4.9.
  *
  * @tags: [
+ *   uses_explain,
  *   uses_api_parameters,
  *   assumes_read_concern_local,
  *   not_allowed_with_signed_security_token,
@@ -13,7 +14,7 @@
  */
 
 import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
-import {getWinningPlanFromExplain} from "jstests/libs/query/analyze_plan.js";
+import {getSingleChildStage, getWinningPlanFromExplain} from "jstests/libs/query/analyze_plan.js";
 
 const testDb = db.getSiblingDB(jsTestName());
 const collName = "api_verision_unstable_indexes";
@@ -66,5 +67,6 @@ if (!FixtureHelpers.isMongos(testDb)) {
     const explainRes = assert.commandWorked(
         testDb.runCommand({explain: {"find": collName, "filter": {views: 50}, "hint": {views: 1}}}),
     );
-    assert.eq(getWinningPlanFromExplain(explainRes).inputStage.indexName, "views_1", explainRes);
+    const ixscan = getSingleChildStage(getWinningPlanFromExplain(explainRes));
+    assert.eq(ixscan.indexName, "views_1", explainRes);
 }

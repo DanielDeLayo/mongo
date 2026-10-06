@@ -9,6 +9,11 @@
 #include "mongo/db/query/compiler/ce/sampling/persistent_sample_gen.h"
 #include "mongo/db/query/compiler/optimizer/index_bounds_builder/index_bounds_builder.h"
 #include "mongo/db/shard_role/lock_manager/exception_util.h"
+#include "mongo/db/shard_role/shard_catalog/clustered_collection_util.h"
+#include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/idl/idl_parser.h"
+
+#include <string>
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
@@ -131,20 +136,29 @@ std::vector<BSONObj> SamplingEstimatorTest::createDocumentsFromSBEValue(
     return docs;
 }
 
+size_t sampleSizeForKnobs(SamplingConfidenceIntervalEnum ci,
+                          double marginOfError,
+                          int sampleSizeOverride) {
+    unittest::ServerParameterGuard confidenceIntervalGuard{"samplingConfidenceInterval",
+                                                           std::string{idl::serialize(ci)}};
+    unittest::ServerParameterGuard marginOfErrorGuard{"samplingMarginOfError", marginOfError};
+    unittest::ServerParameterGuard sampleSizeOverrideGuard{"internalSamplingSizeOverride",
+                                                           sampleSizeOverride};
+    return SamplingEstimatorImpl::calculateSampleSize(
+        QueryKnobConfiguration{query_settings::QuerySettings{}});
+}
+
 size_t translateSampleDefToActualSampleSize(SampleSizeDef sampleSizeDef) {
     // Translate the sample size definition to corresponding sample size.
     switch (sampleSizeDef) {
         case SampleSizeDef::ErrorSetting1: {
-            return SamplingEstimatorForTesting::calculateSampleSize(
-                SamplingConfidenceIntervalEnum::k95, 1.0);
+            return sampleSizeForKnobs(SamplingConfidenceIntervalEnum::k95, 1.0);
         }
         case SampleSizeDef::ErrorSetting2: {
-            return SamplingEstimatorForTesting::calculateSampleSize(
-                SamplingConfidenceIntervalEnum::k95, 2.0);
+            return sampleSizeForKnobs(SamplingConfidenceIntervalEnum::k95, 2.0);
         }
         case SampleSizeDef::ErrorSetting5: {
-            return SamplingEstimatorForTesting::calculateSampleSize(
-                SamplingConfidenceIntervalEnum::k95, 5.0);
+            return sampleSizeForKnobs(SamplingConfidenceIntervalEnum::k95, 5.0);
         }
     }
     MONGO_UNREACHABLE;
@@ -161,7 +175,8 @@ std::pair<SamplingCEMethodEnum, boost::optional<int>> iniitalizeSamplingAlgoBase
 
 void createCollAndInsertDocuments(OperationContext* opCtx,
                                   const NamespaceString& nss,
-                                  const std::vector<BSONObj>& docs) {
+                                  const std::vector<BSONObj>& docs,
+                                  bool clustered) {
     writeConflictRetry(opCtx, "createColl", nss, [&] {
         shard_role_details::getRecoveryUnit(opCtx)->setTimestampReadSource(
             RecoveryUnit::ReadSource::kNoTimestamp);
@@ -170,7 +185,12 @@ void createCollAndInsertDocuments(OperationContext* opCtx,
         WriteUnitOfWork wunit(opCtx);
         AutoGetDb db(opCtx, nss.dbName(), MODE_X);
         db.ensureDbExists(opCtx);
-        invariant(db.getDb()->createCollection(opCtx, nss, {}));
+
+        CollectionOptions options;
+        if (clustered) {
+            options.clusteredIndex = clustered_util::makeDefaultClusteredIdIndex();
+        }
+        invariant(db.getDb()->createCollection(opCtx, nss, options));
         wunit.commit();
     });
 
@@ -578,16 +598,25 @@ BSONObj buildPersistentSampleDoc(const UUID& collUuid,
                                  const std::vector<BSONObj>& docs,
                                  boost::optional<int> numChunks,
                                  int schemaVersion,
-                                 BSONObj overrides) {
+                                 BSONObj overrides,
+                                 int pageNo) {
     BSONObjBuilder builder;
     // _id is required by the IDL schema. For intentionally-malformed docs (e.g. kChunk without
-    // numChunks used in parse-rejection tests) we can't build a valid key, so use a dummy string.
-    const bool validForKey = (method != SamplingTechniqueEnum::kChunk || numChunks.has_value());
+    // numChunks, or sampleSize=0, used in parse-rejection tests) we can't build a valid key, so
+    // use a stand-in random _id string so the doc still has a well-formed key.
+    const bool validForKey = sampleSize > 0 &&
+        (method != SamplingTechniqueEnum::kChunk || (numChunks.has_value() && *numChunks > 0));
     if (validForKey) {
-        builder.append("_id", buildPersistentSampleId(collUuid, method, sampleSize, numChunks));
+        builder.append("_id",
+                       makePersistentSampleId(collUuid, method, sampleSize, numChunks, pageNo));
     } else {
-        builder.append("_id", "dummy");
+        builder.append("_id",
+                       makePersistentSampleId(collUuid,
+                                              SamplingTechniqueEnum::kRandom,
+                                              sampleSize > 0 ? sampleSize : 1,
+                                              boost::none));
     }
+    builder.append(PersistentSampleDoc::kPageNoFieldName, pageNo);
     builder.append(PersistentSampleDoc::kCollectionUuidFieldName, collUuid.toString());
     builder.append(PersistentSampleDoc::kSchemaVersionFieldName, schemaVersion);
     builder.appendDate(PersistentSampleDoc::kCreatedAtFieldName, Date_t::now());
@@ -615,6 +644,12 @@ BSONObj buildPersistentSampleDoc(const UUID& collUuid,
     }
     merged.appendElements(overrides);
     return merged.obj();
+}
+
+BSONObj makeSizedDoc(int id, size_t sizeBytes) {
+    const size_t overhead = static_cast<size_t>(BSON("_id" << id << "pad" << "").objsize());
+    const size_t padLen = sizeBytes > overhead ? sizeBytes - overhead : 0;
+    return BSON("_id" << id << "pad" << std::string(padLen, 'x'));
 }
 
 }  // namespace mongo::ce

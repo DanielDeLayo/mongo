@@ -4,13 +4,9 @@
 #pragma once
 
 #include "mongo/db/matcher/expression.h"
-#include "mongo/db/matcher/expression_expr.h"
-#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/op_debug.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/expression_context_builder.h"
-#include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/query/compiler/optimizer/join/join_graph.h"
-#include "mongo/db/query/compiler/optimizer/join/path_resolver.h"
 
 namespace mongo::join_ordering {
 /**
@@ -34,6 +30,15 @@ StatusWith<std::vector<BSONObj>> addImplicitEdgesAndInferPredicates(
     MutableJoinGraph& graph,
     const std::vector<ResolvedPath>& resolvedPaths,
     size_t maxNodes,
-    const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    OpDebug::JoinOptimizationMetrics& metrics);
+
+/**
+ * Builds a new CanonicalQuery whose filter is 'expr', cloning the FindCommandRequest and
+ * ExpressionContext state of 'cqOld'. Used to snapshot a node's filter as parsed, before predicate
+ * inference mutates the node's access path by ANDing in inferred single-table predicates.
+ */
+StatusWith<std::unique_ptr<CanonicalQuery>> cloneCQWithUpdatedFilter(
+    const CanonicalQuery& cqOld, std::unique_ptr<MatchExpression> expr, bool enableSimplification);
 
 }  // namespace mongo::join_ordering

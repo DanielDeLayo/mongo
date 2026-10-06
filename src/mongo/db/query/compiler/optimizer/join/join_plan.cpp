@@ -6,7 +6,6 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/query/compiler/optimizer/join/join_graph.h"
 #include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
-#include "mongo/db/query/util/disjoint_set.h"
 #include "mongo/util/str.h"
 
 namespace mongo::join_ordering {
@@ -57,6 +56,17 @@ JoinPlanNodeId JoinPlanNodeRegistry::registerJoinNode(const JoinSubset& subset,
                                                       JoinPlanNodeId right,
                                                       JoinCostEstimate cost) {
     JoinPlanNodeId id = _allJoinPlans.size();
+    switch (method) {
+        case JoinMethod::HJ:
+            _numHashJoins++;
+            break;
+        case JoinMethod::NLJ:
+            _numNestedLoopJoins++;
+            break;
+        case JoinMethod::INLJ:
+            _numIndexedNestedLoopJoins++;
+            break;
+    }
     _allJoinPlans.emplace_back(JoiningNode{method, left, right, subset.subset, std::move(cost)});
     return id;
 }
@@ -126,11 +136,20 @@ JoinCostEstimate JoinPlanNodeRegistry::getCost(JoinPlanNodeId nodeId) const {
 
 BSONObj JoinPlanNodeRegistry::joinPlanNodeToBSON(JoinPlanNodeId nodeId,
                                                  const JoinGraph& graph,
-                                                 size_t numNodesToPrint) const {
-    const NodeSet bitset = getBitset(nodeId);
+                                                 bool printSubset) const {
     BSONObjBuilder bob;
-    bob << "subset" << nodeSetToString(bitset, numNodesToPrint);
-    {
+    joinPlanNodeToBSON(bob, nodeId, graph, printSubset);
+    return bob.obj();
+}
+
+void JoinPlanNodeRegistry::joinPlanNodeToBSON(BSONObjBuilder& bob,
+                                              JoinPlanNodeId nodeId,
+                                              const JoinGraph& graph,
+                                              bool brief) const {
+    const NodeSet bitset = getBitset(nodeId);
+    bob << "planNodeId" << (int)nodeId;
+    if (!brief) {
+        bob << "subset" << nodeSetToString(bitset, graph.numNodes());
         BSONArrayBuilder namesBob(bob.subarrayStart("subsetCollectionNames"));
         for (const auto& name : subsetCollectionNames(bitset, graph)) {
             namesBob << name;
@@ -140,43 +159,36 @@ BSONObj JoinPlanNodeRegistry::joinPlanNodeToBSON(JoinPlanNodeId nodeId,
         // INLJRHSNodes don't have their own associated cost.
         bob << "cost" << getCost(nodeId).toBSON();
     }
-    std::visit(OverloadedVisitor{[this, &graph, numNodesToPrint, &bob](const JoiningNode& join) {
-                                     bob << "method" << joinMethodToString(join.method);
-                                     bob << "left"
-                                         << joinPlanNodeToBSON(join.left, graph, numNodesToPrint);
-                                     bob << "right"
-                                         << joinPlanNodeToBSON(join.right, graph, numNodesToPrint);
-                                 },
-                                 [&bob](const INLJRHSNode& ip) {
-                                     bob << "accessPath"
-                                         << (str::stream() << "INDEX_PROBE "
-                                                           << ip.entry->descriptor()->keyPattern());
-                                 },
-                                 [&bob](const BaseNode& base) {
-                                     bob << "accessPath" << base.soln->summaryString();
-                                 }},
-               get(nodeId));
-    return bob.obj();
-}
-
-bool JoinGraph::isConnected() const {
-    if (_edges.size() < _nodes.size() - 1) {
-        return false;
-    }
-
-    // We could implement the following with DFS. However, getting the neighbors of a node requires
-    // iterating over all edges, which is inefficient. Instead, we use union-find.
-    DisjointSet ds{_nodes.size()};
-    for (const auto& edge : _edges) {
-        ds.unite(edge.left, edge.right);
-    }
-    auto root = ds.find(0);
-    for (size_t i = 1; i < _nodes.size(); ++i) {
-        if (ds.find(i) != root) {
-            return false;
-        }
-    }
-    return true;
+    std::visit(
+        OverloadedVisitor{
+            [this, &graph, &bob, &brief](const JoiningNode& join) {
+                bob << "method" << joinMethodToString(join.method);
+                if (!brief) {
+                    bob << "left" << joinPlanNodeToBSON(join.left, graph, brief);
+                    bob << "right" << joinPlanNodeToBSON(join.right, graph, brief);
+                } else {
+                    bob << "leftSubset" << nodeSetToString(getBitset(join.left), graph.numNodes());
+                    bob << "leftNodeId" << (int)join.left;
+                    bob << "rightSubset"
+                        << nodeSetToString(getBitset(join.right), graph.numNodes());
+                    if (isOfType<INLJRHSNode>(join.right)) {
+                        // INLJ is a special case- we use an IXPROBE instead of the "best" single
+                        // table access plan for that subset, but this is not a plan linked to the
+                        // subset. Just print out the whole node.
+                        bob << "rightNode" << joinPlanNodeToBSON(join.right, graph, brief);
+                    } else {
+                        bob << "rightNodeId" << (int)join.right;
+                    }
+                }
+            },
+            [&bob](const INLJRHSNode& ip) {
+                bob << "accessPath"
+                    << (str::stream() << "INDEX_PROBE " << ip.entry->descriptor()->keyPattern());
+            },
+            [&bob](const BaseNode& base) {
+                bob << "accessPath" << base.soln->summaryString();
+            }},
+        get(nodeId));
 }
 
 }  // namespace mongo::join_ordering

@@ -127,6 +127,7 @@ const kInternalClientTypeStages = new Set([
     "$https",
     "$setStreamMeta",
     "$_streamsVectorSearch",
+    "$throttle",
     "$validate",
     "$tumblingWindow",
     "$hoppingWindow",
@@ -171,6 +172,7 @@ const kNeverInVersion1Stages = new Set([
     "$listSampledQueries",
     "$listSessions",
     "$planCacheStats",
+    "$joinPlanCacheStats",
     "$querySettings",
     // $querySettings desugar internals
     "$_internalListQuerySettings",

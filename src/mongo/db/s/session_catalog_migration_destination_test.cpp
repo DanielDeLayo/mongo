@@ -142,8 +142,8 @@ public:
         _migrationId = UUID::gen();
 
         {
-            auto donorShard = assertGet(shardRegistry()->getShard(
-                operationContext(), ShardRef(kDonorConnStr.getSetName())));
+            auto donorShard = assertGet(
+                shardRegistry()->getShard(operationContext(), kDonorConnStr.getSetName()));
             RemoteCommandTargeterMock::get(donorShard->getTargeter())
                 ->setConnectionStringReturnValue(kDonorConnStr);
             RemoteCommandTargeterMock::get(donorShard->getTargeter())
@@ -442,7 +442,7 @@ private:
                                                                   BSONObj filter) override {
 
                 ShardType donorShard;
-                donorShard.setHandle(ShardHandle(ShardId(kDonorConnStr.getSetName()), boost::none));
+                donorShard.setName(kDonorConnStr.getSetName());
                 donorShard.setHost(kDonorConnStr.toString());
 
                 return repl::OpTimeWith<std::vector<ShardType>>({donorShard});

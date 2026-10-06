@@ -12,11 +12,7 @@ import {
     profilerHasSingleMatchingEntryOrThrow,
     profilerHasZeroMatchingEntriesOrThrow,
 } from "jstests/libs/profiler.js";
-import {
-    getAggPlanStages,
-    getPlanStage,
-    getWinningPlanFromExplain,
-} from "jstests/libs/query/analyze_plan.js";
+import {getAggPlanStages} from "jstests/libs/query/analyze_plan.js";
 import {ShardingTest} from "jstests/libs/shardingtest.js";
 import {checkSbeFullyEnabled} from "jstests/libs/query/sbe_util.js";
 
@@ -109,12 +105,29 @@ assert.eq(profileObj.usedDisk, true, tojson(profileObj));
 //
 resetCollection();
 
+// When featureFlagSbeAccumulatorExpressions is enabled, the $avg group key makes this $group
+// eligible for SBE, whose hash agg spills eagerly in debug builds and obeys its own memory knob
+// rather than 'internalDocumentSourceGroupMaxMemoryBytes'. Pin its spilling behavior so the
+// assertions below hold in either engine.
+assert.commandWorked(
+    testDB.adminCommand({
+        setParameter: 1,
+        internalQuerySlotBasedExecutionHashAggIncreasedSpilling: "never",
+    }),
+);
+
 coll.aggregate([{$group: {"_id": {$avg: "$a"}}}], {allowDiskUse: true});
 profileObj = getLatestProfilerEntry(testDB);
 assert(!profileObj.hasOwnProperty("usedDisk"), tojson(profileObj));
 
 assert.commandWorked(
     testDB.adminCommand({setParameter: 1, internalDocumentSourceGroupMaxMemoryBytes: 10}),
+);
+assert.commandWorked(
+    testDB.adminCommand({
+        setParameter: 1,
+        internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill: 10,
+    }),
 );
 resetCollection();
 coll.aggregate([{$group: {"_id": {$avg: "$a"}}}], {allowDiskUse: true});
@@ -220,22 +233,12 @@ const setWindowFieldsPipeline = [
     {$setWindowFields: {sortBy: {a: 1}, output: {as: {$addToSet: "$a"}}}},
 ];
 
-function getSetWindowFieldsMemoryLimit() {
-    const explain = coll.explain().aggregate(setWindowFieldsPipeline);
-    // If $setWindowFields was pushed down to SBE, set a lower limit. We can't set it to 1 byte
-    // for Classic because DocumentSourceSetWindowFields will fail if it still doesn't fit into
-    // memory limit after spilling.
-    if (getPlanStage(getWinningPlanFromExplain(explain), "WINDOW")) {
-        return 1;
-    } else {
-        return 500;
-    }
-}
-
+// We can't set the limit to 1 byte because DocumentSourceSetWindowFields will fail if it still
+// doesn't fit into the memory limit after spilling.
 assert.commandWorked(
     testDB.adminCommand({
         setParameter: 1,
-        internalDocumentSourceSetWindowFieldsMaxMemoryBytes: getSetWindowFieldsMemoryLimit(),
+        internalDocumentSourceSetWindowFieldsMaxMemoryBytes: 500,
     }),
 );
 resetCollection();
@@ -417,7 +420,15 @@ MongoRunner.stopMongod(conn);
 //
 // Tests on a sharded cluster.
 //
-const st = new ShardingTest({shards: 2});
+// Non-deterministic query stats collection can lead to non-deterministic usedDisk in system.profile.
+const queryStatsDisabled = {internalQueryStatsRateLimit: 0, internalQueryStatsSampleRate: 0};
+const st = new ShardingTest({
+    shards: 2,
+    other: {
+        mongosOptions: {setParameter: queryStatsDisabled},
+        rsOptions: {setParameter: queryStatsDisabled},
+    },
+});
 const shardedDB = st.s.getDB(jsTestName());
 
 assert.commandWorked(
@@ -458,6 +469,23 @@ function restartProfiler() {
 
 assert.commandWorked(
     shard0DB.adminCommand({setParameter: 1, internalDocumentSourceGroupMaxMemoryBytes: 10}),
+);
+// As above, pin SBE hash agg spilling in case featureFlagSbeAccumulatorExpressions pushes the
+// $avg-keyed $group stages below into SBE on the shards. The spill threshold mirrors the classic
+// knob and is only set on shard0, which is where the assertions below expect spilling.
+for (let shardDB of [shard0DB, shard1DB]) {
+    assert.commandWorked(
+        shardDB.adminCommand({
+            setParameter: 1,
+            internalQuerySlotBasedExecutionHashAggIncreasedSpilling: "never",
+        }),
+    );
+}
+assert.commandWorked(
+    shard0DB.adminCommand({
+        setParameter: 1,
+        internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill: 10,
+    }),
 );
 restartProfiler();
 // Test that 'usedDisk' doesn't get populated on the profiler entry of the base pipeline, when the
@@ -554,6 +582,12 @@ assert.commandWorked(
     shard0DB.adminCommand({
         setParameter: 1,
         internalDocumentSourceGroupMaxMemoryBytes: 100 * 1024 * 1024,
+    }),
+);
+assert.commandWorked(
+    shard0DB.adminCommand({
+        setParameter: 1,
+        internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill: 100 * 1024 * 1024,
     }),
 );
 

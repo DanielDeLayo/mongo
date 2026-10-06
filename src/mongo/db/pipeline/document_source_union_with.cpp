@@ -55,6 +55,8 @@ DocumentSourceContainer DocumentSourceUnionWith::createFromStageParams(
     // search stage.
     if (hybrid_scoring_util::isHybridSearchPipeline(params.pipeline) || params.isHybridSearch) {
         hybrid_scoring_util::assertForeignCollectionIsNotTimeseries(params.unionNss, expCtx);
+    } else {
+        hybrid_scoring_util::assertForeignSearchViewIsNotTimeseries(params.unionNss, expCtx);
     }
 
     // It is possible to specify a $unionWith with *only* a collection in order to do a
@@ -384,6 +386,8 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceUnionWith::createFromBson(
                 expCtx->getNamespaceString().dbName());
         }
         pipeline = unionWithSpec.getPipeline().value_or(std::vector<BSONObj>{});
+        // TODO SERVER-121094 Remove these assertions when featureFlagExtensionsInsideHybridSearch
+        // is removed.
         if (unionWithSpec.getIsHybridSearch() ||
             hybrid_scoring_util::isHybridSearchPipeline(pipeline)) {
             // If there is a hybrid search stage in our pipeline, then we should validate that we
@@ -393,6 +397,8 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceUnionWith::createFromBson(
             // come from a mongos that does not know if the collection is a valid collection for
             // hybrid search. Therefore, we must validate it here.
             hybrid_scoring_util::assertForeignCollectionIsNotTimeseries(unionNss, expCtx);
+        } else {
+            hybrid_scoring_util::assertForeignSearchViewIsNotTimeseries(unionNss, expCtx);
         }
     }
     return make_intrusive<DocumentSourceUnionWith>(
@@ -405,16 +411,6 @@ DocumentSourceContainer::iterator DocumentSourceUnionWith::optimizeAt(
         _sharedState->_pipeline->addFinalSource(
             nextStage->clone(_sharedState->_pipeline->getContext()));
         // Apply the same rewrite to the cached pipeline if available.
-        //
-        // This reads the verbosity directly from the ExpressionContext, which holds the originally
-        // requested (possibly V3) verbosity rather than the translated legacy verbosity.
-        //
-        // TODO SERVER-130529 The V3 verbosities currently map to the same policy as kExecAllPlans
-        // (see the transitional rows in explainPolicyFor()), so this predicate is true for every V3
-        // mode today. That reproduces the prior behavior exactly: the emit side (serialize()) still
-        // depends on the translated legacy verbosity, so any pushed-down stages recorded here for a
-        // planner-only V3 mode are ignored. Once the real V3 policies are implemented, the
-        // planner-only modes will correctly report hasExecStats() == false here.
         const auto& explainVerbosity = getExpCtx()->getExplain();
         if (explainVerbosity && explainPolicyFor(*explainVerbosity).hasExecStats()) {
             _pushedDownStages.push_back(nextStage->serialize().getDocument().toBson());
@@ -446,11 +442,11 @@ Value DocumentSourceUnionWith::buildUnionWithResult(Value pipelineValue, Value c
 
 void DocumentSourceUnionWith::appendIsHybridSearchFlag(
     MutableDocument& spec, const query_shape::SerializationOptions& opts) const {
-    // The isHybridSearch flag is only carried on the shard-dispatch path, never in the explain
-    // serialization: an explain-of-a-view spec can be re-parsed on the (non-internal) router,
+    // The isHybridSearch flag is only carried on the shard-dispatch path, never in explain or
+    // query-shape serialization. These serializations can be re-parsed by a non-internal client,
     // where the flag would fail validateIsHybridSearchNotSetByUser (error 5491300). Mirrors the
     // guard on $lookup's serialization.
-    if (_userPipelineIsHybridSearch && !opts.isSerializingForExplain()) {
+    if (_userPipelineIsHybridSearch && !opts.isSerializingForExplain() && !opts.isShapifying()) {
         spec[hybrid_scoring_util::kIsHybridSearchFlagFieldName] = Value(true);
     }
 }
@@ -458,7 +454,7 @@ void DocumentSourceUnionWith::appendIsHybridSearchFlag(
 // TODO SERVER-121094: Remove when featureFlagExtensionsInsideHybridSearch is removed.
 Value DocumentSourceUnionWith::legacyUnionWithSerialize(
     const query_shape::SerializationOptions& opts) const {
-    if (opts.isSerializingForQueryStats()) {
+    if (opts.isShapifying()) {
         const auto serializedPipeline =
             pipeline_factory::makePipeline(_userPipeline,
                                            _sharedState->_pipeline->getContext(),
@@ -493,7 +489,7 @@ Value DocumentSourceUnionWith::legacyUnionWithSerialize(
 
 Value DocumentSourceUnionWith::serialize(const query_shape::SerializationOptions& opts) const {
     // The coll value used by most serialization paths (explain, default).
-    // Query stats uses _userNss instead (see below).
+    // Query shapes use _userNss instead (see below).
     Value pipelineContextColl{opts.serializeIdentifier(
         _sharedState->_pipeline->getContext()->getNamespaceString().coll())};
 
@@ -516,12 +512,11 @@ Value DocumentSourceUnionWith::serialize(const query_shape::SerializationOptions
         //  $limit stage after the $unionWith which results in only reading from the base collection
         //  branch and not the sub-pipeline.
         std::unique_ptr<Pipeline> pipeCopy;
-        if (*opts.verbosity == ExplainOptions::Verbosity::kQueryPlanner) {
+        if (!explainPolicyFor(*opts.verbosity).hasExecStats()) {
             pipeCopy = Pipeline::create(_sharedState->_pipeline->getSources(),
                                         _sharedState->_pipeline->getContext());
-        } else if (explainPolicyFor(*opts.verbosity).hasExecStats() &&
-                   _sharedState->_executionState >
-                       UnionWithSharedState::ExecutionProgress::kIteratingSource) {
+        } else if (_sharedState->_executionState >
+                   UnionWithSharedState::ExecutionProgress::kIteratingSource) {
             std::vector<BSONObj> recoveredPipeline;
             // We've either exhausted the sub-pipeline or at least started iterating it. Use the
             // cached user pipeline and pushed down stages to get the explain output since the
@@ -571,7 +566,11 @@ Value DocumentSourceUnionWith::serialize(const query_shape::SerializationOptions
         };
 
         BSONObj explainLocal = [&] {
-            auto serializedPipe = pipeCopy->serializeToBson();
+            // Pre-serialize with serializeForReparse so the catch path below can feed it into
+            // parsePipelineWithMaybeViewDefinition. Otherwise, the serialized pipe is discarded.
+            query_shape::SerializationOptions serializeOptsForViewResolutionReparse{
+                .serializeForReparse = true};
+            auto serializedPipe = pipeCopy->serializeToBson(serializeOptsForViewResolutionReparse);
             try {
                 return preparePipelineAndExplain(std::move(pipeCopy));
             } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& e) {
@@ -610,8 +609,8 @@ Value DocumentSourceUnionWith::serialize(const query_shape::SerializationOptions
             return legacyUnionWithSerialize(opts);
         }
 
-        // For query stats, use the original unresolved namespace and re-parse user pipeline.
-        if (opts.isSerializingForQueryStats()) {
+        // When shapifying, use the original unresolved namespace and re-parse user pipeline.
+        if (opts.isShapifying()) {
             const auto serializedPipeline =
                 pipeline_factory::makePipeline(_userPipeline,
                                                _sharedState->_pipeline->getContext(),

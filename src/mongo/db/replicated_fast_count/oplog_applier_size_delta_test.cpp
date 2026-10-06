@@ -13,6 +13,7 @@
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_entry_test_helpers.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
 #include "mongo/unittest/server_parameter_guard.h"
 #include "mongo/unittest/unittest.h"
 
@@ -63,6 +64,18 @@ TEST_F(SizeDeltaTestDisable, DeleteAbsentSizeMetadataIsSkippedInSecondaryMode) {
     insertDocumentAtRecordId(_opCtx.get(), _nss, doc, rid);
 
     auto op = makeDeleteOplogEntryWithRecordId(nextOpTime(), _nss, _uuid, BSON("_id" << 1), rid);
+    ASSERT_OK(runOpSteadyState(op));
+    EXPECT_FALSE(documentExistsAtRecordId(_opCtx.get(), _nss, rid));
+}
+
+TEST_F(SizeDeltaTestDisable, DeletePresentSizeMetadataWithAbsentSzIsSkippedInSecondaryMode) {
+    // A present SingleOpSizeMetadata whose sz is absent must apply without any size check.
+    const RecordId rid(1);
+    const BSONObj doc = BSON("_id" << 1 << "x" << 100);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, doc, rid);
+
+    auto op =
+        makeDeleteOplogEntryWithRecordIdWithoutSz(nextOpTime(), _nss, _uuid, BSON("_id" << 1), rid);
     ASSERT_OK(runOpSteadyState(op));
     EXPECT_FALSE(documentExistsAtRecordId(_opCtx.get(), _nss, rid));
 }
@@ -141,6 +154,17 @@ TEST_F(SizeDeltaTestDisable, UpdateAbsentSizeMetadataIsSkippedInSecondaryMode) {
     ASSERT_OK(runOpSteadyState(op));
 }
 
+TEST_F(SizeDeltaTestDisable, UpdatePresentSizeMetadataWithAbsentSzIsSkippedInSecondaryMode) {
+    // A present SingleOpSizeMetadata whose sz is absent must apply without any size check.
+    const RecordId rid(1);
+    const BSONObj doc = BSON("_id" << 1 << "x" << 100);
+    insertDocumentAtRecordId(_opCtx.get(), _nss, doc, rid);
+
+    auto op = makeUpdateOplogEntryWithRecordIdWithoutSz(
+        nextOpTime(), _nss, BSON("_id" << 1), BSON("$set" << BSON("x" << 200)), rid);
+    ASSERT_OK(runOpSteadyState(op));
+}
+
 TEST_F(SizeDeltaTest, UpdateWrongSizeDeltaInInitialSyncModeIsIgnored) {
     // The size check must be skipped entirely during initial sync.
     const RecordId rid(1);
@@ -161,6 +185,54 @@ TEST_F(SizeDeltaTestDisable, UpdateWrongSizeDeltaInSecondaryModeReturnsError) {
     auto op = makeUpdateOplogEntryWithRecordIdAndSizeMetadata(
         nextOpTime(), _nss, BSON("_id" << 1), BSON("$set" << BSON("x" << 200)), rid, 42);
     EXPECT_EQ(runOpSteadyState(op).code(), 12380201);
+}
+
+TEST_F(SizeDeltaTest, RepairReplicatedMetadataNoopAdjustsInMemorySizeCount) {
+    const BSONObj o2 = BSON("type" << "repairReplicatedMetadata"
+                                   << "uuid" << _uuid << "m" << BSON("sz" << 100 << "ct" << 5));
+    auto op = makeOplogEntry(nextOpTime(),
+                             OpTypeEnum::kNoop,
+                             NamespaceString::kEmpty,
+                             _uuid,
+                             BSON("msg" << "Repairing collection's replicated metadata with diffs"),
+                             o2);
+    ASSERT_OK(runOpSteadyState(op));
+
+    AutoGetCollection coll(_opCtx.get(), _nss, MODE_IS);
+    EXPECT_EQ(coll->numRecords(_opCtx.get()), 5);
+    EXPECT_EQ(coll->dataSize(_opCtx.get()), 100);
+}
+
+TEST_F(SizeDeltaTest, RepairReplicatedMetadataNoopSizeOnly) {
+    const BSONObj o2 =
+        BSON("type" << "repairReplicatedMetadata" << "uuid" << _uuid << "m" << BSON("sz" << 100));
+    auto op = makeOplogEntry(nextOpTime(),
+                             OpTypeEnum::kNoop,
+                             NamespaceString::kEmpty,
+                             _uuid,
+                             BSON("msg" << "Repairing collection's replicated metadata with diffs"),
+                             o2);
+    ASSERT_OK(runOpSteadyState(op));
+
+    AutoGetCollection coll(_opCtx.get(), _nss, MODE_IS);
+    EXPECT_EQ(coll->numRecords(_opCtx.get()), 0);
+    EXPECT_EQ(coll->dataSize(_opCtx.get()), 100);
+}
+
+TEST_F(SizeDeltaTest, RepairReplicatedMetadataNoopCountOnly) {
+    const BSONObj o2 =
+        BSON("type" << "repairReplicatedMetadata" << "uuid" << _uuid << "m" << BSON("ct" << 5));
+    auto op = makeOplogEntry(nextOpTime(),
+                             OpTypeEnum::kNoop,
+                             NamespaceString::kEmpty,
+                             _uuid,
+                             BSON("msg" << "Repairing collection's replicated metadata with diffs"),
+                             o2);
+    ASSERT_OK(runOpSteadyState(op));
+
+    AutoGetCollection coll(_opCtx.get(), _nss, MODE_IS);
+    EXPECT_EQ(coll->numRecords(_opCtx.get()), 5);
+    EXPECT_EQ(coll->dataSize(_opCtx.get()), 0);
 }
 
 }  // namespace

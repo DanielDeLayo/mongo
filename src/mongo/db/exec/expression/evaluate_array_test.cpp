@@ -1,18 +1,20 @@
 // Copyright (c) MongoDB, Inc.
 // SPDX-License-Identifier: SSPL-1.0
 
-#include <boost/smart_ptr/intrusive_ptr.hpp>
-// IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
 #include "mongo/bson/json.h"
 #include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/expression/evaluate.h"
 #include "mongo/db/exec/expression/evaluate_test_helpers.h"
 #include "mongo/db/memory_tracking/memory_usage_tracker.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/unittest/server_parameter_guard.h"
 #include "mongo/unittest/unittest.h"
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+// IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
 
 
 namespace mongo {
@@ -111,6 +113,42 @@ TEST(ExpressionArrayTest, FallbackTrackerEnforcesLimit) {
     }
     ASSERT_EQ(expCtx.getExpressionFallbackTracker().inUseTrackedMemoryBytes(), 0);
     ASSERT_GT(expCtx.getExpressionFallbackTracker().peakTrackedMemoryBytes(), limit);
+}
+
+TEST(ExpressionArrayTest, ManySmallElementsCollectivelyExceedingLimitStillThrow) {
+    // Many small elements, none individually near the limit, must still trip it once their
+    // accumulated size crosses it.
+    auto expCtx = ExpressionContextForTest{};
+    BSONArrayBuilder bab;
+    for (int i = 0; i < 200; ++i) {
+        bab.append(std::string(50, 'x'));
+    }
+    auto expr = parseArrayLiteral(&expCtx, bab.arr());
+
+    const int64_t limit = 512;  // Well under the ~10KB (200 * 50) of total element data.
+    SimpleMemoryUsageTracker operationTracker{MemoryUsageLimit{limit}};
+    SimpleMemoryUsageTracker stageTracker{&operationTracker, MemoryUsageLimit{100 * 1024 * 1024}};
+    EvaluationContext ctx{.tracker = &stageTracker};
+
+    ASSERT_THROWS_CODE(expr->evaluate(MutableDocument().freeze(), &expCtx.variables, ctx),
+                       AssertionException,
+                       ErrorCodes::ExceededMemoryLimit);
+    ASSERT_LT(operationTracker.peakTrackedMemoryBytes(), limit + 1024 * 1024);
+}
+
+TEST(ExpressionArrayTest, SingleOversizedElementThrowsImmediately) {
+    // A single element larger than the whole limit must be caught immediately.
+    auto expCtx = ExpressionContextForTest{};
+    auto expr = parseArrayLiteral(&expCtx, BSON_ARRAY(std::string(1024, 'x')));
+
+    const int64_t limit = 8;
+    SimpleMemoryUsageTracker operationTracker{MemoryUsageLimit{limit}};
+    SimpleMemoryUsageTracker stageTracker{&operationTracker, MemoryUsageLimit{100 * 1024 * 1024}};
+    EvaluationContext ctx{.tracker = &stageTracker};
+
+    ASSERT_THROWS_CODE(expr->evaluate(MutableDocument().freeze(), &expCtx.variables, ctx),
+                       AssertionException,
+                       ErrorCodes::ExceededMemoryLimit);
 }
 
 /* ------------------------- ExpressionArrayToObject -------------------------- */
@@ -337,6 +375,54 @@ TEST(ExpressionSortArrayTest, TrackerDeductedAfterMemoryLimitException) {
                   AssertionException);
     ASSERT_EQ(tracker.inUseTrackedMemoryBytes(), 5);
     ASSERT_GT(tracker.peakTrackedMemoryBytes(), limit);
+}
+
+TEST(ExpressionSortArrayTest, ManySmallSortKeysCollectivelyExceedingLimitStillThrow) {
+    // Many small sort keys, none individually near the limit, must still trip it once their
+    // accumulated size crosses it.
+    auto expCtx = ExpressionContextForTest{};
+    BSONArrayBuilder bab;
+    for (int i = 0; i < 200; ++i) {
+        bab.append(BSON("x" << i));
+    }
+    BSONObj expr = BSON("$sortArray" << BSON("input" << BSON("$literal" << bab.arr()) << "sortBy"
+                                                     << BSON("x" << 1)));
+    auto expressionSortArray =
+        ExpressionSortArray::parse(&expCtx, expr.firstElement(), expCtx.variablesParseState);
+
+    const int64_t limit = 512;  // Well under the total size of 200 extracted sort keys.
+    SimpleMemoryUsageTracker operationTracker{MemoryUsageLimit{limit}};
+    SimpleMemoryUsageTracker stageTracker{&operationTracker, MemoryUsageLimit{100 * 1024 * 1024}};
+    EvaluationContext ctx{.tracker = &stageTracker};
+
+    ASSERT_THROWS_CODE(
+        expressionSortArray->evaluate(MutableDocument().freeze(), &expCtx.variables, ctx),
+        AssertionException,
+        ErrorCodes::ExceededMemoryLimit);
+    ASSERT_LT(operationTracker.peakTrackedMemoryBytes(), limit + 1024 * 1024);
+}
+
+TEST(ExpressionSortArrayTest, SingleOversizedSortKeyThrowsImmediately) {
+    // One sort key larger than the whole limit must be caught immediately. A second, tiny element
+    // is included because $sortArray skips its tracked loop entirely for arrays under 2 elements.
+    auto expCtx = ExpressionContextForTest{};
+    BSONObj expr =
+        BSON("$sortArray" << BSON(
+                 "input" << BSON("$literal" << BSON_ARRAY(BSON("x" << 1)
+                                                          << BSON("x" << std::string(1024, 'x'))))
+                         << "sortBy" << BSON("x" << 1)));
+    auto expressionSortArray =
+        ExpressionSortArray::parse(&expCtx, expr.firstElement(), expCtx.variablesParseState);
+
+    const int64_t limit = 8;
+    SimpleMemoryUsageTracker operationTracker{MemoryUsageLimit{limit}};
+    SimpleMemoryUsageTracker stageTracker{&operationTracker, MemoryUsageLimit{100 * 1024 * 1024}};
+    EvaluationContext ctx{.tracker = &stageTracker};
+
+    ASSERT_THROWS_CODE(
+        expressionSortArray->evaluate(MutableDocument().freeze(), &expCtx.variables, ctx),
+        AssertionException,
+        ErrorCodes::ExceededMemoryLimit);
 }
 
 TEST(ExpressionSortArrayTest, NoMemoryTrackerNoProblems) {
@@ -1123,6 +1209,46 @@ TEST(ExpressionConcatArraysTest, FallbackTrackerEnforcesLimit) {
     ASSERT_GT(expCtx.getExpressionFallbackTracker().peakTrackedMemoryBytes(), limit);
 }
 
+TEST(ExpressionConcatArraysTest, ManySmallElementsCollectivelyExceedingLimitStillThrow) {
+    // Many small operands, none individually near the limit, must still trip it once their
+    // accumulated size crosses it.
+    auto expCtx = ExpressionContextForTest{};
+    BSONArrayBuilder bab;
+    for (int i = 0; i < 200; ++i) {
+        bab.append(BSON_ARRAY(std::string(50, 'x')));
+    }
+    auto expr = Expression::parseExpression(
+        &expCtx, BSON("$concatArrays" << bab.arr()), expCtx.variablesParseState);
+
+    const int64_t limit = 512;  // Well under the ~10KB (200 * 50) of total operand data.
+    SimpleMemoryUsageTracker operationTracker{MemoryUsageLimit{limit}};
+    SimpleMemoryUsageTracker stageTracker{&operationTracker, MemoryUsageLimit{100 * 1024 * 1024}};
+    EvaluationContext ctx{.tracker = &stageTracker};
+
+    ASSERT_THROWS_CODE(expr->evaluate(MutableDocument().freeze(), &expCtx.variables, ctx),
+                       AssertionException,
+                       ErrorCodes::ExceededMemoryLimit);
+    ASSERT_LT(operationTracker.peakTrackedMemoryBytes(), limit + 1024 * 1024);
+}
+
+TEST(ExpressionConcatArraysTest, SingleOversizedElementThrowsImmediately) {
+    // A single operand larger than the whole limit must be caught immediately.
+    auto expCtx = ExpressionContextForTest{};
+    auto expr = Expression::parseExpression(
+        &expCtx,
+        BSON("$concatArrays" << BSON_ARRAY(BSON_ARRAY(std::string(1024, 'x')))),
+        expCtx.variablesParseState);
+
+    const int64_t limit = 8;
+    SimpleMemoryUsageTracker operationTracker{MemoryUsageLimit{limit}};
+    SimpleMemoryUsageTracker stageTracker{&operationTracker, MemoryUsageLimit{100 * 1024 * 1024}};
+    EvaluationContext ctx{.tracker = &stageTracker};
+
+    ASSERT_THROWS_CODE(expr->evaluate(MutableDocument().freeze(), &expCtx.variables, ctx),
+                       AssertionException,
+                       ErrorCodes::ExceededMemoryLimit);
+}
+
 
 /* ----------------------- ExpressionSetUnion memory tracking ----------------------- */
 
@@ -1167,6 +1293,49 @@ TEST(ExpressionSetUnionTest, MemoryTrackerThrowsWhenQueryLimitExceeded) {
     }
     ASSERT_EQ(operationTracker.inUseTrackedMemoryBytes(), 0);
     ASSERT_GT(operationTracker.peakTrackedMemoryBytes(), limit);
+}
+
+TEST(ExpressionSetUnionTest, ManySmallOperandsCollectivelyExceedingLimitStillThrow) {
+    // Many small operands, none individually near the limit, must still trip it once their
+    // accumulated size crosses it.
+    auto expCtx = ExpressionContextForTest{};
+    BSONArrayBuilder bab;
+    for (int i = 0; i < 200; ++i) {
+        bab.append(BSON_ARRAY(i));
+    }
+    auto expr = Expression::parseExpression(
+        &expCtx, BSON("$setUnion" << bab.arr()), expCtx.variablesParseState);
+
+    const int64_t limit = 256;  // Well under the total size across 200 single-element operands.
+    SimpleMemoryUsageTracker operationTracker{MemoryUsageLimit{limit}};
+    SimpleMemoryUsageTracker stageTracker{&operationTracker, MemoryUsageLimit{100 * 1024 * 1024}};
+    EvaluationContext ctx{.tracker = &stageTracker};
+
+    ASSERT_THROWS_CODE(expr->evaluate(MutableDocument().freeze(), &expCtx.variables, ctx),
+                       AssertionException,
+                       ErrorCodes::ExceededMemoryLimit);
+    ASSERT_LT(operationTracker.peakTrackedMemoryBytes(), limit + 1024 * 1024);
+}
+
+TEST(ExpressionSetUnionTest, SingleOversizedOperandThrowsImmediately) {
+    // A single operand larger than the whole limit must be caught immediately.
+    auto expCtx = ExpressionContextForTest{};
+    std::vector<Value> hugeArr;
+    for (int i = 0; i < 50; ++i) {
+        hugeArr.push_back(Value(std::string(50, 'x') + std::to_string(i)));
+    }
+    auto expr = Expression::parseExpression(
+        &expCtx, BSON("$setUnion" << BSON_ARRAY("$a"sv)), expCtx.variablesParseState);
+    Document doc{{"a", Value(hugeArr)}};
+
+    const int64_t limit = 8;
+    SimpleMemoryUsageTracker operationTracker{MemoryUsageLimit{limit}};
+    SimpleMemoryUsageTracker stageTracker{&operationTracker, MemoryUsageLimit{100 * 1024 * 1024}};
+    EvaluationContext ctx{.tracker = &stageTracker};
+
+    ASSERT_THROWS_CODE(expr->evaluate(doc, &expCtx.variables, ctx),
+                       AssertionException,
+                       ErrorCodes::ExceededMemoryLimit);
 }
 
 TEST(ExpressionSetUnionTest, FallbackTrackerWithinLimitDoesNotThrow) {
@@ -1305,6 +1474,28 @@ TEST(ExpressionZipTest, MemoryTrackerThrowsWhenQueryLimitExceeded) {
     ASSERT_GT(operationTracker.peakTrackedMemoryBytes(), limit);
 }
 
+TEST(ExpressionZipTest, ManySmallInputsCollectivelyExceedingLimitStillThrow) {
+    // Many small inputs, none individually near the limit, must still trip it once their
+    // accumulated size crosses it.
+    auto expCtx = ExpressionContextForTest{};
+    BSONArrayBuilder inputsBab;
+    for (int i = 0; i < 200; ++i) {
+        inputsBab.append(BSON_ARRAY(std::string(20, 'x')));
+    }
+    auto expr = Expression::parseExpression(
+        &expCtx, BSON("$zip" << BSON("inputs" << inputsBab.arr())), expCtx.variablesParseState);
+
+    const int64_t limit = 512;  // Well under the total size across 200 single-element inputs.
+    SimpleMemoryUsageTracker operationTracker{MemoryUsageLimit{limit}};
+    SimpleMemoryUsageTracker stageTracker{&operationTracker, MemoryUsageLimit{100 * 1024 * 1024}};
+    EvaluationContext ctx{.tracker = &stageTracker};
+
+    ASSERT_THROWS_CODE(expr->evaluate(MutableDocument().freeze(), &expCtx.variables, ctx),
+                       AssertionException,
+                       ErrorCodes::ExceededMemoryLimit);
+    ASSERT_LT(operationTracker.peakTrackedMemoryBytes(), limit + 1024 * 1024);
+}
+
 TEST(ExpressionZipTest, FallbackTrackerWithinLimitDoesNotThrow) {
     auto expCtx = ExpressionContextForTest{};
     auto expr =
@@ -1392,7 +1583,7 @@ TEST(ExpressionZipTest, MemoryTrackerThrowsWhenDefaultExceedsLimit) {
         FAIL("Expected ExceededMemoryLimit to be thrown");
     } catch (const AssertionException& ex) {
         ASSERT_EQ(ex.code(), ErrorCodes::ExceededMemoryLimit);
-        ASSERT_STRING_CONTAINS(ex.reason(), "$zip");
+        ASSERT_STRING_CONTAINS(ex.reason(), "$array");
     }
     ASSERT_EQ(operationTracker.inUseTrackedMemoryBytes(), 0);
     ASSERT_GT(operationTracker.peakTrackedMemoryBytes(), limit);
@@ -1413,8 +1604,10 @@ TEST(ExpressionZipTest, MemoryTrackerThrowsWhenInputAndDefaultCombinationExceeds
     int64_t defaultSize = static_cast<int64_t>(Value(moderateDefault).getApproximateSize());
     int64_t nullSize = static_cast<int64_t>(Value(BSONNULL).getApproximateSize());
 
-    // token at the failing assert = inputsSize + nullSize + defaultSize (one null replaced by
-    // default)
+    // The defaults are stored as a single ExpressionArray child, which charges
+    // its elements against the same operation tracker while $zip still holds the inputs and the
+    // placeholder nulls, so the tracked total at the failing assert is at least
+    // inputsSize + 2 * nullSize + defaultSize.
     int64_t limit = inputsSize + nullSize + defaultSize - 1;
     ASSERT_GT(limit, inputsSize + 2 * nullSize);  // inputs + placeholder nulls fit
     ASSERT_GT(limit, defaultSize);                // default alone fits
@@ -1437,6 +1630,9 @@ TEST(ExpressionZipTest, MemoryTrackerThrowsWhenInputAndDefaultCombinationExceeds
         FAIL("Expected ExceededMemoryLimit to be thrown");
     } catch (const AssertionException& ex) {
         ASSERT_EQ(ex.code(), ErrorCodes::ExceededMemoryLimit);
+        // $zip batches its charges, so the inputs are still pending -- and invisible to the
+        // tracker -- while the ExpressionArray defaults child is evaluated. The combination is
+        // therefore caught by $zip's own flush rather than inside the defaults child.
         ASSERT_STRING_CONTAINS(ex.reason(), "$zip");
     }
     ASSERT_EQ(operationTracker.inUseTrackedMemoryBytes(), 0);
@@ -1481,6 +1677,100 @@ TEST(ExpressionZipTest, MemoryTrackerThrowsWhenOutputExceedsLimit) {
     }
     ASSERT_EQ(operationTracker.inUseTrackedMemoryBytes(), 0);
     ASSERT_GT(operationTracker.peakTrackedMemoryBytes(), limit);
+}
+
+TEST(ExpressionZipTest, NullishWholeArrayDefaultsFillWithNullNotMissing) {
+    auto expCtx = ExpressionContextForTest{};
+    // 'defaults' is a whole-array expression (a field path) that resolves to missing, so it
+    // must be treated the same as omitting 'defaults': missing input slots fall back to an
+    // explicit null, not a missing/absent value.
+    auto expr =
+        Expression::parseExpression(&expCtx,
+                                    BSON("$zip" << BSON("inputs" << BSON_ARRAY("$a"sv << "$b"sv)
+                                                                 << "defaults" << "$missingField"
+                                                                 << "useLongestLength" << true)),
+                                    expCtx.variablesParseState);
+    Document doc{{"a", Value(std::vector<Value>{Value(1), Value(2), Value(3)})},
+                 {"b", Value(std::vector<Value>{Value("A"sv), Value("B"sv)})}};
+
+    SimpleMemoryUsageTracker tracker{MemoryUsageLimit{1024 * 1024}};
+    EvaluationContext ctx{.tracker = &tracker};
+    ASSERT_VALUE_EQ(expr->evaluate(doc, &expCtx.variables, ctx),
+                    Value(BSON_ARRAY(BSON_ARRAY(1 << "A"sv)
+                                     << BSON_ARRAY(2 << "B"sv) << BSON_ARRAY(3 << BSONNULL))));
+}
+
+TEST(ExpressionZipTest, ShapifiedNonArrayDefaultsReparseAndReoptimize) {
+    auto expCtx = ExpressionContextForTest{};
+    // A $zip whose defaults expression resolves to a non-array only fails at evaluation time,
+    // so query stats still records its shape, with the defaults collapsed to a constant object
+    // placeholder ({$const: {?: "?"}}). The $queryStats transformIdentifiers pass (exercised by
+    // the RunQueryStats hook) re-parses that representative query, and stages like
+    // $setWindowFields optimize their expressions at parse time — so neither parse() nor
+    // optimize() may eagerly reject a constant non-array defaults value. It must fail only at
+    // evaluation, like the original query did.
+    auto expr = Expression::parseExpression(
+        &expCtx,
+        BSON("$zip" << BSON("inputs" << BSON_ARRAY("$a"sv << "$b"sv) << "defaults"
+                                     << BSON("$const" << BSON("?" << "?")) << "useLongestLength"
+                                     << true)),
+        expCtx.variablesParseState);
+    expr = expr->optimize();
+
+    Document unequal{{"a", Value(std::vector<Value>{Value(1), Value(2)})},
+                     {"b", Value(std::vector<Value>{Value(1)})}};
+    ASSERT_THROWS_CODE(
+        expr->evaluate(unequal, &expCtx.variables, {}), AssertionException, 10961500);
+}
+
+TEST(ExpressionZipTest, ConstantArrayDefaultsLengthIsCheckedLazily) {
+    auto expCtx = ExpressionContextForTest{};
+    // A constant array's length is deliberately not validated at parse or optimize time:
+    // query-shape representative serialization replaces constant arrays with fixed-shape
+    // placeholders, so re-parsed representative queries would fail an eager length check. A
+    // wrong-length constant only fails when the defaults are actually needed.
+    auto expr = Expression::parseExpression(
+        &expCtx,
+        BSON("$zip" << BSON("inputs" << BSON_ARRAY("$a"sv << "$b"sv) << "defaults"
+                                     << BSON("$const" << BSON_ARRAY(1 << 2 << 3))
+                                     << "useLongestLength" << true)),
+        expCtx.variablesParseState);
+    expr = expr->optimize();
+
+    // Equal-length inputs never evaluate the defaults, so the query succeeds.
+    Document equal{{"a", Value(std::vector<Value>{Value(1)})},
+                   {"b", Value(std::vector<Value>{Value(2)})}};
+    ASSERT_VALUE_EQ(expr->evaluate(equal, &expCtx.variables, {}),
+                    Value(BSON_ARRAY(BSON_ARRAY(1 << 2))));
+
+    Document unequal{{"a", Value(std::vector<Value>{Value(1), Value(2)})},
+                     {"b", Value(std::vector<Value>{Value(1)})}};
+    ASSERT_THROWS_CODE(
+        expr->evaluate(unequal, &expCtx.variables, {}), AssertionException, 10961501);
+}
+
+TEST(ExpressionZipTest, LiteralDefaultsKeepPerElementQueryShape) {
+    auto expCtx = ExpressionContextForTest{};
+    auto expr = Expression::parseExpression(
+        &expCtx,
+        BSON("$zip" << BSON("inputs" << BSON_ARRAY("$a"sv << "$b"sv) << "defaults"
+                                     << BSON_ARRAY("x"sv << BSON_ARRAY(1 << 2))
+                                     << "useLongestLength" << true)),
+        expCtx.variablesParseState);
+
+    const auto& opts = query_shape::SerializationOptions::kRepresentativeQueryShapeSerializeOptions;
+    // The query shape of a literal defaults array is per-element, matching the shape recorded
+    // by pre-SERVER-109615 binaries (which stored one child expression per default). Serializing
+    // or folding the array into a single constant would change pre-existing queryShapeHashes.
+    const Value expectedDefaults =
+        Value(BSON_ARRAY(BSON("$const" << "?") << BSON("$const" << BSON_ARRAY(1))));
+    ASSERT_VALUE_EQ(expr->serialize(opts)["$zip"]["defaults"], expectedDefaults);
+
+    // The shape must also survive optimization: $setWindowFields optimizes its partitionBy at
+    // parse time, before the query shape hash is computed, so an all-constant defaults array
+    // must not constant-fold away its per-element structure.
+    expr = expr->optimize();
+    ASSERT_VALUE_EQ(expr->serialize(opts)["$zip"]["defaults"], expectedDefaults);
 }
 
 }  // namespace expression_evaluation_test

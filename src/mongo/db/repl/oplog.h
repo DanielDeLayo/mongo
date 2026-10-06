@@ -158,8 +158,8 @@ void acquireOplogCollectionForLogging(OperationContext* opCtx);
 /**
  * Use 'oplog' as the new cached pointer to the local oplog.
  *
- * Called by catalog::openCatalog() to re-establish the oplog collection pointer while holding onto
- * the global lock in exclusive mode.
+ * Called by catalog::openCatalogAfterRollbackToStable() to re-establish the oplog collection
+ * pointer while holding onto the global lock in exclusive mode.
  */
 void establishOplogRecordStoreForLogging(OperationContext* opCtx, RecordStore* oplog);
 
@@ -271,6 +271,26 @@ Status applyContainerOperations(OperationContext* opCtx,
 Status applyCommand_inlock(OperationContext* opCtx,
                            const ApplierOperation& op,
                            OplogApplication::Mode mode);
+
+/**
+ * Returns true iff the per-document validation hash 'h' carried on an oplog entry should be
+ * verified against a recomputed hash on the secondary upon oplog application. All of the following
+ * must hold:
+ *   - 'mode' is steady-state secondary application (excludes initial sync, recovery, applyOps),
+ *   - the continuous internode per-document validation feature is enabled,
+ *   - 'collection' is a supported collection: one with replicated record ids, or one clustered on
+ *     _id, whose record ids follow from its documents,
+ *   - the namespace is not implicitly replicated, since those replicate only a subset of their
+ *     writes and each node derives the rest for itself, and
+ *   - 'h' is present on the entry.
+ *
+ * For a clustered collection this is only reached for updates and deletes when the by-record-id
+ * apply fast path is on.
+ */
+bool shouldVerifyValidationHash(OperationContext* opCtx,
+                                const CollectionPtr& collection,
+                                OplogApplication::Mode mode,
+                                const OplogEntry& op);
 
 /**
  * Initializes the global Timestamp with the value from the timestamp of the last oplog entry.

@@ -168,7 +168,7 @@ void ReplOperation::extractPrePostImageForTransaction(boost::optional<ImageBundl
 }
 
 void ReplOperation::setTid(boost::optional<mongo::TenantId> value) & {
-    if (gMultitenancySupport &&
+    if (value && gMultitenancySupport &&
         gFeatureFlagRequireTenantID.isEnabled(
             serverGlobalParams.featureCompatibility.acquireFCVSnapshot()))
         DurableReplOperation::setTid(value);
@@ -346,9 +346,16 @@ DurableOplogEntry::DurableOplogEntry(BSONObj rawInput) : _raw(std::move(rawInput
                 const auto& key = containerInsertEntryO.getKey();
                 const auto& maybeVal = containerInsertEntryO.getValue();
                 uassert(13064100,
-                        "One or more values must be specified with int-keyed containers",
-                        key.isArrayKey() || key.isBytesKey() ||
-                            (key.isIntKey() && maybeVal.has_value()));
+                        "inserts must specify key with type array, bytes, or integer",
+                        key.isArrayKey() || key.isBytesKey() || key.isIntKey());
+                if (maybeVal && maybeVal->isArrayVal()) {
+                    uassert(13174600,
+                            "array-valued inserts must specify a single int key or an equivalent "
+                            "length array of keys",
+                            key.isIntKey() ||
+                                (key.isArrayKey() &&
+                                 key.getArrayKey().size() == maybeVal->getArrayVal().size()));
+                }
             } break;
             case OpTypeEnum::kContainerUpdate: {
                 const auto containerUpdateEntryO = ContainerUpdateOplogEntryO::parse(
@@ -359,13 +366,13 @@ DurableOplogEntry::DurableOplogEntry(BSONObj rawInput) : _raw(std::move(rawInput
                         "One key and one value must be specified for container update",
                         !key.isArrayKey() && !val.isArrayVal());
             } break;
-            case OpTypeEnum::kContainerDelete:
+            case OpTypeEnum::kContainerDelete: {
                 ContainerDeleteOplogEntryO::parse(o,
                                                   IDLParserContext("ContainerDeleteOplogEntryO"));
                 uassert(10704704,
                         str::stream() << "delete should not contain value: " << redact(o),
                         !o["v"]);
-                break;
+            } break;
             default:
                 MONGO_UNREACHABLE;
         }
@@ -480,8 +487,6 @@ bool DurableOplogEntry::shouldPrepare() const {
 }
 
 bool DurableOplogEntry::applyOpsIsLinkedTransactionally() const {
-    // An applyOps with a prevWriteOpTime is part of a transaction, unless multiOpType is
-    // kApplyOpsAppliedSeparately.
     return static_cast<bool>(getPrevWriteOpTimeInTransaction()) &&
         getMultiOpType().value_or(MultiOplogEntryType::kLegacyMultiOpType) !=
         MultiOplogEntryType::kApplyOpsAppliedSeparately;
@@ -755,10 +760,6 @@ boost::optional<bool> OplogEntry::getIsTimeseries() const {
 
 const boost::optional<OplogEntrySizeMetadata>& OplogEntry::getSizeMetadata() const {
     return _entry.getSizeMetadata();
-}
-
-boost::optional<std::int64_t> OplogEntry::getDocHash() const {
-    return _entry.getDocHash();
 }
 
 boost::optional<bool> OplogEntry::getUpsert() const {

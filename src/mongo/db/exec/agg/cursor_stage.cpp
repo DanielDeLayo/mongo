@@ -4,7 +4,6 @@
 #include "mongo/db/exec/agg/cursor_stage.h"
 
 #include "mongo/db/curop_failpoint_helpers.h"
-#include "mongo/db/exec/agg/cursor_stage.h"
 #include "mongo/db/exec/agg/document_source_to_stage_registry.h"
 #include "mongo/db/exec/agg/stage.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
@@ -68,6 +67,11 @@ void CursorStage::Batch::enqueue(Document&& doc, boost::optional<BSONObj> resume
             break;
         }
     }
+}
+
+void CursorStage::Batch::enqueue() {
+    invariant(_type == CursorType::kEmptyDocuments);
+    ++_count;
 }
 
 Document CursorStage::Batch::dequeue() {
@@ -259,15 +263,7 @@ void CursorStage::recordPlanSummaryStats() {
 }
 
 bool CursorStage::pullDataFromExecutor(OperationContext* opCtx) {
-    PlanExecutor::ExecState state;
-    Document resultObj;
-
-    while ((state = _sharedState->exec->getNextDocument(resultObj)) == PlanExecutor::ADVANCED) {
-        boost::optional<BSONObj> resumeToken;
-        if (_resumeTrackingType == ResumeTrackingType::kNonOplog)
-            resumeToken = _sharedState->exec->getPostBatchResumeToken();
-        _currentBatch.enqueue(transformDoc(std::move(resultObj)), std::move(resumeToken));
-
+    auto batchFull = [&]() -> bool {
         // As long as we're waiting for inserts, we shouldn't do any batching at this level we
         // need the whole pipeline to see each document to see if we should stop waiting.
         bool batchCountFull = _batchSizeCount != 0 && _currentBatch.count() >= _batchSizeCount;
@@ -277,8 +273,38 @@ bool CursorStage::pullDataFromExecutor(OperationContext* opCtx) {
             if (batchCountFull && overflow::mul(_batchSizeCount, 2, &_batchSizeCount)) {
                 _batchSizeCount = 0;  // Go unlimited if we overflow.
             }
-            // Return false indicating the executor should not be destroyed.
-            return false;
+            return true;
+        }
+        return false;
+    };
+
+    PlanExecutor::ExecState state;
+    auto* exec = _sharedState->exec.get();
+
+    if (_currentBatch.getType() == CursorType::kEmptyDocuments && !transformDocCanThrow()) {
+        // Specialized loop for count-only workloads. In this case, do not materialize the
+        // intermediate documents just for counting them. This is result-equivalent only if the
+        // stage cannot throw on invalid inputs.
+        while ((state = exec->getNext(nullptr, nullptr)) == PlanExecutor::ADVANCED) {
+            _currentBatch.enqueue();
+
+            if (batchFull()) {
+                // Return false indicating the executor should not be destroyed.
+                return false;
+            }
+        }
+    } else {
+        Document resultObj;
+        while ((state = exec->getNextDocument(resultObj)) == PlanExecutor::ADVANCED) {
+            boost::optional<BSONObj> resumeToken;
+            if (_resumeTrackingType == ResumeTrackingType::kNonOplog)
+                resumeToken = exec->getPostBatchResumeToken();
+            _currentBatch.enqueue(transformDoc(std::move(resultObj)), std::move(resumeToken));
+
+            if (batchFull()) {
+                // Return false indicating the executor should not be destroyed.
+                return false;
+            }
         }
     }
 

@@ -2,17 +2,15 @@
 // SPDX-License-Identifier: SSPL-1.0
 
 
-#include <boost/move/utility_core.hpp>
-#include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "ext/alloc_traits.h"
+#include "mongo/db/repl/initial_sync/database_cloner.h"
 
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/db/namespace_string_util.h"
-#include "mongo/db/repl/initial_sync/database_cloner.h"
 #include "mongo/db/repl/initial_sync/database_cloner_gen.h"
 #include "mongo/db/repl/initial_sync/initial_syncer.h"
+#include "mongo/db/replicated_fast_count/replicated_fast_count_manager.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/shard_role/ddl/list_collections_filter.h"
 #include "mongo/db/shard_role/ddl/list_collections_gen.h"
@@ -29,8 +27,11 @@
 #include <mutex>
 #include <string_view>
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
 
 namespace mongo {
 namespace repl {
@@ -42,12 +43,14 @@ DatabaseCloner::DatabaseCloner(const DatabaseName& dbName,
                                DBClientConnection* client,
                                StorageInterface* storageInterface,
                                ThreadPool* dbPool,
-                               std::shared_ptr<InitialSyncSummaryStats> summaryStats)
+                               std::shared_ptr<InitialSyncSummaryStats> summaryStats,
+                               std::shared_ptr<FastCountInitialSyncAggregator> fastCountAggregator)
     : InitialSyncBaseCloner(
           "DatabaseCloner"sv, sharedData, source, client, storageInterface, dbPool),
       _dbName(dbName),
       _listCollectionsStage("listCollections", this, &DatabaseCloner::listCollectionsStage),
-      _summaryStats(summaryStats) {
+      _summaryStats(summaryStats),
+      _fastCountAggregator(std::move(fastCountAggregator)) {
     invariant(!dbName.isEmpty());
     _stats.dbname = dbName;
 }
@@ -84,6 +87,31 @@ BaseCloner::AfterStageBehavior DatabaseCloner::listCollectionsStage() {
                 e.toStatus()
                     .withContext(str::stream() << "Collection info could not be parsed : " << info)
                     .reason());
+        }
+
+        if (_fastCountAggregator) {
+            const auto& collInfo = result.getInfo();
+            const auto& fastCount = collInfo.getFastCount();
+            if (fastCount) {
+                uassert(ErrorCodes::FailedToParse,
+                        str::stream() << "Collection info with fastCount must have (validAsOf, "
+                                         "Size, and Count) or timestampStoreTs: "
+                                      << info,
+                        (fastCount->getTimestampStoreTs() &&
+                         (!fastCount->getValidAsOf() && !fastCount->getSize() &&
+                          !fastCount->getCount())) ||
+                            (fastCount->getValidAsOf() && fastCount->getSize() &&
+                             fastCount->getCount()));
+
+                if (auto tsStoreTs = fastCount->getTimestampStoreTs()) {
+                    _fastCountAggregator->recordTimestampStoreTs(*tsStoreTs);
+                }
+                if (fastCount->getValidAsOf()) {
+                    FastCountEntry entry{
+                        *fastCount->getValidAsOf(), *fastCount->getSize(), *fastCount->getCount()};
+                    _fastCountAggregator->addEntry(collInfo.getUuid(), entry);
+                }
+            }
         }
 
         NamespaceString collectionNamespace(

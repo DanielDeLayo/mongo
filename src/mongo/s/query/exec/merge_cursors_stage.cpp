@@ -108,7 +108,9 @@ GetNextResult MergeCursorsStage::doGetNext() {
 }
 
 void MergeCursorsStage::doDispose() {
-    _blockingResultsMerger->kill(getContext()->getOperationContext());
+    auto* opCtx = getContext()->getOperationContext();
+    tassert(13159600, "requires a valid operation context", opCtx);
+    _blockingResultsMerger->kill(opCtx);
 }
 
 void MergeCursorsStage::doForceSpill() {
@@ -128,6 +130,10 @@ std::size_t MergeCursorsStage::getNumRemotes() const {
 
 BSONObj MergeCursorsStage::getHighWaterMark() {
     return _blockingResultsMerger->getHighWaterMark();
+}
+
+BSONObj MergeCursorsStage::getHighWaterMarkForClient() {
+    return _blockingResultsMerger->getHighWaterMarkForClient();
 }
 
 bool MergeCursorsStage::remotesExhausted() const {
@@ -167,6 +173,14 @@ void MergeCursorsStage::recognizeControlEvents() {
 
 void MergeCursorsStage::setHighWaterMark(const BSONObj& highWaterMark) {
     _blockingResultsMerger->setHighWaterMark(highWaterMark);
+}
+
+void MergeCursorsStage::disablePromisedSortKeyHighWaterMarkAdvancement() {
+    _blockingResultsMerger->disablePromisedSortKeyHighWaterMarkAdvancement();
+}
+
+void MergeCursorsStage::enablePromisedSortKeyHighWaterMarkAdvancement() {
+    _blockingResultsMerger->enablePromisedSortKeyHighWaterMarkAdvancement();
 }
 
 void MergeCursorsStage::setNextHighWaterMarkDeterminingStrategy(

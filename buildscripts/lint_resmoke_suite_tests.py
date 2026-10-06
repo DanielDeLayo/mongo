@@ -12,7 +12,6 @@ import os
 import re
 import subprocess
 import sys
-import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,16 +20,21 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from buildscripts.util.buildozer_utils import BuildozerRuleNotFoundError, bd_add
+from buildscripts.util.taskname import remove_gen_suffix
 
 REPO_ROOT = Path(os.environ.get("BUILD_WORKSPACE_DIRECTORY") or Path(__file__).resolve().parents[1])
 DEFAULT_TASKS_DIR = "etc/evergreen_yml_components/tasks"
+
+# The Evergreen func of a task whose only job is to activate the suite tasks that
+# mongo-task-generator generated for it. Such a task runs no tests itself.
+GEN_TASK_FUNC = "generate resmoke tasks"
 
 # Evergreen function names that use resmoke to run (or generate tasks that run) a suite.
 RESMOKE_FUNCS = frozenset(
     {
         "run tests",
         "run tests with aws credentials",
-        "generate resmoke tasks",
+        GEN_TASK_FUNC,
         "run benchmark tests",
         "run streams tests",
         "run streams tests with mongot",
@@ -40,11 +44,15 @@ RESMOKE_FUNCS = frozenset(
 BAZEL_TAG_PREFIX = "bazel:"
 BAZEL_NONE = "none"  # the value after the prefix, i.e. the full tag is 'bazel:none'
 
+# Evergreen tags that mark a task as running in the commit-queue / required variants.
+CRITICAL_EVERGREEN_TAGS = frozenset({"default", "release_critical"})
+
 TAG_EQUIVALENCES = {
     "default": "ci-default",
     "release_critical": "ci-release-critical",
     "development_critical": "ci-development-critical",
     "experimental": "ci-experimental",
+    "fuzzer_deterministic": "ci-fuzzer-deterministic",
 }
 _EVERGREEN_TO_BAZEL = dict(TAG_EQUIVALENCES)
 _BAZEL_TO_EVERGREEN = {bazel: evg for evg, bazel in TAG_EQUIVALENCES.items()}
@@ -57,20 +65,38 @@ EVERGREEN_EXEMPT_PATTERNS = (
     "arm64_tsan_needs_8xlarge",
     "arm64_aubsan_grpc_needs_8xlarge",
     "assigned_to_jira_team_*",  # team ownership metadata
-    "incompatible_*",  # variant/platform exclusion (bazel uses target_compatible_with)
 )
 
-# Tags that match an EVERGREEN_EXEMPT_PATTERNS glob but must still participate in parity.
-EVERGREEN_PARITY_INCLUSIONS: frozenset[str] = frozenset(
-    {
-        "incompatible_with_bazel_remote_test",  # about Bazel remote-exec compat; meaningful on both sides
-    }
-)
+# Evergreen 'incompatible_*' tags exclude a task from a variant/platform. On the Bazel side that
+# exclusion is expressed with target_compatible_with that resolves to '@platforms//:incompatible'.
+# Every other 'incompatible_*' tag has no such mapping and must participate
+# in parity like an ordinary tag.
+INCOMPATIBLE_TAG_TO_BAZEL_SETTINGS: dict[str, tuple[str, ...]] = {
+    "incompatible_windows": ("@platforms//os:windows",),
+    "incompatible_mac": ("@platforms//os:macos",),
+    "incompatible_ppc": ("@platforms//cpu:ppc64le",),
+    "incompatible_s390x": ("@platforms//cpu:s390x",),
+    "incompatible_tsan": ("//bazel/config:tsan_enabled",),
+    "incompatible_aubsan": ("//bazel/config:asan_enabled", "//bazel/config:ubsan_enabled"),
+    "incompatible_amazon_linux2": ("//bazel/platforms:amazon_linux_2",),
+    "incompatible_system_allocator": ("//bazel/config:system_allocator_enabled",),
+    "incompatible_community": ("//bazel/config:build_enterprise_disabled",),
+}
+
+# Evergreen tags that route a task onto a bigger host. They are meaningless on a task whose body is
+# GEN_TASK_FUNC: that task only activates its generated tasks through the Evergreen API, and the
+# generated tasks take their distro from the 'use_large_distro' var resolved against the build
+# variant's 'large_distro_name' expansion, never from the generating task's tags. Tagging the
+# generating task this way only moves it onto a larger host, via the 'distros:' of the variant
+# selector that the tag matches.
+LARGE_HOST_TAG_PATTERNS = ("requires_large_host*",)
 
 BAZEL_EXEMPT_PATTERNS = (
     "no-cache",
     "manual",
     "local",
+    "requires_large_host*",
+    "requires_xlarge_host*",
     "resmoke_suite_test",
     "resources:*",
     "ci-development-critical-single-variant",  # jsCore is special in that it is tagged default, but also needs to be included in the commit-queue variant by this tag.
@@ -85,12 +111,27 @@ class EvergreenTask:
     source: Path
     ref: str  # "<source>:<line>" of the task's name declaration
     tags: frozenset[str]  # all tags exactly as written in the YAML
+    # Whether the task's body is GEN_TASK_FUNC, i.e. it activates tasks generated for it rather than
+    # running tests itself. This, not the '_gen' name suffix, identifies a generating task.
+    generates_tasks: bool = False
+    # Whether that func already asks for the generated tasks to run on the variant's large distro.
+    sets_use_large_distro: bool = False
 
     @classmethod
     def from_dict(cls, task: dict, source: Path) -> "EvergreenTask":
         name = task.get("name", "<unnamed>")
         tags = frozenset(t for t in (task.get("tags") or []) if isinstance(t, str))
-        return cls(name=name, source=source, ref=_task_ref(source, name), tags=tags)
+        gen_vars = _gen_task_vars(task)
+        return cls(
+            name=name,
+            source=source,
+            ref=_task_ref(source, name),
+            tags=tags,
+            generates_tasks=gen_vars is not None,
+            sets_use_large_distro=str(gen_vars.get("use_large_distro", "")).lower() == "true"
+            if gen_vars
+            else False,
+        )
 
     @property
     def bazel_tags(self) -> frozenset[str]:
@@ -111,7 +152,8 @@ class EvergreenTask:
         return frozenset(
             t
             for t in self.non_bazel_tags
-            if t in EVERGREEN_PARITY_INCLUSIONS or not _matches(t, EVERGREEN_EXEMPT_PATTERNS)
+            if not _matches(t, EVERGREEN_EXEMPT_PATTERNS)
+            and t not in INCOMPATIBLE_TAG_TO_BAZEL_SETTINGS
         )
 
 
@@ -121,9 +163,21 @@ class BazelTarget:
     ref: str  # "<pkg>/BUILD.bazel:<line>" of the target
     tags: frozenset[str]  # all tags on the target
 
+    # select() keys in target_compatible_with that resolve to '@platforms//:incompatible'
+    compatible_exclusions: frozenset[str] | None = None
+
     @classmethod
-    def from_label(cls, label: str, tags: set[str]) -> "BazelTarget":
-        return cls(label=label, ref=_target_ref(label), tags=frozenset(tags))
+    def from_label(
+        cls, label: str, tags: set[str], compatible_exclusions: set[str] | None = None
+    ) -> "BazelTarget":
+        return cls(
+            label=label,
+            ref=_target_ref(label),
+            tags=frozenset(tags),
+            compatible_exclusions=(
+                None if compatible_exclusions is None else frozenset(compatible_exclusions)
+            ),
+        )
 
     @property
     def parity_tags(self) -> frozenset[str]:
@@ -137,12 +191,82 @@ class Violation:
     evergreen_tags_to_add: frozenset[str] = frozenset()
     target_label: str | None = None
     bazel_tags_to_add: frozenset[str] = frozenset()
+    # Whether --fix reports this violation by printing a copy-ready snippet instead of the message,
+    # so that it is not also listed among the issues needing a hand edit.
+    has_snippet: bool = False
+
+    @property
+    def is_auto_fixable(self) -> bool:
+        """Whether the violation carries tags that --fix can add for you."""
+        return bool(self.evergreen_tags_to_add or (self.target_label and self.bazel_tags_to_add))
 
 
 class TagRule(ABC):
     @abstractmethod
-    def check(self, task: EvergreenTask, target: BazelTarget) -> list[Violation]:
-        pass
+    def check(self, task: EvergreenTask, target: BazelTarget | None = None) -> list[Violation]:
+        """Return violations for a task.
+
+        Rules in TAG_RULES compare a task against a resolved Bazel `target`. Rules in TASK_RULES
+        inspect the task's own 'bazel:*' labels and are called once per task with `target=None`.
+        """
+
+
+class CriticalTasksMustMapToTarget(TagRule):
+    """A task tagged 'default' or 'release_critical' must map to a resmoke_suite_test target
+    (e.g. 'bazel://jstests/suites/foo:bar').
+    """
+
+    @staticmethod
+    def applies(task: EvergreenTask) -> bool:
+        """Whether the task is critical yet opts out of Bazel coverage with 'bazel:none'."""
+        return bool(task.tags & CRITICAL_EVERGREEN_TAGS) and task.labels == {BAZEL_NONE}
+
+    def check(self, task: EvergreenTask, target: BazelTarget | None = None) -> list[Violation]:
+        if not self.applies(task):
+            return []
+        critical = sorted(task.tags & CRITICAL_EVERGREEN_TAGS)
+        return [
+            Violation(
+                f"{task.ref}: task '{task.name}' is tagged {critical} but maps to 'bazel:none'; "
+                "default/release_critical tasks must map to a real resmoke_suite_test target "
+                "(bazel://pkg:target)",
+                has_snippet=True,
+            )
+        ]
+
+
+class GeneratingTasksMustNotRequireLargeHost(TagRule):
+    """A task that generates tasks must not carry a 'requires_large_host*' tag.
+
+    The tag does not give the generated tests a larger host; it only moves the generating task
+    itself, which does nothing but activate the generated tasks over the Evergreen API. Use
+    'use_large_distro: "true"' in the vars of the task's GEN_TASK_FUNC to route the tests instead.
+    """
+
+    @staticmethod
+    def offending_tags(task: EvergreenTask) -> frozenset[str]:
+        """The large-host tags on a generating task; empty for any other task."""
+        if not task.generates_tasks:
+            return frozenset()
+        return frozenset(t for t in task.tags if _matches(t, LARGE_HOST_TAG_PATTERNS))
+
+    def check(self, task: EvergreenTask, target: BazelTarget | None = None) -> list[Violation]:
+        tags = self.offending_tags(task)
+        if not tags:
+            return []
+        remedy = (
+            "it already sets 'use_large_distro', so the tag is redundant and should be removed"
+            if task.sets_use_large_distro
+            else "to give the generated tests a larger host, set 'use_large_distro: \"true\"' in "
+            f"the vars of the task's '{GEN_TASK_FUNC}' func instead"
+        )
+        return [
+            Violation(
+                f"{task.ref}: task '{task.name}' is tagged {sorted(tags)}, which a task running "
+                f"'{GEN_TASK_FUNC}' must not use: the tag only moves the generating task itself, "
+                f"which merely activates the generated tasks over the Evergreen API; {remedy}."
+            )
+        ]
 
 
 class EvergreenTagsMustBeOnTarget(TagRule):
@@ -179,9 +303,44 @@ class TargetTagsMustBeOnEvergreen(TagRule):
         ]
 
 
+class IncompatibleTagsMustExcludeInBazel(TagRule):
+    """An Evergreen 'incompatible_*' tag with a Bazel mapping must be mirrored by the target's
+    target_compatible_with. For each such tag, every setting in INCOMPATIBLE_TAG_TO_BAZEL_SETTINGS
+    must appear as a select() key resolving to '@platforms//:incompatible'.
+    """
+
+    def check(self, task: EvergreenTask, target: BazelTarget) -> list[Violation]:
+        if target.compatible_exclusions is None:
+            return []
+        violations: list[Violation] = []
+        for tag in sorted(task.non_bazel_tags):
+            settings = INCOMPATIBLE_TAG_TO_BAZEL_SETTINGS.get(tag)
+            if not settings:
+                continue
+            missing = [s for s in settings if s not in target.compatible_exclusions]
+            if missing:
+                violations.append(
+                    Violation(
+                        f"{task.ref}: task '{task.name}' is tagged '{tag}' but Bazel target"
+                        f" {target.label} ({target.ref}) does not exclude {missing} in"
+                        " target_compatible_with; add a select() entry mapping each to"
+                        " ['@platforms//:incompatible'] (not auto-fixable)"
+                    )
+                )
+        return violations
+
+
+# Rules that compare a task against a resolved Bazel target.
 TAG_RULES: tuple[TagRule, ...] = (
+    IncompatibleTagsMustExcludeInBazel(),
     EvergreenTagsMustBeOnTarget(),
     TargetTagsMustBeOnEvergreen(),
+)
+
+# Rules that inspect a task's own 'bazel:*' labels (no target needed), run once per task.
+TASK_RULES: tuple[TagRule, ...] = (
+    CriticalTasksMustMapToTarget(),
+    GeneratingTasksMustNotRequireLargeHost(),
 )
 
 
@@ -191,15 +350,40 @@ class TaskResult:
     def __init__(self, task: EvergreenTask):
         self.task = task
         self.violations: list[str] = []
+        # Violations that --fix cannot resolve, so it must report them rather than pass silently.
+        self.unfixable: list[str] = []
         self.needs_bazel_tag = False
+        self.needs_real_target = False  # critical task that maps to 'bazel:none'
         self.evergreen_tags_to_add: set[str] = set()
         self.target_tags_to_add: dict[str, set[str]] = {}
 
+    def add(self, violation: Violation) -> None:
+        """Record a violation, tracking whether --fix will be able to resolve it."""
+        self.violations.append(violation.message)
+        if not violation.is_auto_fixable and not violation.has_snippet:
+            self.unfixable.append(violation.message)
 
-def check_task(task: dict, source: Path, label_to_tags: dict[str, set[str]]) -> TaskResult:
-    """Apply the tag rules to one task: Rule 1 / resolution preconditions, then TAG_RULES."""
+
+def check_task(
+    task: dict,
+    source: Path,
+    label_to_tags: dict[str, set[str]],
+    label_to_exclusions: dict[str, set[str]] | None = None,
+) -> TaskResult:
+    """Apply the tag rules to one task: Rule 1 / resolution preconditions, then TAG_RULES.
+
+    `label_to_exclusions` maps each target to its target_compatible_with exclusion settings.
+    """
     evg = EvergreenTask.from_dict(task, source)
     result = TaskResult(evg)
+
+    # Task-level rules: inspect the task's own name and tags (e.g. 'bazel:none' coverage
+    # requirements). These run before the precondition below so that a task missing its 'bazel:*'
+    # tag still reports every other problem it has.
+    for rule in TASK_RULES:
+        for violation in rule.check(evg):
+            result.add(violation)
+    result.needs_real_target = CriticalTasksMustMapToTarget.applies(evg)
 
     # Precondition: the task has at least one bazel:* tag.
     if not evg.bazel_tags:
@@ -210,24 +394,27 @@ def check_task(task: dict, source: Path, label_to_tags: dict[str, set[str]]) -> 
     # Precondition: bazel:none must be used alone.
     if BAZEL_NONE in evg.labels:
         if evg.labels != {BAZEL_NONE}:
-            result.violations.append(
-                f"{evg.ref}: task '{evg.name}' mixes 'bazel:none' with label tags: "
-                f"{sorted(evg.bazel_tags)}"
+            result.add(
+                Violation(
+                    f"{evg.ref}: task '{evg.name}' mixes 'bazel:none' with label tags: "
+                    f"{sorted(evg.bazel_tags)}"
+                )
             )
         return result
 
     for label in sorted(evg.labels):
         # Precondition: the label must resolve to a real resmoke_suite_test target.
         if label not in label_to_tags:
-            result.violations.append(
-                f"{evg.ref}: task '{evg.name}' references unknown Bazel target '{label}'"
+            result.add(
+                Violation(f"{evg.ref}: task '{evg.name}' references unknown Bazel target '{label}'")
             )
             continue
 
-        target = BazelTarget.from_label(label, label_to_tags[label])
+        exclusions = None if label_to_exclusions is None else label_to_exclusions.get(label, set())
+        target = BazelTarget.from_label(label, label_to_tags[label], exclusions)
         for rule in TAG_RULES:
             for violation in rule.check(evg, target):
-                result.violations.append(violation.message)
+                result.add(violation)
                 result.evergreen_tags_to_add |= violation.evergreen_tags_to_add
                 if violation.target_label and violation.bazel_tags_to_add:
                     result.target_tags_to_add.setdefault(violation.target_label, set()).update(
@@ -235,6 +422,15 @@ def check_task(task: dict, source: Path, label_to_tags: dict[str, set[str]]) -> 
                     )
 
     return result
+
+
+def _gen_task_vars(task: dict) -> dict | None:
+    """Return the vars of the task's GEN_TASK_FUNC command, or None if it does not run that func."""
+    for command in task.get("commands") or []:
+        if isinstance(command, dict) and command.get("func") == GEN_TASK_FUNC:
+            variables = command.get("vars")
+            return variables if isinstance(variables, dict) else {}
+    return None
 
 
 def _matches(tag: str, patterns: tuple[str, ...]) -> bool:
@@ -279,35 +475,66 @@ def load_resmoke_tasks(tasks_dir: Path) -> list[tuple[Path, dict]]:
     return out
 
 
-def _parse_target_tags_xml(xml_text: str) -> dict[str, set[str]]:
-    """Parse `bazel query --output=xml` into {label: tags} for resmoke_suite_test targets."""
+# A select() key mapping to exactly ['@platforms//:incompatible'], e.g.
+#   "@platforms//os:macos": ["@platforms//:incompatible"]
+# as printed on the single-line `target_compatible_with = select({...})` of `--output=build`.
+_INCOMPATIBLE_SELECT_KEY_RE = re.compile(r'"([^"]+)":\s*\["@platforms//:incompatible"\]')
+
+# A quoted string entry, used to pull the values out of a single-line `tags = [...]` list.
+_QUOTED_RE = re.compile(r'"([^"]*)"')
+
+
+def _parse_targets_build(build_text: str) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Parse `bazel query --output=build` into ({label: tags}, {label: exclusion keys})."""
     label_to_tags: dict[str, set[str]] = {}
-    if not xml_text.strip():
-        return label_to_tags
-    root = ET.fromstring(xml_text)
-    for rule in root.iter("rule"):
-        name = rule.get("name")
-        if not name:
+    label_to_exclusions: dict[str, set[str]] = {}
+    name: str | None = None
+    package: str | None = None
+    tags: set[str] = set()
+    compatible_line: str | None = None
+
+    def flush() -> None:
+        if name is not None and package is not None and "resmoke_suite_test" in tags:
+            label = f"//{package}:{name}"
+            label_to_tags[label] = set(tags)
+            label_to_exclusions[label] = set(
+                _INCOMPATIBLE_SELECT_KEY_RE.findall(compatible_line or "")
+            )
+
+    for line in build_text.splitlines():
+        # Each rule stanza begins with an unindented `<rule_class>(` line.
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\(\s*$", line):
+            flush()
+            name = package = compatible_line = None
+            tags = set()
             continue
-        tags = {
-            string_elem.get("value")
-            for list_elem in rule.findall("list[@name='tags']")
-            for string_elem in list_elem.findall("string")
-            if string_elem.get("value")
-        }
-        if "resmoke_suite_test" in tags:
-            label_to_tags[name] = tags
-    return label_to_tags
+        m = re.match(r'^  name = "([^"]+)"', line)
+        if m:
+            name = m.group(1)
+            continue
+        m = re.match(r'^  generator_location = "(.+?)/BUILD\.bazel:', line)
+        if m:
+            package = m.group(1)
+            continue
+        m = re.match(r"^  tags = \[(.*)\],\s*$", line)
+        if m:
+            tags = set(_QUOTED_RE.findall(m.group(1)))
+            continue
+        m = re.match(r"^  target_compatible_with = (.*)$", line)
+        if m:
+            compatible_line = m.group(1)
+    flush()
+    return label_to_tags, label_to_exclusions
 
 
-def query_target_tags(bazel_bin: str) -> dict[str, set[str]]:
-    """Query every resmoke_suite_test target's tags via bazel query."""
+def query_targets(bazel_bin: str) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Query every resmoke_suite_test target's tags and target_compatible_with exclusions."""
     result = subprocess.run(
         [
             bazel_bin,
             "query",
             "attr('tags','resmoke_suite_test',//...)",
-            "--output=xml",
+            "--output=build",
             "--keep_going",
         ],
         capture_output=True,
@@ -317,7 +544,7 @@ def query_target_tags(bazel_bin: str) -> dict[str, set[str]]:
     _warn_on_query_errors(result.returncode, result.stderr)
     if not result.stdout.strip():
         print(f"ERROR: bazel query returned no targets.\n{result.stderr}", file=sys.stderr)
-    return _parse_target_tags_xml(result.stdout)
+    return _parse_targets_build(result.stdout)
 
 
 def _warn_on_query_errors(returncode: int, stderr: str) -> None:
@@ -376,7 +603,7 @@ def _target_ref(label: str) -> str:
 
 def resmoke_suite_test_snippet(task: EvergreenTask) -> str:
     """Emit a copy-ready resmoke_suite_test for a task that is missing a 'bazel:*' tag."""
-    suite = task.name[:-4] if task.name.endswith("_gen") else task.name
+    suite = remove_gen_suffix(task.name)
     bazel_tags = sorted(_to_bazel_spelling(t) for t in task.parity_tags)
     tag_lines = "".join(f'        "{t}",\n' for t in bazel_tags)
     return (
@@ -547,43 +774,60 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--target-tags-xml",
+        "--target-info-build",
         default=None,
-        help="File with `bazel query --output=xml` output (skips an internal bazel query).",
+        help="File with `bazel query --output=build` output (skips an internal bazel query). ",
     )
     parser.add_argument("--fix", action="store_true", help="Reconcile tag-only issues in place.")
     args = parser.parse_args()
 
-    if args.target_tags_xml:
-        label_to_tags = _parse_target_tags_xml(Path(args.target_tags_xml).read_text())
+    if args.target_info_build:
+        label_to_tags, label_to_exclusions = _parse_targets_build(
+            Path(args.target_info_build).read_text()
+        )
     else:
-        label_to_tags = query_target_tags("bazel")
+        label_to_tags, label_to_exclusions = query_targets("bazel")
 
     tasks = load_resmoke_tasks(REPO_ROOT / DEFAULT_TASKS_DIR)
 
-    results = [check_task(task, source, label_to_tags) for source, task in tasks]
+    results = [
+        check_task(task, source, label_to_tags, label_to_exclusions) for source, task in tasks
+    ]
     violations = [v for r in results for v in r.violations]
 
     missing_tag = [r.task for r in results if r.needs_bazel_tag]
+    needs_real_target = [r.task for r in results if r.needs_real_target]
 
     def print_missing_tag_snippets() -> None:
-        print(
-            f"\n{len(missing_tag)} task(s) are missing a 'bazel:*' tag (not auto-fixable). Create "
-            "the suite target (snippet below) and tag the task, or add 'bazel:none':\n"
-        )
-        for task in missing_tag:
-            print(f"# --- {task.name} ---")
-            print(resmoke_suite_test_snippet(task))
-            print()
+        if missing_tag:
+            print(
+                f"\n{len(missing_tag)} task(s) are missing a 'bazel:*' tag (not auto-fixable). "
+                "Create the suite target (snippet below) and tag the task, or add 'bazel:none':\n"
+            )
+            for task in missing_tag:
+                print(f"# --- {task.name} ---")
+                print(resmoke_suite_test_snippet(task))
+                print()
+        if needs_real_target:
+            print(
+                f"\n{len(needs_real_target)} default/release_critical task(s) map to 'bazel:none' "
+                "but must map to a real target (not auto-fixable). Create the suite target (snippet "
+                "below) and tag the task with its 'bazel://...' label:\n"
+            )
+            for task in needs_real_target:
+                print(f"# --- {task.name} ---")
+                print(resmoke_suite_test_snippet(task))
+                print()
 
     if not args.fix:
         for v in violations:
             print(f"  {v}")
-        if missing_tag:
+        if missing_tag or needs_real_target:
             print_missing_tag_snippets()
         if violations:
             print(
-                f"\n{len(violations)} parity violation(s). Run `bazel run lint --fix` to "
+                f"\n{len(violations)} parity violation(s). Run "
+                "`bazel run lint --fix` to "
                 "reconcile tag-only issues."
             )
             return 1
@@ -616,9 +860,9 @@ def main() -> int:
     for n in fixed:
         print(f"  {n}")
 
-    # Report everything --fix could not resolve. Unknown-target and bazel:none-mixing violations
-    # need a hand edit; without printing them here, --fix would exit non-zero with no explanation.
-    not_auto_fixable = [v for v in violations if "references unknown" in v or "mixes" in v]
+    # Report everything --fix could not resolve. Every violation that carries no tags for --fix to
+    # add is listed here, so a new rule cannot silently pass under --fix.
+    not_auto_fixable = [v for r in results for v in r.unfixable]
     if manual:
         print(f"\n{len(manual)} Bazel target tag issue(s) require manual fixing:")
         for m in manual:
@@ -627,11 +871,11 @@ def main() -> int:
         print(f"\n{len(not_auto_fixable)} issue(s) require manual fixing:")
         for v in not_auto_fixable:
             print(f"  {v}")
-    if missing_tag:
+    if missing_tag or needs_real_target:
         print_missing_tag_snippets()
 
     # The run fails if anything remains unresolved after fixing.
-    return 1 if (manual or not_auto_fixable or missing_tag) else 0
+    return 1 if (manual or not_auto_fixable or missing_tag or needs_real_target) else 0
 
 
 if __name__ == "__main__":

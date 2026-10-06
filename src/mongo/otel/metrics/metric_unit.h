@@ -29,6 +29,10 @@ enum class MetricUnit {
     // Space
     kBytes,
 
+    // Throughput
+    kBytesPerSecond,
+    kMegabytesPerSecond,
+
     // Database
     kOperations,
     kQueries,

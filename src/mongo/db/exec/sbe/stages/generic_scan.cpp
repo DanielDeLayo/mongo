@@ -7,7 +7,6 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/exec/sbe/expressions/compile_ctx.h"
-#include "mongo/db/exec/sbe/stages/generic_scan.h"
 #include "mongo/db/exec/sbe/stages/scan.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/platform/compiler.h"
@@ -73,38 +72,6 @@ std::unique_ptr<PlanStage> GenericScanStage::clone() const {
         _state, _yieldPolicy, _commonStats.nodeId, participateInTrialRunTracking());
 }
 
-PlanState GenericScanStage::getNext() {
-    if (MONGO_unlikely(hangGenericScanGetNext.shouldFail())) {
-        hangGenericScanGetNext.pauseWhileSet();
-    }
-    auto optTimer(getOptTimer(_opCtx));
-
-    handleInterruptAndSlotAccess();
-    boost::optional<Record> nextRecord;
-    nextRecord = _cursor->next();
-
-    if (!nextRecord) {
-        handleEOF(nextRecord);
-        return trackPlanState(PlanState::IS_EOF);
-    }
-
-    resetRecordId(nextRecord);
-
-    if (_state->recordIdSlot) {
-        _recordId = std::move(nextRecord->id);
-        _recordIdAccessor.reset(value::TagValueView{value::TypeTags::RecordId,
-                                                    value::bitcastFrom<RecordId*>(&_recordId)});
-    }
-
-    if (!_scanFieldAccessors.empty()) {
-        placeFieldsFromRecordInAccessors(*nextRecord, _state->scanFieldNames, _scanFieldAccessors);
-    }
-
-    ++_specificStats.numReads;
-    trackRead();
-    return trackPlanState(PlanState::ADVANCED);
-}
-
 std::unique_ptr<PlanStageStats> GenericScanStage::getStats(bool includeDebugInfo) const {
     auto ret = std::make_unique<PlanStageStats>(_commonStats);
     ret->specific = std::make_unique<ScanStats>(_specificStats);
@@ -121,6 +88,12 @@ void GenericScanStage::doDebugPrint(std::vector<DebugPrinter::Block>& ret,
                                     DebugPrintInfo& debugPrintInfo) const {
     ret.emplace_back("generic");
     debugPrintShared(ret);
+}
+
+void GenericScanStage::getNextHangFailPoint() {
+    if (MONGO_unlikely(hangGenericScanGetNext.shouldFail())) {
+        hangGenericScanGetNext.pauseWhileSet();
+    }
 }
 }  // namespace sbe
 }  // namespace mongo

@@ -433,6 +433,15 @@ public:
     virtual int64_t freeStorageSize(RecoveryUnit&) const = 0;
 
     /**
+     * Returns the storage engine's approximate count of leaf pages backing this record store, or
+     * boost::none if the engine does not maintain such a statistic or has not yet recorded a
+     * meaningful value for this table. The count is maintained incrementally by the storage engine
+     * and is cheap to read (no tree walk), but is not exact. Used by the query optimizer's cost
+     * model.
+     */
+    virtual boost::optional<int64_t> approxNumLeafPages(RecoveryUnit&) const = 0;
+
+    /**
      * Get the RecordData at loc, which must exist.
      *
      * If unowned data is returned, it is only valid until either of these happens:
@@ -740,8 +749,9 @@ public:
     virtual StatusWith<Timestamp> getEarliestTimestamp(RecoveryUnit&) = 0;
 
     /**
-     * Returns the last value successfully returned by getEarliestTimestamp(), or an empty
-     * Timestamp if getEarliestTimestamp() has not yet succeeded. Never performs storage I/O.
+     * Returns the newest value observed for this record store's earliest timestamp, from
+     * getEarliestTimestamp() or a truncation's commit-time refresh, or an empty Timestamp if
+     * none has been observed. The value never moves backward. Never performs storage I/O.
      */
     virtual Timestamp getCachedEarliestTimestamp() const = 0;
 };

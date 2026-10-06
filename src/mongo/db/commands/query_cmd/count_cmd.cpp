@@ -38,7 +38,6 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_explainer.h"
 #include "mongo/db/query/plan_summary_stats.h"
-#include "mongo/db/query/query_settings/query_settings_gen.h"
 #include "mongo/db/query/query_shape/count_cmd_shape.h"
 #include "mongo/db/query/query_shape/query_shape_hash.h"
 #include "mongo/db/query/query_shape/shape_helpers.h"
@@ -51,7 +50,6 @@
 #include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/query_analysis_writer.h"
-#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
 #include "mongo/db/shard_role/shard_catalog/collection.h"
@@ -140,7 +138,7 @@ public:
             : InvocationBaseGen(opCtx, command, opMsgRequest),
               _ns(request().getNamespaceOrUUID().isNamespaceString()
                       ? request().getNamespaceOrUUID().nss()
-                      : shard_role_nocheck::resolveNssWithoutAcquisition(
+                      : shard_role_nocheck::resolveNssWithoutAcquisitionAtLatest(
                             opCtx,
                             request().getNamespaceOrUUID().dbName(),
                             request().getNamespaceOrUUID().uuid())) {
@@ -253,9 +251,13 @@ public:
                 parsed_find_command::parseFromCount(expCtx, request(), *extensionsCallback, ns));
 
             // Compute QueryShapeHash and record it in CurOp.
+            const bool rawDataForShape = request().getRawData().value_or(false);
             query_shape::DeferredQueryShape deferredShape{[&]() {
                 return shape_helpers::tryMakeShape<query_shape::CountCmdShape>(
-                    *parsedFind, request().getLimit().has_value(), request().getSkip().has_value());
+                    *parsedFind,
+                    request().getLimit().has_value(),
+                    request().getSkip().has_value(),
+                    rawDataForShape);
             }};
 
             CurOp::get(opCtx)->debug().ensureQueryShapeHash(opCtx, [&]() {
@@ -367,7 +369,7 @@ public:
             // For the purposes of OpDebug's reporting, we only need 'collectionType' to distinguish
             // between view/timeseries/collection. For view/timeseries, 'collectionType' will be set
             // on the agg path taken above. In the normal path (i.e. here), we bypass the
-            // getCollectionType() call and hardcode "kCollection" for performance reasons.
+            // getCollectionType() call and hardcode "kCollection".
             curOp->debug().collectionType = query_shape::CollectionType::kCollection;
 
             tassert(10168301,
@@ -501,32 +503,31 @@ public:
                                           const ParsedFindCommand& parsedFind,
                                           const NamespaceString& ns) {
             // Compute QueryShapeHash and record it in CurOp.
+            const bool rawDataForShape = req.getRawData().value_or(false);
             query_shape::DeferredQueryShape deferredShape{[&]() {
                 return shape_helpers::tryMakeShape<query_shape::CountCmdShape>(
-                    parsedFind, req.getLimit().has_value(), req.getSkip().has_value());
+                    parsedFind,
+                    req.getLimit().has_value(),
+                    req.getSkip().has_value(),
+                    rawDataForShape);
             }};
             boost::optional<query_shape::QueryShapeHash> queryShapeHash =
                 CurOp::get(opCtx)->debug().ensureQueryShapeHash(opCtx, [&]() {
                     return shape_helpers::computeQueryShapeHash(expCtx, deferredShape, ns);
                 });
 
-            if (feature_flags::gFeatureFlagQueryStatsCountDistinct
-                    .isEnabledUseLastLTSFCVWhenUninitialized(
-                        VersionContext::getDecoration(opCtx),
-                        serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
-                query_stats::registerRequest(opCtx, _ns, [&]() {
-                    uassertStatusOKWithContext(deferredShape->getStatus(),
-                                               "Failed to compute query shape");
-                    return std::make_unique<query_stats::CountKey>(
-                        expCtx,
-                        req,
-                        std::move(deferredShape->getValue()),
-                        collectionOrView.getCollectionType());
-                });
+            query_stats::registerRequest(opCtx, _ns, [&]() {
+                uassertStatusOKWithContext(deferredShape->getStatus(),
+                                           "Failed to compute query shape");
+                return std::make_unique<query_stats::CountKey>(
+                    expCtx,
+                    req,
+                    std::move(deferredShape->getValue()),
+                    collectionOrView.getCollectionType());
+            });
 
-                if (req.getIncludeQueryStatsMetrics()) {
-                    curOp->debug().getQueryStatsInfo().metricsRequested = true;
-                }
+            if (req.getIncludeQueryStatsMetrics()) {
+                curOp->debug().getQueryStatsInfo().metricsRequested = true;
             }
         }
 
@@ -576,16 +577,19 @@ public:
             const auto vts = auth::ValidatedTenancyScope::get(opCtx);
             auto viewAggRequest =
                 query_request_conversion::asAggregateCommandRequest(req, true /* hasExplain */);
-            // An empty PrivilegeVector is acceptable because these privileges are only checked
-            // on getMore and explain will not open a cursor.
-            auto runStatus = runAggregate(opCtx,
-                                          viewAggRequest,
-                                          {viewAggRequest},
-                                          req.toBSON(),
-                                          PrivilegeVector(),
-                                          verbosity,
-                                          replyBuilder);
-            uassertStatusOK(runStatus);
+            // This aggregation was derived locally from the explain, so any IFR flag kickback it
+            // raises has to be absorbed here rather than propagated to the router.
+            retryOnLocalIFRFlagKickback(opCtx, viewAggRequest, "explain count as aggregation", [&] {
+                // An empty PrivilegeVector is acceptable because these privileges are only checked
+                // on getMore and explain will not open a cursor.
+                uassertStatusOK(runAggregate(opCtx,
+                                             viewAggRequest,
+                                             {viewAggRequest},
+                                             req.toBSON(),
+                                             PrivilegeVector(),
+                                             verbosity,
+                                             replyBuilder));
+            });
         }
 
         CountCommandReply runCountAsAgg(OperationContext* opCtx, const RequestType& req) {
@@ -593,11 +597,16 @@ public:
             auto aggRequest = query_request_conversion::asAggregateCommandRequest(req);
             auto opMsgAggRequest =
                 OpMsgRequestBuilder::create(vts, aggRequest.getDbName(), aggRequest.toBSON());
-            BSONObj aggResult = CommandHelpers::runCommandDirectly(opCtx, opMsgAggRequest);
 
-            long long countResult = ViewResponseFormatter(aggResult).getCountValue(
-                _ns.dbName().tenantId(),
-                SerializationContext::stateCommandReply(req.getSerializationContext()));
+            // This aggregation was derived locally from the count, so any IFR flag kickback it
+            // raises has to be absorbed here rather than propagated to the router.
+            long long countResult =
+                retryOnLocalIFRFlagKickback(opCtx, aggRequest, "count as aggregation", [&] {
+                    BSONObj aggResult = CommandHelpers::runCommandDirectly(opCtx, opMsgAggRequest);
+                    return ViewResponseFormatter(aggResult).getCountValue(
+                        _ns.dbName().tenantId(),
+                        SerializationContext::stateCommandReply(req.getSerializationContext()));
+                });
 
             return count_cmd_helper::buildCountReply(countResult);
         }

@@ -36,7 +36,6 @@
 #include "mongo/db/shard_role/lock_manager/d_concurrency.h"
 #include "mongo/db/sharding_environment/client/shard.h"
 #include "mongo/db/sharding_environment/shard_id.h"
-#include "mongo/db/sharding_environment/shard_ref.h"
 #include "mongo/db/tenant_id.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
 #include "mongo/db/topology/remove_shard_exception.h"
@@ -731,12 +730,6 @@ public:
     const std::shared_ptr<Shard>& localConfigShard();
 
     /**
-     * Creates the indexes on config.placementHistory supporting the getHistoricalPlacement()
-     * method.
-     */
-    Status createIndexesForConfigPlacementHistory(OperationContext* opCtx);
-
-    /**
      * Creates a secondary index on the uuid field of config.shards.
      * When checkFCVState is true, the method additionally verifies if the
      * gFeatureFlagAssignUUIDToShard is enabled (and skips the request if not).
@@ -790,7 +783,7 @@ public:
      * into config.placementHistory, given the passed in initialization time and default placement.
      */
     static write_ops::InsertCommandRequest buildInsertReqForPlacementHistoryOperationalBoundaries(
-        const Timestamp& initializationTime, const std::vector<ShardRef>& defaultPlacement);
+        const Timestamp& initializationTime, const std::vector<ShardId>& defaultPlacement);
 
     /**
      * Schedules an asynchronous unset of the addOrRemoveShardInProgress cluster parameter, in case

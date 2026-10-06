@@ -4,18 +4,6 @@
 
 #include "mongo/db/server_options_server_helpers.h"
 
-#include <boost/algorithm/string/constants.hpp>
-#include <boost/algorithm/string/split.hpp>
-#include <boost/algorithm/string/trim.hpp>
-#include <boost/core/addressof.hpp>
-#include <boost/filesystem/operations.hpp>
-#include <boost/filesystem/path.hpp>
-#include <boost/function/function_base.hpp>
-#include <boost/iterator/iterator_facade.hpp>
-#include <fmt/format.h>
-// IWYU pragma: no_include "boost/system/detail/error_code.hpp"
-#include <boost/type_index/type_index_facade.hpp>
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
@@ -42,6 +30,19 @@
 #include <type_traits>
 #include <utility>
 #include <variant>
+
+#include <boost/algorithm/string/constants.hpp>
+#include <boost/algorithm/string/split.hpp>
+#include <boost/algorithm/string/trim.hpp>
+#include <boost/core/addressof.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/function/function_base.hpp>
+#include <boost/iterator/iterator_facade.hpp>
+#include <boost/type_index/type_index_facade.hpp>
+#include <fmt/format.h>
+// IWYU pragma: no_include "boost/system/detail/error_code.hpp"
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
@@ -211,13 +212,9 @@ Status canonicalizeServerOptions(moe::Environment* params) {
     if (!ret.isOK())
         return ret;
 
-    // "net.wireObjectCheck" comes from the config file, so override it if either "objcheck" or
-    // "noobjcheck" are set, since those come from the command line.
+    // objcheck and noobjcheck are deprecated now, so if either are set, log a warning.
     if (params->count("objcheck")) {
-        ret = params->set("net.wireObjectCheck", moe::Value((*params)["objcheck"].as<bool>()));
-        if (!ret.isOK()) {
-            return ret;
-        }
+        LOGV2_WARNING(13047401, "Deprecated option \"objcheck\" was set");
         ret = params->remove("objcheck");
         if (!ret.isOK()) {
             return ret;
@@ -225,10 +222,7 @@ Status canonicalizeServerOptions(moe::Environment* params) {
     }
 
     if (params->count("noobjcheck")) {
-        ret = params->set("net.wireObjectCheck", moe::Value(!(*params)["noobjcheck"].as<bool>()));
-        if (!ret.isOK()) {
-            return ret;
-        }
+        LOGV2_WARNING(13047402, "Deprecated option \"noobjcheck\" was set");
         ret = params->remove("noobjcheck");
         if (!ret.isOK()) {
             return ret;
@@ -348,7 +342,7 @@ Status storeServerOptions(const moe::Environment& params) {
     }
 
     if (params.count("net.wireObjectCheck")) {
-        serverGlobalParams.objcheck = params["net.wireObjectCheck"].as<bool>();
+        LOGV2_WARNING(13047403, "Deprecated option \"net.wireObjectCheck\" was set");
     }
 
     if (params.count("net.bindIp")) {

@@ -408,6 +408,17 @@ TEST(CardinalityEstimator, NoHistogramForPath) {
     ASSERT(!ceRes.isOK() && ceRes.getStatus().code() == ErrorCodes::HistogramCEFailure);
 }
 
+// Under histogramCE, a non-sargable leaf predicate (e.g. $size, $bitsAllSet) cannot be estimated.
+TEST(CardinalityEstimator, UnsupportedMatchExpressionFallsBack) {
+    auto collInfo = buildCollectionInfo({}, makeCollStatsWithHistograms({"a"}, 1000.0));
+    for (const auto& query : {fromjson("{a: {$size: 2}}"), fromjson("{a: {$bitsAllSet: [1]}}")}) {
+        auto plan = makeCollScanPlan(parse(query));
+        const auto ceRes = getPlanCE(*plan, collInfo, QueryCBRCEModeEnum::kHistogramCE);
+        ASSERT(!ceRes.isOK() && ceRes.getStatus().code() == ErrorCodes::UnsupportedCbrNode)
+            << "expected UnsupportedCbrNode for " << query << ", got " << ceRes.getStatus();
+    }
+}
+
 TEST(CardinalityEstimator, HistogramConjunctionOverMultikey) {
     BSONObj query = fromjson("{a: {$gt: 1, $lt: 5}}");
     auto plan = makeCollScanPlan(parse(query));
@@ -994,10 +1005,6 @@ public:
     CardinalityEstimate estimateCardinality(const MatchExpression*) const override {
         return makeCard(10.0);
     }
-    std::vector<CardinalityEstimate> estimateCardinality(
-        const std::vector<const MatchExpression*>&) const override {
-        return {};
-    }
     CardinalityEstimate estimateKeysScanned(const IndexBounds&) const override {
         return makeCard(10.0);
     }
@@ -1033,6 +1040,9 @@ public:
     }
     ce::SamplingMetadata getSamplingMetadata() const override {
         MONGO_UNREACHABLE;
+    }
+    std::vector<ce::PersistedNDVEntry> getPersistedNDVMetadata() const override {
+        return {};
     }
 };
 
@@ -1413,10 +1423,6 @@ public:
     CardinalityEstimate estimateCardinality(const MatchExpression*) const override {
         MONGO_UNIMPLEMENTED;
     }
-    std::vector<CardinalityEstimate> estimateCardinality(
-        const std::vector<const MatchExpression*>&) const override {
-        MONGO_UNIMPLEMENTED;
-    }
     CardinalityEstimate estimateKeysScanned(const IndexBounds&) const override {
         MONGO_UNIMPLEMENTED;
     }
@@ -1446,13 +1452,16 @@ public:
         return makeCard(bounds ? _ndvMultiKeyBounded : _ndvMultiKey);
     }
     CardinalityEstimate getCollCard() const override {
-        MONGO_UNIMPLEMENTED;
+        return makeCard(1000.0);
     }
     size_t getSampleSize() const override {
         MONGO_UNIMPLEMENTED;
     }
     ce::SamplingMetadata getSamplingMetadata() const override {
         MONGO_UNREACHABLE;
+    }
+    std::vector<ce::PersistedNDVEntry> getPersistedNDVMetadata() const override {
+        return {};
     }
 
 private:

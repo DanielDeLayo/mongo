@@ -10,9 +10,12 @@
 #include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
 #include "mongo/db/query/client_cursor/cursor_manager.h"
 #include "mongo/db/query/client_cursor/cursor_server_params.h"
+#include "mongo/db/query/client_cursor/generic_cursor_utils.h"
 #include "mongo/db/query/plan_explainer.h"
+#include "mongo/db/query/query_latency_accumulator.h"
 #include "mongo/db/query/query_lifespan.h"
 #include "mongo/db/query/query_stats/query_stats.h"
+#include "mongo/db/query/query_stats/supplemental_metrics_stats.h"
 #include "mongo/db/shard_role/shard_catalog/external_data_source_scope_guard.h"
 #include "mongo/db/shard_role/shard_catalog/raw_data_operation.h"
 #include "mongo/db/storage/write_unit_of_work.h"
@@ -129,7 +132,9 @@ ClientCursor::ClientCursor(ClientCursorParams params,
       _readConcernArgs(std::move(params.readConcernArgs)),
       _readPreferenceSetting(std::move(params.readPreferenceSetting)),
       _rawData(isRawDataOperation(operationUsingCursor)),
-      _originatingCommand(params.originatingCommandObj),
+      _originatingCommand(generic_cursor::maybeRedactOriginatingCommand(
+          params.originatingCommandObj,
+          CurOp::get(operationUsingCursor)->getShouldOmitDiagnosticInformation())),
       _originatingPrivileges(std::move(params.originatingPrivileges)),
       _tailableMode(params.tailableMode),
       _isNoTimeout(params.isNoTimeout),
@@ -148,11 +153,20 @@ ClientCursor::ClientCursor(ClientCursorParams params,
           CurOp::get(operationUsingCursor)->debug().usesOptimizedUpdateLookup),
       _shouldOmitDiagnosticInformation(
           CurOp::get(operationUsingCursor)->getShouldOmitDiagnosticInformation()),
-      _opKey(operationUsingCursor->getOperationKey()) {
+      _opKey(operationUsingCursor->getOperationKey()),
+      _mayHoldMongotTaskExecutor(params.mayHoldMongotTaskExecutor),
+      // Take a co-owning reference to the operation's memory tracker.
+      _memoryUsageTracker(OperationMemoryUsageTracker::getOwningIfExists(operationUsingCursor)) {
     invariant(_exec);
     invariant(_operationUsingCursor);
 
     _queryLifespan = QueryLifespan::get(operationUsingCursor).handle();
+
+    // Exclude tailable and change-stream cursors from queryLatencies since they can stay open
+    // indefinitely.
+    if (_tailableMode != TailableModeEnum::kNormal) {
+        QueryLatencyAccumulator::get(operationUsingCursor).exclude();
+    }
 
     cursorStats().open.increment();
     cursorStats().totalOpened.increment();
@@ -206,7 +220,8 @@ void ClientCursor::dispose(OperationContext* opCtx, boost::optional<Date_t> now)
                                                       std::move(_queryStatsKey),
                                                       _isChangeStreamQuery,
                                                       _firstResponseExecutionTime,
-                                                      _metrics);
+                                                      _metrics,
+                                                      takeSupplementalMetrics());
 }
 
 GenericCursor ClientCursor::toGenericCursor() const {
@@ -217,6 +232,9 @@ GenericCursor ClientCursor::toGenericCursor() const {
     gc.setTailable(isTailable());
     gc.setAwaitData(isAwaitData());
     gc.setNoCursorTimeout(isNoTimeout());
+    if (_shouldOmitDiagnosticInformation && !_originatingCommand.isEmpty()) {
+        gc.setRedacted(true);
+    }
     gc.setOriginatingCommand(getOriginatingCommandObj());
     gc.setLsid(getSessionId());
     gc.setTxnNumber(_txnNumber);
@@ -275,6 +293,25 @@ void ClientCursor::updateMetricsOnUnpin(const ChangeStreamCursorMetrics& csMetri
     }
 }
 
+void ClientCursor::captureSupplementalMetricsIfNeeded(const OpDebug& opDebug) {
+    if (_supplementalMetrics) {
+        return;
+    }
+    _supplementalMetrics = query_stats::computeSupplementalQueryStatsMetrics(opDebug);
+}
+
+std::vector<std::unique_ptr<query_stats::SupplementalStatsEntry>>
+ClientCursor::takeSupplementalMetrics() {
+    // We intentionally leave _supplementalMetrics engaged after the move rather than resetting it
+    // to boost::none so that its has_value() is the once-guard that prevents
+    // captureSupplementalMetricsIfNeeded from re-capturing on getMores, whose OpDebug has no
+    // planning data.
+    if (!_supplementalMetrics) {
+        return {};
+    }
+    return std::move(*_supplementalMetrics);
+}
+
 //
 // Pin methods
 //
@@ -297,8 +334,8 @@ ClientCursorPin::ClientCursorPin(OperationContext* opCtx,
     if (_cursor->_isChangeStreamQuery) {
         change_stream_metrics::gCursorsOpenPinned.add(1);
     }
-    OperationMemoryUsageTracker::moveToOpCtxIfAvailable(opCtx,
-                                                        std::move(_cursor->_memoryUsageTracker));
+    // Publish a copy of the tracker onto the operation context.
+    OperationMemoryUsageTracker::attachToOpCtxIfAvailable(opCtx, _cursor->_memoryUsageTracker);
 }
 
 ClientCursorPin::ClientCursorPin(ClientCursorPin&& other)
@@ -357,8 +394,12 @@ void ClientCursorPin::release() {
     invariant(_cursor->_operationUsingCursor);
     invariant(_cursorManager);
 
-    _cursor->_memoryUsageTracker =
-        OperationMemoryUsageTracker::moveFromOpCtxIfAvailable(_cursor->_operationUsingCursor);
+    // Reclaim the tracker from the operation context, but only overwrite the cursor's reference if
+    // one was there -- otherwise keep the reference captured at construction (don't clobber it).
+    if (auto tracker = OperationMemoryUsageTracker::detachFromOpCtxIfAvailable(
+            _cursor->_operationUsingCursor)) {
+        _cursor->_memoryUsageTracker = std::move(tracker);
+    }
     const bool isChangeStream = _cursor->_isChangeStreamQuery;
 
     // Unpin the cursor. This must be done by calling into the cursor manager, since the cursor

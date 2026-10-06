@@ -4,14 +4,6 @@
 
 #include "mongo/executor/network_interface_tl.h"
 
-#include <absl/container/node_hash_map.h>
-#include <absl/meta/type_traits.h>
-#include <boost/move/utility_core.hpp>
-#include <boost/none.hpp>
-#include <boost/optional/optional.hpp>
-#include <boost/smart_ptr/intrusive_ptr.hpp>
-#include <fmt/format.h>
-// IWYU pragma: no_include "cxxabi.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
@@ -50,6 +42,15 @@
 #include <mutex>
 #include <tuple>
 #include <type_traits>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <fmt/format.h>
+// IWYU pragma: no_include "cxxabi.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
@@ -405,7 +406,6 @@ void NetworkInterfaceTL::CommandStateBase::cancel(Status status) {
                         2,
                         "Skipping redundant cancellation",
                         "requestId"_attr = request.id,
-                        "request"_attr = redact(request.toString()),
                         "originalReason"_attr = cancelStatus,
                         "redundantReason"_attr = status);
             return;
@@ -416,7 +416,6 @@ void NetworkInterfaceTL::CommandStateBase::cancel(Status status) {
                     2,
                     "Cancelling command with reason",
                     "requestId"_attr = request.id,
-                    "request"_attr = redact(request.toString()),
                     "reason"_attr = status);
     }
     cancelSource.cancel();
@@ -464,16 +463,14 @@ void NetworkInterfaceTL::CommandStateBase::setTimer() {
                 return;
             }
 
-            const std::string message = str::stream()
-                << "Request " << request.id << " timed out" << ", deadline was "
-                << deadline.toString() << ", op was " << redact(request.toString());
+            const std::string message = str::stream() << "Request " << request.id << " timed out"
+                                                      << ", deadline was " << deadline.toString();
 
             LOGV2_DEBUG(22595,
                         2,
                         "Request timed out",
                         "requestId"_attr = request.id,
-                        "deadline"_attr = deadline,
-                        "request"_attr = request);
+                        "deadline"_attr = deadline);
             cancel({timeoutCode, message});
         });
 }
@@ -646,7 +643,6 @@ void NetworkInterfaceTL::_killOperation(CommandStateBase* cmdStateToKill) try {
                 "Sending remote _killOperations request to cancel command",
                 "target"_attr = cmdStateToKill->request.target,
                 "cancelledRequestId"_attr = cmdStateToKill->request.id,
-                "canelledRequest"_attr = redact(cmdStateToKill->request.toString()),
                 "operationKey"_attr = operationKey);
 
     executor::RemoteCommandRequest killOpRequest(
@@ -654,8 +650,9 @@ void NetworkInterfaceTL::_killOperation(CommandStateBase* cmdStateToKill) try {
         DatabaseName::kAdmin,
         BSON("_killOperations" << 1 << "operationKeys" << BSON_ARRAY(*operationKey)),
         nullptr,
-        increaseTimeoutOnKillOp.shouldFail() ? kCancelCommandTimeout_forTest
-                                             : kCancelCommandTimeout);
+        {.timeout = increaseTimeoutOnKillOp.shouldFail() ? kCancelCommandTimeout_forTest
+                                                         : kCancelCommandTimeout,
+         .isKillOp = true});
     auto cbHandle = executor::TaskExecutor::CallbackHandle();
     auto killOpCmdState = std::make_shared<CommandState>(
         this, killOpRequest, cbHandle, nullptr, CancellationToken::uncancelable());
@@ -847,7 +844,12 @@ NetworkInterfaceTL::CommandStateBase::getClient(AsyncClientFactory& factory) {
         }
     }
 
-    return factory.get(request.target, request.sslMode, poolTimeout, cancelSource.token());
+    return factory.get(request.target,
+                       request.sslMode,
+                       poolTimeout,
+                       cancelSource.token(),
+                       request.isKillOp ? ConnectionAcquisitionPurpose::kKillOperation
+                                        : ConnectionAcquisitionPurpose::kNormal);
 }
 
 ExecutorFuture<RemoteCommandResponse> NetworkInterfaceTL::CommandStateBase::sendRequest(
@@ -1054,12 +1056,6 @@ ExecutorFuture<RemoteCommandResponse> NetworkInterfaceTL::_runCommand(
 
                 return false;
             });
-
-            // The TransportLayer has, for historical reasons returned SocketException for network
-            // errors, but sharding assumes HostUnreachable on network errors.
-            if (response.status == ErrorCodes::SocketException) {
-                response.status = Status(ErrorCodes::HostUnreachable, response.status.reason());
-            }
 
             LOGV2_DEBUG(22597,
                         2,

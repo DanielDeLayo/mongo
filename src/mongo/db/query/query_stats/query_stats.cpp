@@ -4,6 +4,8 @@
 #include "mongo/db/query/query_stats/query_stats.h"
 
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bson_validate.h"
+#include "mongo/crypto/sha256_block.h"
 #include "mongo/db/commands/server_status/server_status_metric.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/feature_flag.h"
@@ -11,15 +13,12 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/partitioned.h"
 #include "mongo/db/query/lru_key_value.h"
-#include "mongo/db/query/query_execution_knobs_gen.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/query_integration_knobs_gen.h"
-#include "mongo/db/query/query_optimization_knobs_gen.h"
 #include "mongo/db/query/query_stats/query_stats_failed_to_record_info.h"
 #include "mongo/db/query/query_stats/query_stats_on_parameter_change.h"
 #include "mongo/db/query/query_stats/rate_limiting.h"
 #include "mongo/db/query/util/memory_util.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/atomic.h"
@@ -70,16 +69,6 @@ auto& queryStatsStoreWriteErrorsMetric =
     *MetricBuilder<Counter64>{"queryStats.numQueryStatsStoreWriteErrors"};
 
 /**
- * Indicates whether or not query stats is enabled via the feature flag.
- */
-bool isQueryStatsFeatureEnabled() {
-    // We need to use isEnabledUseLastLTSFCVWhenUninitialized instead of isEnabled because
-    // this could run during startup while the FCV is still uninitialized.
-    return feature_flags::gFeatureFlagQueryStats.isEnabledUseLastLTSFCVWhenUninitialized(
-        serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
-}
-
-/**
  * Cap the queryStats store size.
  */
 size_t capQueryStatsStoreSize(size_t requestedSize) {
@@ -104,14 +93,6 @@ size_t getQueryStatsStoreSize() {
     uassertStatusOK(status);
     size_t requestedSize = memory_util::convertToSizeInBytes(status.getValue());
     return capQueryStatsStoreSize(requestedSize);
-}
-
-void assertConfigurationAllowed() {
-    uassert(7373500,
-            "Cannot configure queryStats store. The feature flag is not enabled. Please restart "
-            "and specify the feature flag, or upgrade the feature compatibility version to one "
-            "where it is enabled by default.",
-            isQueryStatsFeatureEnabled());
 }
 
 /**
@@ -148,7 +129,6 @@ void configureWriteCmdRateLimiter(ServiceContext* serviceCtx) {
 class QueryStatsOnParamChangeUpdaterImpl final : public query_stats_util::OnParamChangeUpdater {
 public:
     void updateCacheSize(ServiceContext* serviceCtx, memory_util::MemorySize memSize) final {
-        assertConfigurationAllowed();
         auto requestedSize = memory_util::convertToSizeInBytes(memSize);
         auto cappedSize = capQueryStatsStoreSize(requestedSize);
         auto& queryStatsStoreManager = QueryStatsStoreManager::get(serviceCtx);
@@ -160,26 +140,16 @@ public:
     }
 
     void updateRateLimiter(ServiceContext* serviceCtx) override {
-        assertConfigurationAllowed();
         configureRateLimiter(serviceCtx);
     }
 
     void updateWriteCmdRateLimiter(ServiceContext* serviceCtx) override {
-        assertConfigurationAllowed();
         configureWriteCmdRateLimiter(serviceCtx);
     }
 };
 
 ServiceContext::ConstructorActionRegisterer queryStatsStoreManagerRegisterer{
     "QueryStatsStoreManagerRegisterer", [](ServiceContext* serviceCtx) {
-        // Note: it is possible that this is called before FCV is properly set up. The feature flags
-        // can only be specified at startup, but the feature compatibility version may change at
-        // runtime. If the feature compatibility version upgrades at runtime, the feature may now be
-        // enabled by default, even if the flag was not specified. To allow for this possibility, we
-        // will always configure a query stats store of the size currently specified by
-        // 'internalQueryStatsCacheSize', but we will prevent changing its shape or rate limit at
-        // runtime unless the feature flag is enabled (at whatever current FCV when the
-        // configuration setParameter command is run).
         query_stats_util::queryStatsStoreOnParamChangeUpdater(serviceCtx) =
             std::make_unique<QueryStatsOnParamChangeUpdaterImpl>();
         size_t size = getQueryStatsStoreSize();
@@ -206,15 +176,11 @@ ServiceContext::ConstructorActionRegisterer queryStatsStoreManagerRegisterer{
     }};
 
 /**
- * Top-level checks for whether queryStats collection is enabled. If this returns false, we must go
+ * Top-level checks for whether the query stats store is enabled. If this returns false, we must go
  * no further.
  */
-bool isQueryStatsEnabled(const ServiceContext* serviceCtx) {
-    // During initialization, FCV may not yet be setup but queries could be run. We can't
-    // check whether queryStats should be enabled without FCV, so default to not recording
-    // those queries.
-    return isQueryStatsFeatureEnabled() &&
-        QueryStatsStoreManager::get(serviceCtx)->getMaxSize() > 0;
+bool isQueryStatsStoreEnabled(const ServiceContext* serviceCtx) {
+    return QueryStatsStoreManager::get(serviceCtx)->getMaxSize() > 0;
 }
 
 /**
@@ -317,6 +283,16 @@ void updateStatistics(const QueryStatsStore::Partition& proofOfLock,
                       const QueryStatsSnapshot& snapshot,
                       std::vector<std::unique_ptr<SupplementalStatsEntry>> supplementalStats) {
     toUpdate.latestSeenTimestamp = Date_t::now();
+
+    // 'featureFlagQueryStatsErrors' allows for errored snapshots arrive here. Errored snapshots
+    // carry partial metrics, so they are dropped.
+    if (snapshot.isErrored()) {
+        if (feature_flags::gFeatureFlagQueryStatsErrors.checkEnabled()) {
+            toUpdate.recordErrorCode(snapshot.errorCode);
+        }
+        return;
+    }
+
     toUpdate.lastExecutionMicros = snapshot.queryExecMicros;
     toUpdate.execCount++;
     toUpdate.workingTimeMillis.aggregate(snapshot.workingTimeMillis);
@@ -369,11 +345,8 @@ void registerRequestImpl(const OperationContext* opCtx,
                          const NamespaceString& collection,
                          const std::function<std::unique_ptr<Key>(void)>& makeKey,
                          OpDebug::QueryStatsInfo& queryStatsInfo) {
-    if (!isQueryStatsEnabled(opCtx->getServiceContext())) {
-        LOGV2_DEBUG(8473000,
-                    5,
-                    "not collecting query stats for this request since it is disabled",
-                    "featureEnabled"_attr = isQueryStatsFeatureEnabled());
+    if (!isQueryStatsStoreEnabled(opCtx->getServiceContext())) {
+        LOGV2_DEBUG(8473000, 5, "not collecting query stats for this request since it is disabled");
         return;
     }
 
@@ -423,6 +396,15 @@ void registerRequestImpl(const OperationContext* opCtx,
     // original query from queryStats metrics collection and let it execute normally.
     try {
         queryStatsInfo.key = makeKey();
+        if (queryStatsInfo.key->size() > static_cast<size_t>(BSONObjMaxUserSize)) {
+            queryStatsStoreWriteErrorsMetric.increment();
+            LOGV2_DEBUG(13146600,
+                        2,
+                        "Query Stats shapification has exceeded the memory limit. Metrics will not "
+                        "be collected");
+            queryStatsInfo.key = nullptr;
+            return;
+        }
         queryStatsInfo.keyHash = absl::HashOf(*queryStatsInfo.key);
         if (MONGO_unlikely(queryStatsFailToSerializeKey.shouldFail())) {
             uasserted(ErrorCodes::FailPointEnabled,
@@ -435,8 +417,8 @@ void registerRequestImpl(const OperationContext* opCtx,
         if (status.code() == ErrorCodes::BSONObjectTooLarge) {
             LOGV2_DEBUG(7979400,
                         2,
-                        "Query Stats shapification has exceeded the 16 MB memory limit. Metrics "
-                        "will not be collected");
+                        "Query Stats shapification has exceeded the MB memory limit. Metrics will "
+                        "not be collected");
             return;
         }
 
@@ -466,6 +448,39 @@ void registerRequestImpl(const OperationContext* opCtx,
 }
 
 }  // namespace
+
+Status validateQueryStatsKeyBson(const BSONObj& keyBson) {
+    // The 'keyBson' is expected to have structurally well-formed BSON by this point. Only its size
+    // and nesting depth remain to be checked.
+    dassert(validateBSON(keyBson));
+
+    if (auto status = keyBson.validateBSONObjSize(BSONObjMaxUserSize)
+                          .addContext("Query stats key exceeds maximum BSON size");
+        !status.isOK()) {
+        return status;
+    }
+
+    // validateBSONDepthForUserStorage enforces the user-storage depth limit, leaving enough buffer
+    // for server-added nesting when embedding 'keyBson' in a command reply.
+    return validateBSONDepthForUserStorage(keyBson).addContext(
+        "Query stats key is too deeply nested");
+}
+
+// This SHA256 version of the hash is output to aid in data analytics use cases. In these
+// cases, we often care about comparing hashes from different hosts, potentially on
+// different versions and platforms. The thinking here is that the SHA256 algorithm is more
+// stable across these different environments than the quicker 'absl::HashOf'
+// implementation. This must match the value used to populate the store's 'KeyHashIndex',
+// which the $match on keyHash optimization relies on.
+std::string computeKeyHashString(OperationContext* opCtx, const Key& key) {
+    auto representativeShapeKey =
+        key.toBson(opCtx,
+                   query_shape::SerializationOptions::kRepresentativeQueryShapeSerializeOptions,
+                   SerializationContext::stateDefault());
+    return SHA256Block::computeHash((const uint8_t*)representativeShapeKey.objdata(),
+                                    representativeShapeKey.objsize())
+        .toString();
+}
 
 void registerRequest(OperationContext* opCtx,
                      const NamespaceString& collection,
@@ -519,9 +534,8 @@ bool shouldRequestRemoteMetrics(const OpDebug& opDebug, size_t opIndex) {
 
 QueryStatsStore& getQueryStatsStore(OperationContext* opCtx) {
     uassert(6579000,
-            "Query stats is not enabled without the feature flag on and a cache size greater than "
-            "0 bytes",
-            isQueryStatsEnabled(opCtx->getServiceContext()));
+            "The query stats cache size is not greater than 0 bytes",
+            isQueryStatsStoreEnabled(opCtx->getServiceContext()));
     return QueryStatsStoreManager::get(opCtx->getServiceContext())->getQueryStatsStore();
 }
 
@@ -588,10 +602,10 @@ void writeQueryStats(OperationContext* opCtx,
     }
 
     // It's possible that query stats was enabled in registerRequest but has been disabled since
-    // (e.g., by FCV downgrade or setting the store size to 0). Rather than calling
-    // getQueryStatsStore (which would trigger a uassert if query stats is disabled), we return and
-    // log a message if query stats is disabled, and otherwise grab the query stats store directly.
-    if (!isQueryStatsEnabled(opCtx->getServiceContext())) {
+    // (e.g., by setting the store size to 0). Rather than calling getQueryStatsStore (which would
+    // trigger a uassert if query stats is disabled), we return and log a message if query stats is
+    // disabled, and otherwise grab the query stats store directly.
+    if (!isQueryStatsStoreEnabled(opCtx->getServiceContext())) {
         LOGV2_DEBUG(8456700,
                     2,
                     "Query stats was enabled when the command started but is now disabled. "
@@ -629,12 +643,14 @@ void writeQueryStats(OperationContext* opCtx,
                                  std::move(supplementalMetrics));
 }
 
-void writeQueryStatsOnCursorDisposeOrKill(OperationContext* opCtx,
-                                          boost::optional<size_t> queryStatsKeyHash,
-                                          std::unique_ptr<Key> key,
-                                          bool isChangeStreamQuery,
-                                          boost::optional<Microseconds> firstResponseExecutionTime,
-                                          OpDebug::AdditiveMetrics metrics) {
+void writeQueryStatsOnCursorDisposeOrKill(
+    OperationContext* opCtx,
+    boost::optional<size_t> queryStatsKeyHash,
+    std::unique_ptr<Key> key,
+    bool isChangeStreamQuery,
+    boost::optional<Microseconds> firstResponseExecutionTime,
+    OpDebug::AdditiveMetrics metrics,
+    std::vector<std::unique_ptr<SupplementalStatsEntry>> supplementalMetrics) {
     // It is discouraged but technically possible for a user to enable queryStats on the mongods of
     // a replica set. In this case, a cursor will be created for each mongod. However, the
     // queryStatsKey is behind a unique_ptr on CurOp. The ClientCursor constructor std::moves the
@@ -651,7 +667,8 @@ void writeQueryStatsOnCursorDisposeOrKill(OperationContext* opCtx,
         auto snapshot = query_stats::captureMetrics(
             opCtx, query_stats::microsecondsToUint64(firstResponseExecutionTime), metrics);
 
-        query_stats::writeQueryStats(opCtx, queryStatsKeyHash, std::move(key), snapshot);
+        query_stats::writeQueryStats(
+            opCtx, queryStatsKeyHash, std::move(key), snapshot, std::move(supplementalMetrics));
     } else if (isChangeStreamQuery && opCtx) {
         // Since we already recorded information about the possible getMores associated with a
         // cursor that never ends, the only information left to record is about the kill/dispose

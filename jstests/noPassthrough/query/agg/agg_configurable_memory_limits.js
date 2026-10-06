@@ -289,11 +289,7 @@ assert.commandWorked(bulk.execute());
 
     // BinData -> array has by far the largest blow-up of any $convert conversion (one array element
     // per vector entry, so the output can be many times the input size), so it is the only tracked
-    // case. It requires the vector conversion feature flag.
-    if (!FeatureFlagUtil.isEnabled(db, "ConvertBinDataVectors")) {
-        return;
-    }
-
+    // case.
     // Build a vector-subtype BinData from an array field, then convert it back to an array.
     const memColl = db.agg_convert_memory_limit;
     memColl.drop();
@@ -519,7 +515,9 @@ assert.commandWorked(bulk.execute());
         );
         return;
     }
-    const knob = "internalQueryMaxMemoryUsageBytesPerOperation";
+    // $object memory is tracked locally against a per-expression cap; it does not count against the
+    // operation-wide limit. Lower that cap to make the $object result exceed it.
+    const knob = "internalQueryMaxSingleExpressionMemoryUsageBytes";
 
     const pipeline = [
         {$limit: 1},
@@ -533,7 +531,7 @@ assert.commandWorked(bulk.execute());
 
     assert.doesNotThrow(() => coll.aggregate(pipeline).toArray());
 
-    // Lower the operation-wide limit so the $object result exceeds it.
+    // Lower the per-expression cap so the $object result exceeds it.
     const originalVal = setParam(knob, 1024);
 
     const err = assert.throwsWithCode(
@@ -547,6 +545,42 @@ assert.commandWorked(bulk.execute());
     );
 
     setParam(knob, originalVal);
+})();
+
+(function testInternalQueryMaxMemoryIntensiveExpressions() {
+    // Pipeline covering all 9 tracked memory-intensive expressions:
+    //   $addFields stage: $range (1)
+    //   $project stage:   $range (2), $map (3), $reduce (4), $concatArrays (5),
+    //                     $setUnion (6), $zip (7), $array literal (8), $object literal (9)
+    // The $addFields stage creates an array field so downstream expressions can reference it
+    // via "$arr" instead of introducing extra tracked sub-expressions.
+    // $array is triggered by the [1, 2, 3] literal inside $arrayElemAt's argument list.
+    // $object is triggered by the {a: "$y"} literal passed as the $mergeObjects argument.
+    const pipeline = [
+        {$addFields: {arr: {$range: [0, 3]}}},
+        {
+            $project: {
+                ranged: {$range: [0, 5]},
+                mapped: {$map: {input: "$arr", as: "x", in: "$$x"}},
+                reduced: {
+                    $reduce: {input: "$arr", initialValue: 0, in: {$add: ["$$value", "$$this"]}},
+                },
+                concat: {$concatArrays: ["$arr", "$arr"]},
+                union: {$setUnion: ["$arr", "$arr"]},
+                zipped: {$zip: {inputs: ["$arr", "$arr"]}},
+                firstOfArr: {$arrayElemAt: [[1, 2, 3], 0]},
+                merged: {$mergeObjects: {a: "$y"}},
+            },
+        },
+    ];
+
+    // Verify the pipeline works at the default limit.
+    assert.doesNotThrow(() => coll.aggregate(pipeline));
+
+    // Set limit below expression count (9) to trigger the error at parse time.
+    const originalVal = setParam("internalQueryMaxMemoryIntensiveExpressions", 8);
+    assert.throwsWithCode(() => coll.aggregate(pipeline), 12876600);
+    setParam("internalQueryMaxMemoryIntensiveExpressions", originalVal);
 })();
 
 MongoRunner.stopMongod(conn);

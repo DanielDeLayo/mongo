@@ -267,7 +267,7 @@ ScopedCollectionDescription CollectionShardingRuntime::getCollectionDescription(
                         receivedShardVersion ? *receivedShardVersion
                                              : ShardVersionPlacementIgnored(),
                         boost::none /* wantedVersion */,
-                        ShardingState::get(_serviceContext)->getShardHandle().toShardRef(opCtx)),
+                        ShardingState::get(_serviceContext)->shardId()),
         str::stream() << "sharding status of collection " << _nss.toStringForErrorMsg()
                       << " is not currently available for description and needs to be recovered "
                       << "from the config server",
@@ -303,7 +303,7 @@ void CollectionShardingRuntime::enterCriticalSectionCatchUpPhase(OperationContex
     _critSec.enterCriticalSectionCatchUpPhase(reason);
 
     if (_placementVersionInRecoverOrRefresh) {
-        _placementVersionInRecoverOrRefresh->cancellationSource.cancel();
+        _placementVersionInRecoverOrRefresh->recovererTrackerAcquisition.cancel();
     }
 }
 
@@ -406,8 +406,16 @@ void CollectionShardingRuntime::setCollectionMetadata(OperationContext* opCtx,
 void CollectionShardingRuntime::clearCollectionMetadata(OperationContext* opCtx,
                                                         bool collIsDropped) {
     if (_placementVersionInRecoverOrRefresh) {
-        _placementVersionInRecoverOrRefresh->cancellationSource.cancel();
+        _placementVersionInRecoverOrRefresh->recovererTrackerAcquisition.cancel();
     }
+
+    // Drop any in-flight synchronizer immediately so op observers stop enqueueing into a recovery
+    // round that has already been canceled.
+    _metadataSynchronizer.reset();
+
+    // Metadata is gone; clear needsDbPrimaryClassification so a later recover does not wait on
+    // the database primary critical section based on stale empty-catalog state.
+    _needsDbPrimaryClassification = false;
 
     _shardVersionWaiters.cancelWaiters(Status{ErrorCodes::CallbackCanceled,
                                               "Filtering metadata got cleared, cancelling callback "
@@ -461,14 +469,13 @@ Status CollectionShardingRuntime::waitForClean(OperationContext* opCtx,
             // the migration is authoritative is decided by the donor and passed in by the caller;
             // this node does not consult the feature flag itself.
             if (refreshMetadataIfUnknown && self->_metadataType == MetadataType::kUnknown) {
-                uasserted(
-                    StaleConfigInfo(nss,
-                                    ShardVersionPlacementIgnored(),
-                                    boost::none /* wantedVersion */,
-                                    ShardingState::get(opCtx)->getShardHandle().toShardRef(opCtx)),
-                    str::stream() << "Filtering metadata for " << nss.toStringForErrorMsg()
-                                  << " is not known; recovering before waiting for orphan "
-                                     "cleanup");
+                uasserted(StaleConfigInfo(nss,
+                                          ShardVersionPlacementIgnored(),
+                                          boost::none /* wantedVersion */,
+                                          ShardingState::get(opCtx)->shardId()),
+                          str::stream() << "Filtering metadata for " << nss.toStringForErrorMsg()
+                                        << " is not known; recovering before waiting for orphan "
+                                           "cleanup");
             }
 
             // If the metadata was reset, or the collection was dropped and recreated since the
@@ -589,7 +596,7 @@ CollectionShardingRuntime::_getMetadataWithVersionCheckAt(
         uasserted(StaleConfigInfo(_nss,
                                   receivedShardVersion,
                                   boost::none /* wantedVersion */,
-                                  ShardingState::get(opCtx)->getShardHandle().toShardRef(opCtx)),
+                                  ShardingState::get(opCtx)->shardId()),
                   "Failing with StaleConfig as alwaysThrowStaleConfigInfo is enabled");
     });
 
@@ -607,7 +614,7 @@ CollectionShardingRuntime::_getMetadataWithVersionCheckAt(
         uassert(StaleConfigInfo(_nss,
                                 receivedShardVersion,
                                 boost::none /* wantedVersion */,
-                                ShardingState::get(opCtx)->getShardHandle().toShardRef(opCtx),
+                                ShardingState::get(opCtx)->shardId(),
                                 std::move(criticalSectionSignal),
                                 shard_role_details::getLocker(opCtx)->isWriteLocked()
                                     ? StaleConfigInfo::OperationType::kWrite
@@ -621,7 +628,7 @@ CollectionShardingRuntime::_getMetadataWithVersionCheckAt(
     uassert(StaleConfigInfo(_nss,
                             receivedShardVersion,
                             boost::none /* wantedVersion */,
-                            ShardingState::get(opCtx)->getShardHandle().toShardRef(opCtx)),
+                            ShardingState::get(opCtx)->shardId()),
             str::stream() << "sharding status of collection " << _nss.toStringForErrorMsg()
                           << " is not currently known and needs to be recovered",
             optCurrentMetadata);
@@ -677,10 +684,8 @@ CollectionShardingRuntime::_getMetadataWithVersionCheckAt(
         return optCurrentMetadata;
     }
 
-    StaleConfigInfo sci(_nss,
-                        receivedShardVersion,
-                        wantedShardVersion,
-                        ShardingState::get(opCtx)->getShardHandle().toShardRef(opCtx));
+    StaleConfigInfo sci(
+        _nss, receivedShardVersion, wantedShardVersion, ShardingState::get(opCtx)->shardId());
 
     uassert(std::move(sci),
             str::stream() << "timestamp mismatch detected for " << _nss.toStringForErrorMsg(),
@@ -728,9 +733,11 @@ void CollectionShardingRuntime::appendShardVersion(BSONObjBuilder* builder) cons
 }
 
 void CollectionShardingRuntime::setPlacementVersionRecoverRefreshFuture(
-    SharedSemiFuture<void> future, CancellationSource cancellationSource) {
+    SharedSemiFuture<void> future,
+    ShardCatalogRecovererTracker::Acquisition recovererTrackerAcquisition) {
     invariant(!_placementVersionInRecoverOrRefresh);
-    _placementVersionInRecoverOrRefresh.emplace(std::move(future), std::move(cancellationSource));
+    _placementVersionInRecoverOrRefresh.emplace(std::move(future),
+                                                std::move(recovererTrackerAcquisition));
 }
 
 boost::optional<SharedSemiFuture<void>> CollectionShardingRuntime::getMetadataRefreshFuture()
@@ -743,17 +750,18 @@ boost::optional<SharedSemiFuture<void>> CollectionShardingRuntime::getMetadataRe
 void CollectionShardingRuntime::resetPlacementVersionRecoverRefreshFuture() {
     invariant(_placementVersionInRecoverOrRefresh);
     _placementVersionInRecoverOrRefresh = boost::none;
+    _metadataSynchronizer.reset();
 }
 
-void CollectionShardingRuntime::setCollectionRecoverer(
-    std::shared_ptr<CollectionCacheRecoverer> recoverer) {
-    invariant(!(_collectionRecoverer && recoverer));
-    _collectionRecoverer = std::move(recoverer);
+void CollectionShardingRuntime::setMetadataSynchronizer(
+    std::shared_ptr<CollectionMetadataSynchronizer> synchronizer) {
+    invariant(!(_metadataSynchronizer && synchronizer));
+    _metadataSynchronizer = std::move(synchronizer);
 }
 
-std::shared_ptr<CollectionCacheRecoverer> CollectionShardingRuntime::getCollectionCacheRecoverer()
+std::shared_ptr<CollectionMetadataSynchronizer> CollectionShardingRuntime::getMetadataSynchronizer()
     const {
-    return _collectionRecoverer;
+    return _metadataSynchronizer;
 }
 
 SharedSemiFuture<void> CollectionShardingRuntime::registerWaiterForChunkVersion(

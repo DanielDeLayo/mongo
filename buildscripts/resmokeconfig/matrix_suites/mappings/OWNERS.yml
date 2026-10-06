@@ -15,6 +15,12 @@ filters:
   - "aggregation_pqs*":
     approvers:
       - 10gen/query-execution-query-settings
+  - "*qemp_ifr_batch1.yml":
+    approvers:
+      - 10gen/query-execution
+  - "*qemp_ifr_no_nlm_transform.yml":
+    approvers:
+      - 10gen/query-execution
   - "aggregation_sharded_collections_pqs*":
     approvers:
       - 10gen/query-execution-query-settings
@@ -106,7 +112,16 @@ filters:
   - "replica_sets_kill_secondaries_jscore_passthrough.yml":
     approvers:
       - 10gen/server-replication-reviewers
+  - "replica_sets_kill_primary_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
+  - "replica_sets_max_mirroring.yml":
+    approvers:
+      - 10gen/server-replication-reviewers
   - "replica_sets_jscore_passthrough.yml":
+    approvers:
+      - 10gen/server-jstest-infra
+  - "replica_sets_last_patch.yml":
     approvers:
       - 10gen/server-jstest-infra
   - "*execution_control*":
@@ -139,3 +154,6 @@ filters:
   - "with_mongot_extension*":
     approvers:
       - 10gen/query-integration-extensions-api
+  - "multiversion_sanity_check*":
+    approvers:
+      - 10gen/server-jstest-infra

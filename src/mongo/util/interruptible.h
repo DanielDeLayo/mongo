@@ -3,10 +3,6 @@
 
 #pragma once
 
-#include <boost/move/utility_core.hpp>
-#include <boost/none.hpp>
-#include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "cxxabi.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
@@ -23,6 +19,11 @@
 #include <mutex>
 #include <utility>
 #include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
 
 namespace [[MONGO_MOD_PUBLIC]] mongo {
 
@@ -45,6 +46,8 @@ auto doWithoutLock(BasicLockableAdapter m, Callable&& callable) {
  */
 class [[MONGO_MOD_OPEN]] Interruptible {
 public:
+    virtual ~Interruptible() = default;
+
     /**
      * Returns true if currently waiting for a condition/interrupt.
      * This function relies on waitForConditionOrInterrupt to properly set _isWaiting.

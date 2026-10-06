@@ -143,7 +143,7 @@ void ensureNoRemovedShardsForChangeStreamV1(const ExpressionContext& expCtx) {
     }
 
     const auto changeStreamOpeningTime =
-        ResumeToken::parse(expCtx.getInitialPostBatchResumeToken()).getData().clusterTime;
+        ResumeToken::extractClusterTime(expCtx.getInitialPostBatchResumeToken());
     uassert(ErrorCodes::ChangeStreamHistoryLost,
             "Change stream events no longer available due to removed shard",
             !Grid::get(expCtx.getOperationContext())
@@ -285,7 +285,7 @@ std::vector<RemoteCursor> establishShardCursors(
                 designatedHostsMap.empty());
         std::set<ShardId> shardIds;
         for (const auto& request : requests) {
-            shardIds.emplace(request.shardRef);
+            shardIds.emplace(request.shardId);
             tassert(
                 8133500,
                 str::stream() << "Expected same request for each shard when targeting every shard "
@@ -761,6 +761,21 @@ std::unique_ptr<Pipeline> runPipelineDirectlyOnSingleShard(
         });
 }
 
+bool hasUnsourcedSetVariableStage(const Pipeline& pipeline) {
+    for (const auto& source : pipeline.getSources()) {
+        auto* setVarStage = dynamic_cast<DocumentSourceSetVariableFromSubPipeline*>(source.get());
+        if (!setVarStage) {
+            continue;
+        }
+        auto* subPipeline = setVarStage->getSubPipeline();
+        if (subPipeline && !subPipeline->empty() &&
+            subPipeline->front()->constraints().requiresInputDocSource) {
+            return true;
+        }
+    }
+    return false;
+}
+
 boost::optional<ShardedExchangePolicy> checkIfEligibleForExchange(OperationContext* opCtx,
                                                                   const Pipeline* mergePipeline) {
     if (internalQueryDisableExchange.load()) {
@@ -1081,12 +1096,12 @@ std::vector<AsyncRequestsSender::Request> buildShardRequests(
         std::vector<AsyncRequestsSender::Request> requestsWithResumeTokens;
         requestsWithResumeTokens.reserve(requests.size());
         for (const auto& request : requests) {
-            auto resumeTokenIt = resumeTokenMap.find(request.shardRef);
+            auto resumeTokenIt = resumeTokenMap.find(request.shardId);
             if (resumeTokenIt == resumeTokenMap.end()) {
                 requestsWithResumeTokens.emplace_back(request);
             } else {
                 requestsWithResumeTokens.emplace_back(
-                    request.shardRef,
+                    request.shardId,
                     request.cmdObj.addField(BSON(AggregateCommandRequest::kResumeAfterFieldName
                                                  << resumeTokenIt->second)
                                                 .firstElement()));
@@ -1499,6 +1514,15 @@ void partitionAndAddMergeCursorsSource(Pipeline* mergePipeline,
     if (metaCursors) {
         injectMetaCursor(mergePipeline, std::move(*metaCursors), remoteMetricsToInclude);
     }
+    // If the merge pipeline sets $$SEARCH_META from a sub-pipeline, that sub-pipeline must have
+    // received the shards' metadata cursors above. Executing or dispatching it without a cursor
+    // source is impossible (the merging node would trip a tassert). This is an internal invariant:
+    // it should be unreachable now that $setVariableFromSubPipeline is only attached when the
+    // pipeline actually references $$SEARCH_META.
+    tassert(13182000,
+            "$$SEARCH_META is required by the merging pipeline, but the shards did not return "
+            "metadata cursors",
+            !hasUnsourcedSetVariableStage(*mergePipeline));
 }
 
 void mergeExplainOutputFromShards(const std::vector<AsyncRequestsSender::Response>& shardResponses,
@@ -1646,8 +1670,11 @@ BSONObj finalizePipelineAndTargetShardsForExplain(
             // TODO SERVER-124003 Figure out a way to either avoid this serialized BSON or reuse it
             // as much as possible.
             query_shape::SerializationOptions wireOpts{.isSerializingForRemoteDispatch = true};
-            LiteParsedPipeline liteParsedPipeline(expCtx->getNamespaceString(),
-                                                  pipelineToTarget->serializeToBson(wireOpts));
+            LiteParsedPipeline liteParsedPipeline(
+                expCtx->getNamespaceString(),
+                pipelineToTarget->serializeToBson(wireOpts),
+                false /* isRunningAgainstView_ForHybridSearch */,
+                LiteParserOptions{.ifrContext = expCtx->getIfrContext()});
             PipelineDataSource pipelineDataSource = getPipelineDataSource(liteParsedPipeline);
 
             auto ifrCtx = expCtx->getIfrContext();
@@ -1985,8 +2012,11 @@ std::unique_ptr<Pipeline> finalizeAndMaybePreparePipelineForExecution(
             // TODO SERVER-124003 Figure out a way to either avoid this serialized BSON or reuse it
             // as much as possible.
             query_shape::SerializationOptions wireOpts{.isSerializingForRemoteDispatch = true};
-            LiteParsedPipeline liteParsedPipeline(expCtx->getNamespaceString(),
-                                                  pipelineToTarget->serializeToBson(wireOpts));
+            LiteParsedPipeline liteParsedPipeline(
+                expCtx->getNamespaceString(),
+                pipelineToTarget->serializeToBson(wireOpts),
+                false /* isRunningAgainstView_ForHybridSearch */,
+                LiteParserOptions{.ifrContext = expCtx->getIfrContext()});
             PipelineDataSource pipelineDataSource = getPipelineDataSource(liteParsedPipeline);
 
             auto ifrCtx = expCtx->getIfrContext();

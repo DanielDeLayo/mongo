@@ -8,9 +8,14 @@
  * logs instead of kHandleMoveChunk.
  *
  * @tags: [
+ *   # Asserts on database-level shard-targeting internals specifically; forcing
+ *   # whole-db/whole-cluster upconversion would target a different/redundant code path.
+ *   do_not_run_in_whole_db_passthrough,
+ *   do_not_run_in_whole_cluster_passthrough,
  *   assumes_balancer_off,
  *   does_not_support_stepdowns,
  *   featureFlagChangeStreamPreciseShardTargeting,
+ *   featureFlagChangeStreamReaderV2,
  *   requires_fcv_90,
  *   requires_sharding,
  *   uses_change_streams,

@@ -10,6 +10,8 @@
 #include "mongo/util/modules.h"
 
 #include <cstdint>
+#include <functional>
+#include <string_view>
 
 [[MONGO_MOD_PUBLIC]];
 
@@ -60,5 +62,27 @@ Status validateBSONColumn(const char* buf,
                           int maxLength,
                           BSONValidateModeEnum mode = BSONValidateModeEnum::kDefault,
                           ValidationVersion validationVersion = currentValidationVersion) noexcept;
+
+// Validates JS-produced BSON. Throws InvalidBSONFromJavaScript on failure, preserves
+// ExceededMemoryLimit.
+void uassertValidBSONFromJavaScript(const BSONObj& obj, std::string_view context);
+
+/**
+ * Validates the nesting depth of 'obj', returning ErrorCodes::Overflow if it exceeds the depth
+ * limit getMaxDepthForUserStorage() sets. That limit is lower than the one validateBSON() enforces,
+ * because a depth level buffer is needed to account for the nesting the server adds when it embeds
+ * 'obj' in an oplog entry or a command reply.
+ */
+Status validateBSONDepthForUserStorage(const BSONObj& obj);
+
+/**
+ * Same as validateBSONDepthForUserStorage(const BSONObj&), but additionally invokes
+ * 'topLevelVisitor' for every top-level element of 'obj' while the depth validation traversal is
+ * already visiting those elements. This allows callers to perform top-level validation work in the
+ * same pass as the depth check. If the visitor encounters an error, it should throw a
+ * 'DBException'; this function will catch it and return the corresponding Status.
+ */
+Status validateBSONDepthForUserStorage(
+    const BSONObj& obj, const std::function<void(const BSONElement&)>& topLevelVisitor);
 
 }  // namespace mongo

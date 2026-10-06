@@ -15,6 +15,7 @@
 #include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/query/collection_index_usage_tracker_decoration.h"
 #include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/query/plan_cache/join_plan_cache.h"
 #include "mongo/db/shard_role/lock_manager/exception_util.h"
 #include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
 #include "mongo/db/shard_role/shard_catalog/index_catalog.h"
@@ -214,6 +215,7 @@ Status commit(OperationContext* opCtx,
         if (mongo::feature_flags::gFeatureFlagPathArrayness.isEnabled()) {
             collectionQueryInfo.rebuildPathArrayness(opCtx, writableColl);
         }
+        join_ordering::bumpCollectionVersionForDDL(writableColl);
 
         audit::logCreateIndex(opCtx->getClient(),
                               &index.spec,
@@ -270,9 +272,25 @@ Status abort(OperationContext* opCtx,
     WriteUnitOfWork wuow{opCtx};
     auto writableColl = writer.getWritableCollection(opCtx);
 
+    if (!_registry(opCtx->getServiceContext()).contains(buildUUID)) {
+        LOGV2(13344300,
+              "Index build: already deregistered, nothing to abort",
+              "buildUUID"_attr = buildUUID,
+              "collectionUUID"_attr = collectionUUID);
+        return Status::OK();
+    }
+
     for (auto&& index : indexes) {
         auto entry = writableColl->getIndexCatalog()->getWritableEntryByName(
             opCtx, index.getIndexName(), IndexCatalog::InclusionPolicy::kUnfinished);
+        if (!entry) {
+            LOGV2(13343400,
+                  "Index build: index entry not found during abort, skipping",
+                  "index"_attr = index.getIndexName(),
+                  "buildUUID"_attr = buildUUID,
+                  "collectionUUID"_attr = collectionUUID);
+            continue;
+        }
 
         auto status = writableColl->getIndexCatalog()->dropIndexEntry(opCtx, writableColl, entry);
         if (!status.isOK()) {

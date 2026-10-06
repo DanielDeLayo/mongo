@@ -4,11 +4,12 @@
 #include "mongo/db/validate/validate_state.h"
 
 #include "mongo/db/repl/local_oplog_info.h"
-#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/replicated_fast_count/replicated_fast_count_init.h"
 #include "mongo/db/replicated_fast_count/replicated_fast_count_test_helpers.h"
 #include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
 #include "mongo/db/shard_role/shard_catalog/collection_options.h"
+#include "mongo/db/storage/ident.h"
+#include "mongo/db/storage/key_format.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/server_parameter_guard.h"
@@ -38,6 +39,17 @@ public:
                                    ReplicatedFastCountTestPersistenceProvider>())) {}
 };
 
+// Creates the replicated fast count backing stores as container idents.
+void createReplicatedFastCountContainers(OperationContext* opCtx) {
+    ASSERT_OK(createInternalFastCountContainers(opCtx,
+                                                NamespaceString::kAdminCommandNamespace,
+                                                ident::kFastCountMetadataStore,
+                                                KeyFormat::String,
+                                                ident::kFastCountMetadataStoreTimestamps,
+                                                KeyFormat::Long,
+                                                /*writeToOplog=*/false));
+}
+
 }  // namespace
 
 TEST_F(ValidateStateTest, GetDetectedFastCountTypeReturnsLegacySizeStorer) {
@@ -47,15 +59,13 @@ TEST_F(ValidateStateTest, GetDetectedFastCountTypeReturnsLegacySizeStorer) {
 };
 
 TEST_F(ValidateStateTest, GetDetectedFastCountTypeReturnsBoth) {
-    ASSERT_OK(replicated_fast_count::createReplicatedFastCountCollection(storageInterface(),
-                                                                         operationContext()));
+    createReplicatedFastCountContainers(operationContext());
     ValidateState validateState(operationContext(), kNss, kValidationOptions);
     EXPECT_EQ(validateState.getDetectedFastCountType(operationContext()), FastCountType::both);
 };
 
 TEST_F(ValidateStateWithoutSizeStorerTest, GetDetectedFastCountTypeReturnsReplicated) {
-    ASSERT_OK(replicated_fast_count::createReplicatedFastCountCollection(storageInterface(),
-                                                                         operationContext()));
+    createReplicatedFastCountContainers(operationContext());
     ValidateState validateState(operationContext(), kNss, kValidationOptions);
     EXPECT_EQ(validateState.getDetectedFastCountType(operationContext()),
               FastCountType::replicated);
@@ -64,6 +74,38 @@ TEST_F(ValidateStateWithoutSizeStorerTest, GetDetectedFastCountTypeReturnsReplic
 TEST_F(ValidateStateWithoutSizeStorerTest, GetDetectedFastCountTypeReturnsNeither) {
     ValidateState validateState(operationContext(), kNss, kValidationOptions);
     EXPECT_EQ(validateState.getDetectedFastCountType(operationContext()), FastCountType::neither);
+}
+
+TEST(ValidationOptionsToBSONTest, ReportsModeAndRepairMode) {
+    const ValidationOptions options(ValidateMode::kCollectionHash, RepairMode::kNone, false);
+    const BSONObj obj = options.toBSON();
+    EXPECT_EQ(obj["mode"].String(), "collectionHash");
+    EXPECT_EQ(obj["repairMode"].String(), "none");
+    EXPECT_FALSE(obj["repair"].Bool());
+    EXPECT_FALSE(obj["fixMultikey"].Bool());
+    EXPECT_FALSE(obj["logDiagnostics"].Bool());
+}
+
+TEST(ValidationOptionsToBSONTest, ReportsSliceTargetAndSizeStats) {
+    const ValidationOptions options(ValidateMode::kForegroundFull,
+                                    RepairMode::kFixErrors,
+                                    true,
+                                    currentValidationVersion,
+                                    boost::none,
+                                    boost::none,
+                                    boost::none,
+                                    boost::none,
+                                    /*targetRecordsPerRecordStoreSlice=*/5000,
+                                    /*sizeStats=*/true);
+    const BSONObj obj = options.toBSON();
+    EXPECT_EQ(obj["mode"].String(), "foregroundFull");
+    EXPECT_EQ(obj["repairMode"].String(), "fixErrors");
+    EXPECT_TRUE(obj["repair"].Bool());
+    // kFixErrors implies kAdjustMultikey.
+    EXPECT_TRUE(obj["fixMultikey"].Bool());
+    EXPECT_TRUE(obj["logDiagnostics"].Bool());
+    EXPECT_TRUE(obj["sizeStats"].Bool());
+    EXPECT_EQ(obj["targetRecordsPerRecordStoreSlice"].numberLong(), 5000);
 }
 
 TEST(FastCountTypeToStringTest, Works) {
@@ -160,8 +202,7 @@ TEST_P(ShouldEnforceFastCountAndSizeTest, ShouldEnforceFastCountAndSize) {
     }
 
     if (p.createRfcCollection) {
-        ASSERT_OK(replicated_fast_count::createReplicatedFastCountCollection(storageInterface(),
-                                                                             operationContext()));
+        createReplicatedFastCountContainers(operationContext());
     }
 
     ValidateState validateState(operationContext(), kNss, kValidationOptions);

@@ -3,28 +3,6 @@
 
 #include "mongo/crypto/fle_crypto.h"
 
-#include <absl/container/node_hash_map.h>
-#include <absl/meta/type_traits.h>
-#include <boost/cstdint.hpp>
-#include <boost/exception/exception.hpp>
-#include <boost/multiprecision/cpp_int.hpp>
-#include <boost/multiprecision/cpp_int/bitwise.hpp>
-#include <boost/multiprecision/cpp_int/comparison.hpp>
-#include <boost/multiprecision/cpp_int/divide.hpp>
-#include <boost/multiprecision/cpp_int/limits.hpp>
-#include <boost/multiprecision/cpp_int/literals.hpp>
-#include <boost/multiprecision/cpp_int/multiply.hpp>
-#include <boost/optional.hpp>
-// IWYU pragma: no_include "boost/multiprecision/detail/default_ops.hpp"
-// IWYU pragma: no_include "boost/multiprecision/detail/integer_ops.hpp"
-// IWYU pragma: no_include "boost/multiprecision/detail/no_et_ops.hpp"
-// IWYU pragma: no_include "boost/multiprecision/detail/number_base.hpp"
-// IWYU pragma: no_include "boost/multiprecision/detail/number_compare.hpp"
-#include <boost/move/utility_core.hpp>
-#include <boost/multiprecision/number.hpp>
-#include <boost/none.hpp>
-#include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -40,6 +18,23 @@
 #include <type_traits>
 #include <variant>
 #include <vector>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/cstdint.hpp>
+#include <boost/exception/exception.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/multiprecision/cpp_int.hpp>
+#include <boost/multiprecision/cpp_int/bitwise.hpp>
+#include <boost/multiprecision/cpp_int/comparison.hpp>
+#include <boost/multiprecision/cpp_int/divide.hpp>
+#include <boost/multiprecision/cpp_int/limits.hpp>
+#include <boost/multiprecision/cpp_int/literals.hpp>
+#include <boost/multiprecision/cpp_int/multiply.hpp>
+#include <boost/multiprecision/number.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 
 extern "C" {
 #include <mc-fle2-payload-iev-private-v2.h>
@@ -96,6 +91,12 @@ extern "C" {
 #include "mongo/util/debug_util.h"
 #include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
+// IWYU pragma: no_include "boost/multiprecision/detail/default_ops.hpp"
+// IWYU pragma: no_include "boost/multiprecision/detail/integer_ops.hpp"
+// IWYU pragma: no_include "boost/multiprecision/detail/no_et_ops.hpp"
+// IWYU pragma: no_include "boost/multiprecision/detail/number_base.hpp"
+// IWYU pragma: no_include "boost/multiprecision/detail/number_compare.hpp"
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
@@ -2947,8 +2948,24 @@ FLE2IndexedRangeEncryptedValueV2::getMetadataBlocks() const {
 FLE2IndexedTextEncryptedValue::FLE2IndexedTextEncryptedValue()
     : _value(mc_FLE2IndexedEncryptedValueV2_new()) {}
 
+void FLE2IndexedTextEncryptedValue::verifyTotalTagCountIsWithinLimit(ConstDataRange toParse) {
+    constexpr size_t kCountsOffset = 1 + 16 + 1;  // fle_blob_subtype + key_uuid + bson_type
+    constexpr size_t kMinHeaderSize = kCountsOffset + 3 * sizeof(uint32_t);
+    uassert(12773700,
+            "Encountered a buffer with invalid length for a FLE2IndexedTextEncryptedValue",
+            toParse.length() >= kMinHeaderSize);
+
+    ConstDataRangeCursor cursor(toParse);
+    cursor.advance(kCountsOffset);
+    auto edgeCount = cursor.readAndAdvance<LittleEndian<uint32_t>>();
+    uassert(12773701,
+            "FLE2IndexedTextEncryptedValue contains tags that exceed the tag limit",
+            edgeCount <= EncryptionInformationHelpers::kFLE2PerFieldTagLimit);
+}
+
 FLE2IndexedTextEncryptedValue::FLE2IndexedTextEncryptedValue(ConstDataRange toParse)
     : _value(mc_FLE2IndexedEncryptedValueV2_new()) {
+    verifyTotalTagCountIsWithinLimit(toParse);
     auto buf = MongoCryptBuffer::borrow(toParse);
     MongoCryptStatus status;
     mc_FLE2IndexedEncryptedValueV2_parse(_value.get(), buf.get(), status);
@@ -3685,6 +3702,25 @@ void EncryptionInformationHelpers::checkTagLimitsAndStorageNotExceeded(
                     totalTagStorage,
                     BSONObjMaxUserSize),
         shouldOverrideTotalTagOverheadLimit || totalTagStorage <= BSONObjMaxUserSize);
+}
+
+void EncryptionInformationHelpers::checkMaxContentionFactorNotExceeded(int64_t contention) {
+    uassert(ErrorCodes::BadValue,
+            fmt::format("contention factor ({}) must be >= 0", contention),
+            contention >= 0);
+    uassert(ErrorCodes::BadValue,
+            fmt::format("contention factor ({}) exceeds the maximum allowed value ({})",
+                        contention,
+                        kFLEMaxContentionFactor),
+            contention <= kFLEMaxContentionFactor);
+}
+
+void EncryptionInformationHelpers::checkMaxContentionFactorNotExceeded(
+    const EncryptedFieldConfig& ef) {
+    visitQueryTypeConfigs(ef, [](const EncryptedField&, const QueryTypeConfig& qtc) {
+        EncryptionInformationHelpers::checkMaxContentionFactorNotExceeded(qtc.getContention());
+        return false;
+    });
 }
 
 void EncryptionInformationHelpers::checkSubstringParameterLimitsNotExceeded(

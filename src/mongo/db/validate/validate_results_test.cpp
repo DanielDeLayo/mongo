@@ -13,6 +13,7 @@
 #include "mongo/util/uuid.h"
 
 #include <algorithm>
+#include <limits>
 #include <vector>
 
 namespace mongo {
@@ -149,31 +150,32 @@ TEST(ValidateResultsTest, MissingAndExtraEntriesKeepsAtLeastOne) {
     ASSERT_BSONOBJ_EQ(obj2, vr.getExtraIndexEntries().front());
 }
 
-TEST(ValidateResultsTest, MissingAndExtraEntriesCreateErrorsWhenSizeExceeded) {
+TEST(ValidateResultsTest, MissingAndExtraEntriesCreateWarningsWhenSizeExceeded) {
     ValidateResults vr;
     auto obj = BSON("x" << std::string(2 * 1024 * 1024, 'a'));
 
     // First addition, no evictions.
     vr.addMissingIndexEntry(obj);
     vr.addExtraIndexEntry(obj);
-    ASSERT_TRUE(vr.getErrors().empty());
+    ASSERT_TRUE(vr.getWarnings().empty());
 
     // Now we evict something.
     vr.addMissingIndexEntry(obj);
-    ASSERT_EQ(1, vr.getErrors().size());
-    ASSERT_TRUE(vr.getErrors().contains(
+    ASSERT_EQ(1, vr.getWarnings().size());
+    ASSERT_TRUE(vr.getWarnings().contains(
         "Not all missing index entry inconsistencies are listed due to size limitations."));
 
     // Multiple evictions -> still 1 error.
     vr.addMissingIndexEntry(obj);
-    ASSERT_EQ(1, vr.getErrors().size());
+    ASSERT_EQ(1, vr.getWarnings().size());
 
     // But 1 for each missing/extra
     vr.addExtraIndexEntry(obj);
-    ASSERT_EQ(2, vr.getErrors().size());
-    ASSERT_TRUE(vr.getErrors().contains(
+    ASSERT_TRUE(vr.getErrors().empty());
+    ASSERT_EQ(2, vr.getWarnings().size());
+    ASSERT_TRUE(vr.getWarnings().contains(
         "Not all missing index entry inconsistencies are listed due to size limitations."));
-    ASSERT_TRUE(vr.getErrors().contains(
+    ASSERT_TRUE(vr.getWarnings().contains(
         "Not all extra index entry inconsistencies are listed due to size limitations."));
 }
 
@@ -323,6 +325,146 @@ TEST(ValidateResultsTest, MergeIsCommutative) {
     EXPECT_EQ(ab.getIndexResultsMap().at("idx").getErrors().size(), 2);  // ie_a, ie_b
     EXPECT_EQ(ab.getIndexResultsMap().at("idx").getKeysTraversed(), 11);
     EXPECT_EQ(ab.getIndexResultsMap().at("idx2").getKeysTraversed(), 9);
+}
+
+TEST(ValidateResultsTest, MergeCombinesXxh3CollectionHashWithXor) {
+    const auto uuid = UUID::gen();
+    const auto nss = NamespaceString::createNamespaceString_forTest("test.coll");
+
+    auto make = [&](boost::optional<uint64_t> hash) {
+        ValidateResults vr;
+        vr.setUUID(uuid);
+        vr.setNamespaceString(nss);
+        if (hash) {
+            vr.setXxh3CollectionHash(*hash);
+        }
+        return vr;
+    };
+
+    // Two ranges of the same collection combine into the XOR of their hashes, in either order.
+    ValidateResults ab = make(0x1234);
+    ab.merge(make(0x00ff));
+    ValidateResults ba = make(0x00ff);
+    ba.merge(make(0x1234));
+    ASSERT_TRUE(ab.getXxh3CollectionHash().has_value());
+    EXPECT_EQ(*ab.getXxh3CollectionHash(), uint64_t{0x1234 ^ 0x00ff});
+    EXPECT_TRUE(ab.getXxh3CollectionHash() == ba.getXxh3CollectionHash());
+
+    // A result that never got far enough to compute a hash adopts the other one's.
+    ValidateResults adopted = make(boost::none);
+    adopted.merge(make(0x1234));
+    ASSERT_TRUE(adopted.getXxh3CollectionHash().has_value());
+    EXPECT_EQ(*adopted.getXxh3CollectionHash(), uint64_t{0x1234});
+
+    ValidateResults kept = make(0x1234);
+    kept.merge(make(boost::none));
+    ASSERT_TRUE(kept.getXxh3CollectionHash().has_value());
+    EXPECT_EQ(*kept.getXxh3CollectionHash(), uint64_t{0x1234});
+
+    ValidateResults neither = make(boost::none);
+    neither.merge(make(boost::none));
+    EXPECT_FALSE(neither.getXxh3CollectionHash().has_value());
+}
+
+TEST(ValidateResultsTest, RecordHashComparisonReportsAMatch) {
+    ValidateResults vr;
+    EXPECT_TRUE(vr.recordHashComparison(/*accumulated=*/0x1234, /*expected=*/int64_t{0x1234}));
+
+    ASSERT_TRUE(vr.getHashComparison().has_value());
+    EXPECT_EQ(toString(*vr.getHashComparison()), "matched");
+    EXPECT_TRUE(vr.getWarnings().empty());
+
+    BSONObjBuilder bob;
+    vr.appendToResultObj(&bob, /*debugging=*/false);
+    EXPECT_FALSE(bob.obj().hasField("xxh3AllDiff"));
+}
+
+TEST(ValidateResultsTest, RecordHashComparisonWarnsOnMismatch) {
+    ValidateResults vr;
+    vr.setXxh3CollectionHash(0x1234);
+    EXPECT_FALSE(vr.recordHashComparison(/*accumulated=*/0x1234, /*expected=*/int64_t{0x4321}));
+
+    ASSERT_TRUE(vr.getHashComparison().has_value());
+    EXPECT_EQ(toString(*vr.getHashComparison()), "mismatched");
+    EXPECT_EQ(vr.getWarnings().size(), 1);
+
+    // A divergence is surfaced, but the comparison has enough moving parts that it must not by
+    // itself declare the collection invalid.
+    EXPECT_TRUE(vr.isValid());
+
+    // Everything an operator acts on has to reach the reply, not just the results object.
+    BSONObjBuilder bob;
+    vr.appendToResultObj(&bob, /*debugging=*/false);
+    const BSONObj obj = bob.obj();
+    EXPECT_EQ(obj.getField("expectedXxh3All").Long(), 0x4321);
+    EXPECT_EQ(obj.getField("hashComparison").String(), "mismatched");
+    // Folding the diff into the replicated metadata system's hash yields the accumulated one.
+    EXPECT_EQ(obj.getField("xxh3AllDiff").Long(), int64_t{0x1234} ^ int64_t{0x4321});
+    EXPECT_EQ(obj.getField("warnings").Array().size(), 1u);
+    EXPECT_TRUE(obj.getField("valid").Bool());
+}
+
+TEST(ValidateResultsTest, Xxh3CollectionHashDiffKeepsItsBitsWhenReported) {
+    // BSON has no unsigned 64-bit type, so a diff with the high bit set is reported as a negative
+    // long long carrying the same bits.
+    const uint64_t accumulated = 0xffff'ffff'ffff'fffeULL;
+    const int64_t expected = 1;
+
+    ValidateResults vr;
+    vr.setXxh3CollectionHash(accumulated);
+    EXPECT_FALSE(vr.recordHashComparison(accumulated, expected));
+
+    BSONObjBuilder bob;
+    vr.appendToResultObj(&bob, /*debugging=*/false);
+    const BSONObj obj = bob.obj();
+    const auto elem = obj.getField("xxh3AllDiff");
+    EXPECT_EQ(elem.type(), BSONType::numberLong);
+    EXPECT_EQ(static_cast<uint64_t>(elem.Long()), accumulated ^ static_cast<uint64_t>(expected));
+}
+
+TEST(ValidateResultsTest, HighBitHashesMatchRatherThanFalselyDiverging) {
+    // Above INT64_MAX unsigned and negative signed. If the conversion between the accumulated and
+    // expected hashes ever clamped instead of preserving the bit pattern, two identical hashes
+    // would be reported as diverged and a healthy collection would look corrupt.
+    constexpr uint64_t kHighBitHash = 0x8000000000000001ULL;
+
+    ValidateResults vr;
+    EXPECT_TRUE(vr.recordHashComparison(kHighBitHash, static_cast<int64_t>(kHighBitHash)));
+    EXPECT_TRUE(vr.getWarnings().empty());
+
+    BSONObjBuilder bob;
+    vr.setXxh3CollectionHash(kHighBitHash);
+    vr.appendToResultObj(&bob, /*debugging=*/false);
+    const BSONObj obj = bob.obj();
+    EXPECT_EQ(obj.getField("xxh3All").Long(), obj.getField("expectedXxh3All").Long());
+}
+
+TEST(ValidateResultsTest, Xxh3CollectionHashIsReportedAsALong) {
+    ValidateResults vr;
+    // Small enough to fit in an int, which is where a narrowing append would change the type.
+    vr.setXxh3CollectionHash(0);
+
+    BSONObjBuilder bob;
+    vr.appendToResultObj(&bob, /*debugging=*/false);
+    const BSONObj obj = bob.obj();
+    const auto elem = obj.getField("xxh3All");
+    EXPECT_EQ(elem.type(), BSONType::numberLong);
+    EXPECT_EQ(elem.Long(), 0);
+}
+
+TEST(ValidateResultsTest, Xxh3CollectionHashKeepsItsBitsWhenReported) {
+    ValidateResults vr;
+    // BSON has no unsigned 64-bit type, so a hash with the high bit set is reported as a negative
+    // long long carrying the same bits, which is how the replicated collection hash stores it too.
+    const uint64_t hash = 0xffff'ffff'ffff'fffeULL;
+    vr.setXxh3CollectionHash(hash);
+
+    BSONObjBuilder bob;
+    vr.appendToResultObj(&bob, /*debugging=*/false);
+    const BSONObj obj = bob.obj();
+    const auto elem = obj.getField("xxh3All");
+    EXPECT_EQ(elem.type(), BSONType::numberLong);
+    EXPECT_EQ(static_cast<uint64_t>(elem.Long()), hash);
 }
 
 TEST(ValidateResultsTest, MergeThrowsAndIsAtomicOnSpecMismatch) {

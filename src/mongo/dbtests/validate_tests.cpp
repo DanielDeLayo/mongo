@@ -218,7 +218,7 @@ protected:
 
         forceCheckpoint(_background);
         ASSERT_OK(collection_validation::validate(
-            &_opCtx, _nss, ValidationOptions{mode, repairMode, kLogDiagnostics}, &results));
+            &_opCtx, _nss, ValidationOptions{mode, repairMode, kLogDiagnostics}, results));
 
         //  Check if errors are reported if and only if valid is set to false.
         ASSERT_EQ(results.isValid(), totalErrors(results) == 0);
@@ -1246,7 +1246,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -1355,7 +1355,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -1430,7 +1430,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -1529,7 +1529,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -1559,7 +1559,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kFixErrors,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -1596,7 +1596,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kFixErrors,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -1711,7 +1711,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -1743,7 +1743,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kFixErrors,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -1773,7 +1773,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -1854,7 +1854,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -1887,7 +1887,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kFixErrors,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -1916,7 +1916,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -2069,7 +2069,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -2100,7 +2100,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kFixErrors,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -2165,7 +2165,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -2333,7 +2333,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -2367,7 +2367,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kFixErrors,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -2435,7 +2435,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -2703,7 +2703,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -2734,7 +2734,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kFixErrors,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -2802,7 +2802,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -2932,7 +2932,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -2964,7 +2964,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kFixErrors,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -2997,7 +2997,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kFixErrors,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -3366,8 +3366,7 @@ public:
         }
 
         // Encode an invalid BSON Object with an invalid type, x90 and insert record
-        const char* buffer = "\x0c\x00\x00\x00\x90\x41\x00\x10\x00\x00\x00\x00";
-        BSONObj obj(buffer);
+        auto bufferStr = "\x0c\x00\x00\x00\x90\x41\x00\x10\x00\x00\x00\x00"sv;
         lockDb(MODE_X);
         RecordStore* rs = coll()->getRecordStore();
         RecordId rid;
@@ -3375,8 +3374,8 @@ public:
             beginTransaction();
             auto swRecordId = rs->insertRecord(&_opCtx,
                                                *shard_role_details::getRecoveryUnit(&_opCtx),
-                                               obj.objdata(),
-                                               obj.objsize(),
+                                               bufferStr.data(),
+                                               bufferStr.size(),
                                                timestampToUse);
             ASSERT_OK(swRecordId);
             rid = swRecordId.getValue();
@@ -3405,7 +3404,7 @@ public:
                 &_opCtx,
                 _nss,
                 ValidationOptions{mode, collection_validation::RepairMode::kNone, kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -3443,30 +3442,27 @@ public:
 
         // Encode BSON Objects with invalid type x90, size less than 5 bytes, and BSON length and
         // object size mismatch, respectively. Insert invalid BSON objects into record store.
-        const char* buf1 = "\x0c\x00\x00\x00\x90\x41\x00\x10\x00\x00\x00\x00";
-        const char* buf2 = "\x04\x00\x00\x00\x90\x41\x00\x10\x00\x00\x00\x00";
-        const char* buf3 = "\x0f\x00\x00\x00\x00\x41\x00\x10\x00\x00\x00\x00";
-        BSONObj obj1(buf1);
-        BSONObj obj2(buf2);
-        BSONObj obj3(buf3);
+        auto buf1 = "\x0c\x00\x00\x00\x90\x41\x00\x10\x00\x00\x00\x00"sv;
+        auto buf2 = "\x04\x00\x00\x00\x90\x41\x00\x10\x00\x00\x00\x00"sv;
+        auto buf3 = "\x0f\x00\x00\x00\x00\x41\x00\x10\x00\x00\x00\x00"sv;
         lockDb(MODE_X);
         RecordStore* rs = coll()->getRecordStore();
         {
             beginTransaction();
             ASSERT_OK(rs->insertRecord(&_opCtx,
                                        *shard_role_details::getRecoveryUnit(&_opCtx),
-                                       obj1.objdata(),
-                                       12ULL,
+                                       buf1.data(),
+                                       buf1.size(),
                                        timestampToUse));
             ASSERT_OK(rs->insertRecord(&_opCtx,
                                        *shard_role_details::getRecoveryUnit(&_opCtx),
-                                       obj2.objdata(),
-                                       12ULL,
+                                       buf2.data(),
+                                       buf2.size(),
                                        timestampToUse));
             ASSERT_OK(rs->insertRecord(&_opCtx,
                                        *shard_role_details::getRecoveryUnit(&_opCtx),
-                                       obj3.objdata(),
-                                       12ULL,
+                                       buf3.data(),
+                                       buf3.size(),
                                        timestampToUse));
             commitTransaction();
         }
@@ -3483,7 +3479,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -3515,7 +3511,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kFixErrors,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -3551,7 +3547,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kFixErrors,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -3580,7 +3576,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -3756,7 +3752,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -3786,7 +3782,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kFixErrors,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -3817,7 +3813,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kFixErrors,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -3977,7 +3973,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -4007,7 +4003,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kFixErrors,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -4034,7 +4030,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -4140,7 +4136,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kAdjustMultikey,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -4177,7 +4173,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kAdjustMultikey,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -4287,7 +4283,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -4416,7 +4412,7 @@ public:
             ValidationOptions{collection_validation::ValidateMode::kForeground,
                               collection_validation::RepairMode::kNone,
                               kLogDiagnostics},
-            &results));
+            results));
 
         EXPECT_FALSE(results.isValid());
 
@@ -4543,7 +4539,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -4684,7 +4680,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -4807,7 +4803,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForeground,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -4841,8 +4837,7 @@ public:
         ASSERT(coll());
 
         // Encode an invalid BSON Object with an invalid type, x90 and insert record
-        const char* buffer = "\x0c\x00\x00\x00\x90\x41\x00\x10\x00\x00\x00\x00";
-        BSONObj obj(buffer);
+        auto bufferStr = "\x0c\x00\x00\x00\x90\x41\x00\x10\x00\x00\x00\x00"sv;
 
         RecordStore* rs = coll()->getRecordStore();
         RecordId rid({OID::gen().view().view(), OID::kOIDSize});
@@ -4851,8 +4846,8 @@ public:
             ASSERT_OK(rs->insertRecord(&_opCtx,
                                        *shard_role_details::getRecoveryUnit(&_opCtx),
                                        rid,
-                                       obj.objdata(),
-                                       obj.objsize(),
+                                       bufferStr.data(),
+                                       bufferStr.size(),
                                        timestampToUse));
             commitTransaction();
         }
@@ -4879,7 +4874,7 @@ public:
                 &_opCtx,
                 _nss,
                 ValidationOptions{mode, collection_validation::RepairMode::kNone, kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -4970,7 +4965,7 @@ public:
                 &_opCtx,
                 _nss,
                 ValidationOptions{mode, collection_validation::RepairMode::kNone, kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -5250,7 +5245,7 @@ public:
                 &_opCtx,
                 _nss,
                 ValidationOptions{mode, collection_validation::RepairMode::kNone, kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -5293,7 +5288,7 @@ public:
                 _nss,
                 ValidationOptions{
                     mode, collection_validation::RepairMode::kFixErrors, kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);
@@ -5398,7 +5393,7 @@ public:
                 ValidationOptions{collection_validation::ValidateMode::kForegroundFull,
                                   collection_validation::RepairMode::kNone,
                                   kLogDiagnostics},
-                &results));
+                results));
 
             ScopeGuard dumpOnErrorGuard([&] {
                 StorageDebugUtil::printValidateResults(results);

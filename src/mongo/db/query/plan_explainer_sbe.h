@@ -12,8 +12,10 @@
 #include "mongo/db/query/compiler/optimizer/cost_based_ranker/estimates_storage.h"
 #include "mongo/db/query/compiler/physical_model/query_solution/query_solution.h"
 #include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/explain_policy.h"
 #include "mongo/db/query/plan_cache/plan_cache_debug_info.h"
 #include "mongo/db/query/plan_explainer.h"
+#include "mongo/db/query/plan_ranking/plan_selection_strategy.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/sbe_plan_ranker.h"
 #include "mongo/db/query/stage_builder/sbe/builder_data.h"
@@ -21,6 +23,7 @@
 #include "mongo/util/duration.h"
 #include "mongo/util/modules.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -36,7 +39,7 @@ namespace mongo {
  * optimization.
  */
 struct JoinOptPlan {
-    // Note: these fields are are owned here.
+    // Note: these fields are owned here.
     std::unique_ptr<QuerySolution> soln;
     std::unique_ptr<sbe::PlanStage> stage;
     stage_builder::PlanStageData data;
@@ -54,7 +57,9 @@ public:
                          RemoteExplainVector* remoteExplains,
                          bool usedJoinOpt = false,
                          cost_based_ranker::EstimateMap estimates = {},
-                         std::vector<JoinOptPlan> rejectedPlans = {});
+                         std::vector<JoinOptPlan> rejectedPlans = {},
+                         boost::optional<PlanSelectionStrategy> planSelectionStrategy = boost::none,
+                         boost::optional<size_t> preExtensionWinningPlanHash = boost::none);
 
     bool isSbeExplainer() const final {
         return true;
@@ -68,6 +73,9 @@ public:
     bool matchesCachedPlan() const;
     std::string getPlanSummary() const final;
     void getSummaryStats(PlanSummaryStats* statsOut) const final;
+    boost::optional<PlanSelectionStrategy> getPlanSelectionStrategy() const final {
+        return _planSelectionStrategy;
+    }
     void getSecondarySummaryStats(const NamespaceString& secondaryColl,
                                   PlanSummaryStats* statsOut) const override;
     PlanStatsDetails getWinningPlanStats(ExplainOptions::Verbosity verbosity) const final;
@@ -114,7 +122,11 @@ protected:
     const bool _isMultiPlan{false};
     const bool _isFromPlanCache{false};
     const bool _usedJoinOpt{false};
+    const boost::optional<PlanSelectionStrategy> _planSelectionStrategy{boost::none};
     const boost::optional<size_t> _cachedPlanHash{boost::none};
+    // Winning solution's hash before pipeline extension; see PlanExplainerData. Reported as
+    // 'solutionHashUnstable' so the winning plan can be re-selected with forcedPlanSolutionHash.
+    const boost::optional<size_t> _preExtensionWinningPlanHash{boost::none};
     // Pre-computed debugging info so we don't necessarily have to collect them from QuerySolution.
     // All plans recovered from the same cached entry share the same debug info.
     const std::shared_ptr<const plan_cache_debug_info::DebugInfoSBE> _debugInfo;
@@ -138,22 +150,62 @@ public:
         bool usedJoinOpt = false,
         cost_based_ranker::EstimateMap estimates = {},
         std::vector<JoinOptPlan> rejectedPlans = {},
-        boost::optional<PlanExplainerData> maybeExplainData = boost::none);
+        boost::optional<PlanExplainerData> maybeExplainData = boost::none,
+        boost::optional<PlanSelectionStrategy> planSelectionStrategy = boost::none);
 
     PlanStatsDetails getWinningPlanTrialStats() const final;
     std::vector<PlanStatsDetails> getRejectedPlansStats(
         ExplainOptions::Verbosity verbosity) const final;
+
+    /**
+     * The V3 per-plan view for a query run through SBE, drawn from one of two sources.
+     *
+     * Normally it is delegated to the embedded classic explainer, whose entries are the trial trees
+     * the classic runtime planner ranked. Otherwise the plan is described by its QuerySolution
+     * alone (e.g. if there is a single solution or via the subplanner).
+     *
+     */
+    std::vector<ExplainPlanEntry> getPlanEntries(
+        const ExplainPolicy& policy,
+        PlanStatsFormat format,
+        PlanSelectionStrategy decidingPlanRanker) const final;
+
     boost::optional<StringMap<cost_based_ranker::SamplingMetadata>> getCeSamplingMetadata()
         const override;
+    boost::optional<StringMap<std::vector<ce::PersistedNDVEntry>>> getFieldStatsMetadata()
+        const override;
     boost::optional<uint32_t> getJoinPlanCacheKeyHash() const override;
+    boost::optional<PlanRankerReason> getPlanRankerReason() const override {
+        return _planRankerReason;
+    }
 
 private:
+    /**
+     * Serializes 'solution' into a V3 plan entry using the QuerySolution-derived node shape. Used
+     * for the plans that never ran a multi-planning trial, so the entry carries no trial
+     * statistics.
+     */
+    ExplainPlanEntry makeQsnPlanEntry(const QuerySolution& solution,
+                                      const ExplainPolicy& policy,
+                                      const cost_based_ranker::EstimateMap& estimates) const;
+
+    /**
+     * Attaches the SBE-only, winner-only content (the compiled SBE tree) to the first entry of
+     * 'entries'. A no-op on an empty vector.
+     */
+    void attachWinnerSbeInfo(const ExplainPolicy& policy,
+                             std::vector<ExplainPlanEntry>& entries) const;
+
     // Using a pointer to a MultiPlanStage, we can create a classic PlanExplainerImpl from which we
     // can extract the necessary information regarding the classic multi-planner's trial period
     // using the same format as we would for the classic engine.
     const std::unique_ptr<PlanStage> _classicRuntimePlannerStage;
     boost::optional<StringMap<cost_based_ranker::SamplingMetadata>> _ceSamplingMetadata;
+    boost::optional<StringMap<std::vector<ce::PersistedNDVEntry>>> _fieldStatsMetadata;
     boost::optional<uint32_t> _joinPlanCacheKeyHash;
+    // Copied out of the incoming PlanExplainerData for the same reason as the two fields above: the
+    // data is moved into the embedded classic explainer, which does not exist on every path.
+    boost::optional<PlanRankerReason> _planRankerReason;
     // Do not call getCeSamplingMetadata() on this explainer; it returns boost::none because
     // ceSamplingMetadata is copied into _ceSamplingMetadata above. Callers should use
     // getCeSamplingMetadata() on PlanExplainerClassicRuntimePlannerForSBE instead.
@@ -164,5 +216,18 @@ private:
 void statsToBSON(const QuerySolutionNode* node,
                  BSONObjBuilder* bob,
                  const BSONObjBuilder* topLevelBob,
-                 const cost_based_ranker::EstimateMap& estimates = {});
+                 const cost_based_ranker::EstimateMap& estimates = {},
+                 std::uint32_t currentDepth = 0);
+
+/**
+ * Serializes the QuerySolution tree rooted at 'node' in the V3 explain node shape.
+ *
+ * 'topLevelBob' tracks the size of the overall explain object for the size guard.
+ */
+void statsToBsonV3(const QuerySolutionNode* node,
+                   const ExplainPolicy& explainPolicy,
+                   const cost_based_ranker::EstimateMap& estimates,
+                   BSONObjBuilder* bob,
+                   const BSONObjBuilder* topLevelBob,
+                   std::uint32_t currentDepth = 0);
 }  // namespace mongo

@@ -4,10 +4,10 @@
 #pragma once
 
 #include "mongo/db/exec/sbe/expressions/sbe_fn_names.h"
+#include "mongo/db/exec/sbe/stages/extract_field_paths.h"
 #include "mongo/db/exec/sbe/stages/fetch.h"
 #include "mongo/db/exec/sbe/stages/loop_join.h"
 #include "mongo/db/exec/sbe/stages/scan.h"
-#include "mongo/db/exec/sbe/stages/window.h"
 #include "mongo/db/exec/sbe/values/path_request.h"
 #include "mongo/db/query/stage_builder/sbe/builder_state.h"
 #include "mongo/db/query/stage_builder/sbe/gen_abt_helpers.h"
@@ -96,6 +96,11 @@ inline SbIndexInfoType operator~(SbIndexInfoType t) {
     return static_cast<SbIndexInfoType>(~static_cast<uint32_t>(t));
 }
 
+/**
+ * Bounds for a single-range or unbounded scan that the stage builder turns into a ScanStage (or
+ * a GenericScanStage when both slots are absent). For non-contiguous multi-range scans, pass in
+ * the RecordIdRangeList object directly instead.
+ */
 struct SbScanBounds {
     boost::optional<SbSlot> minRecordIdSlot;
     boost::optional<SbSlot> maxRecordIdSlot;
@@ -285,11 +290,6 @@ public:
     sbe::SlotExprPairVector lower(SbExprSlotVector& sbSlotSbExprVec,
                                   const VariableTypes* varTypes = nullptr);
 
-    sbe::WindowStage::Window lower(SbWindow& sbWindow, const VariableTypes* varTypes = nullptr);
-
-    std::vector<sbe::WindowStage::Window> lower(std::vector<SbWindow>& sbWindows,
-                                                const VariableTypes* varTypes = nullptr);
-
 protected:
     StageBuilderState& _state;
 };
@@ -311,15 +311,25 @@ public:
         _nodeId = nodeId;
     }
 
-    std::tuple<SbStage, SbSlot, SbSlot, SbSlotVector> makeScan(
-        UUID collectionUuid,
-        DatabaseName dbName,
-        bool forward = true,
-        std::vector<std::string> scanFieldNames = {},
-        const SbScanBounds& scanBounds = {},
-        const SbIndexInfoSlots& indexInfoSlots = {},
-        sbe::ScanOpenCallback scanOpenCallback = {},
-        boost::optional<SbSlot> oplogTsSlot = boost::none);
+    using MakeScanResult = std::tuple<SbStage, SbSlot, SbSlot, SbSlotVector>;
+
+    MakeScanResult makeScan(UUID collectionUuid,
+                            DatabaseName dbName,
+                            bool forward = true,
+                            std::vector<std::string> scanFieldNames = {},
+                            const SbScanBounds& scanBounds = {},
+                            const SbIndexInfoSlots& indexInfoSlots = {},
+                            sbe::ScanOpenCallback scanOpenCallback = {},
+                            boost::optional<SbSlot> oplogTsSlot = boost::none);
+
+    // Multi-range overload: produces a MultiRangeClusteredScanStage.
+    MakeScanResult makeScan(UUID collectionUuid,
+                            DatabaseName dbName,
+                            bool forward,
+                            std::vector<std::string> scanFieldNames,
+                            RecordIdRangeList scanBounds,
+                            const SbIndexInfoSlots& indexInfoSlots = {},
+                            sbe::ScanOpenCallback scanOpenCallback = {});
 
     std::tuple<SbStage, SbSlot, SbSlotVector, SbIndexInfoSlots> makeSimpleIndexScan(
         UUID collectionUuid,
@@ -524,29 +534,6 @@ public:
                                                      SbStage stage,
                                                      SbBlockAggExprVector sbBlockAggExprs);
 
-    SbStage makeWindow(SbStage stage,
-                       const SbSlotVector& currSlots,
-                       const SbSlotVector& boundTestingSlots,
-                       size_t partitionSlotCount,
-                       std::vector<SbWindow> windows,
-                       boost::optional<sbe::value::SlotId> collatorSlot) {
-        return makeWindow(VariableTypes{},
-                          std::move(stage),
-                          currSlots,
-                          boundTestingSlots,
-                          partitionSlotCount,
-                          std::move(windows),
-                          collatorSlot);
-    }
-
-    SbStage makeWindow(const VariableTypes& varTypes,
-                       SbStage stage,
-                       const SbSlotVector& currSlots,
-                       const SbSlotVector& boundTestingSlots,
-                       size_t partitionSlotCount,
-                       std::vector<SbWindow> windows,
-                       boost::optional<sbe::value::SlotId> collatorSlot);
-
     std::tuple<SbStage, SbSlot, SbSlot> makeUnwind(SbStage stage,
                                                    SbSlot inputSlot,
                                                    bool preserveNullAndEmptyArrays);
@@ -716,6 +703,10 @@ public:
                                const SbIndexInfoSlots& indexInfoSlots,
                                sbe::FetchCallbacks scanCallbacks);
 
+    SbStage makeExtractFieldPaths(SbStage child,
+                                  std::vector<sbe::PathSlot> inputs,
+                                  std::vector<sbe::PathSlot> outputs,
+                                  PlanNodeId nodeId);
 
 protected:
     SbIndexInfoSlots allocateIndexInfoSlots(SbIndexInfoType indexInfoTypeMask,

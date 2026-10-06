@@ -11,15 +11,115 @@
 #include "mongo/db/query/compiler/ce/sampling/sampling_estimator.h"
 #include "mongo/db/query/multiple_collection_accessor.h"
 #include "mongo/db/query/plan_yield_policy_sbe.h"
+#include "mongo/db/query/query_knobs/query_knob_configuration.h"
 #include "mongo/db/query/query_optimization_knobs_gen.h"
 #include "mongo/db/query/stage_builder/sbe/builder_data.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/util/modules.h"
+#include "mongo/util/string_map.h"
+
+#include <functional>
+#include <utility>
 
 namespace mongo::ce {
 /**
+ * Represents the top-level fields that must be present in a sample.
+ */
+class TopLevelSampleFields {
+public:
+    /**
+     * Creates a set that represents all fields.
+     */
+    static TopLevelSampleFields allFields() {
+        return {};
+    }
+
+    explicit TopLevelSampleFields(StringSet fieldNames) : _fieldNames(std::move(fieldNames)) {}
+
+    bool needsAllFields() const {
+        return _fieldNames == kAllFields;
+    }
+
+    /**
+     * Only valid when not all fields are needed.
+     */
+    const StringSet& fieldNames() const;
+
+    /**
+     * Adds the fields of 'other' to 'this'. If either side needs all fields, marks 'this' as
+     * needing all fields.
+     */
+    void merge(TopLevelSampleFields other);
+
+    /**
+     * Helper to construct relevant indexes for the query planner.
+     */
+    boost::optional<StringSet&> relevantIndexOutput();
+
+    /**
+     * Helper to construct projection params from these top level fields.
+     */
+    ProjectionParams toProjectionParams() &&;
+
+private:
+    // boost::none denotes that all fields are needed.
+    static inline const boost::optional<StringSet> kAllFields = boost::none;
+
+    TopLevelSampleFields() = default;
+
+    boost::optional<StringSet> _fieldNames = kAllFields;
+};
+
+/**
  * Helper function to extract the top level fields from a given MatchExpression.
  */
-StringSet extractTopLevelFieldsFromMatchExpression(const MatchExpression* expr);
+TopLevelSampleFields extractTopLevelFieldsFromMatchExpression(const MatchExpression* expr);
+
+/**
+ * The canonically (lexicographically) sorted field paths a persisted NDV statistic describes.
+ */
+using SortedFieldPaths = std::vector<std::string>;
+
+/**
+ * Caches persisted NDV statistics for one estimator, and therefore for one query's planning:
+ * plan enumeration costs the same join edge in many candidate orders, so estimateNDV() is
+ * called with the same field paths many times within one optimization. Caching the compact
+ * document summary per sorted path set and the estimate per (path set, sketch variant) makes
+ * only the first such call read the statistics document. Nothing is shared across queries.
+ */
+class PersistedNDVStatsCache {
+public:
+    /**
+     * Returns the memoized estimate for the given path set and sketch variant, or nullptr when
+     * none was stored yet. The pointee may be an empty optional: misses are memoized too.
+     */
+    const boost::optional<CardinalityEstimate>* findEstimate(const SortedFieldPaths& sortedPaths,
+                                                             size_t sketchIndex) const;
+
+    void storeEstimate(const SortedFieldPaths& sortedPaths,
+                       size_t sketchIndex,
+                       boost::optional<CardinalityEstimate> estimate);
+
+    /**
+     * Returns the cached document summary for the given path set, invoking 'load' on the first
+     * request. The entry is boost::none when no usable document exists; that outcome is cached
+     * as well, so an absent document is looked up only once.
+     */
+    const boost::optional<PersistedNDVEntry>& getOrLoadDoc(
+        const SortedFieldPaths& sortedPaths,
+        const std::function<boost::optional<PersistedNDVEntry>()>& load);
+
+private:
+    // Loaded statistics (including misses) per sorted path set as compact PersistedNDVEntry
+    // summaries (no 16KB sketch registers), so serving several folding variants of one statistic
+    // reads the document once.
+    stdx::unordered_map<SortedFieldPaths, boost::optional<PersistedNDVEntry>> _docs;
+    // Persisted-NDV estimates (including misses), keyed by the sorted field paths plus the
+    // folding variant the request's equality semantics select, so repeated estimateNDV() calls
+    // during plan enumeration do not recompute.
+    stdx::unordered_map<std::pair<SortedFieldPaths, size_t>, boost::optional<CardinalityEstimate>>
+        _estimates;
+};
 
 /**
  * This CE Estimator estimates cardinality of predicates by running a filter/MatchExpression against
@@ -39,32 +139,9 @@ public:
         const MultipleCollectionAccessor& collections,
         SamplingSourceEnum samplingSource = SamplingSourceEnum::kPersistentSample);
 
-    /**
-     * 'opCtx' is used to create a new CanonicalQuery for the sampling SBE plan.
-     * 'collections' is needed to create a sampling SBE plan. 'samplingStyle' is the on-the-fly
-     * method used when no persisted sample is loaded. 'samplingSource' controls whether to try
-     * reading a persistent sample from `<db>.system.stats.samples` before falling back to
-     * on-the-fly SBE sampling; 'analyze' passes kOnTheFlySample to bypass the persisted read.
-     * 'persistentSampleMethod' independently picks which sampling technique to look for in the
-     * persisted samples collection. Prefer the factory method above outside tests.
-     */
-    SamplingEstimatorImpl(
-        OperationContext* opCtx,
-        const MultipleCollectionAccessor& collections,
-        const NamespaceString& nss,
-        PlanYieldPolicy::YieldPolicy yieldPolicy,
-        SamplingCEMethodEnum samplingStyle,
-        CardinalityEstimate collectionCard,
-        SamplingConfidenceIntervalEnum ci,
-        double marginOfError,
-        boost::optional<int> numChunks,
-        boost::intrusive_ptr<const ExpressionContext> customerQueryExpCtx,
-        SamplingSourceEnum samplingSource = SamplingSourceEnum::kPersistentSample,
-        SamplingCEMethodEnum persistentSampleMethod = PersistentSampleCEMethod::kDataDefault);
-
     /*
-     * Lets the caller specify an exact sample size, e.g. for a smaller preliminary-analysis
-     * sample. Prefer the factory method above outside tests.
+     * Lets the caller specify an exact sample size. Prefer the factory method above for most use
+     * cases outside tests.
      */
     SamplingEstimatorImpl(
         OperationContext* opCtx,
@@ -102,13 +179,6 @@ public:
      * sample.
      */
     CardinalityEstimate estimateCardinality(const MatchExpression* expr) const override;
-
-    /**
-     * Batch Estimates the Cardinality of a vector of filter/MatchExpression by running the given
-     * MEs against the sample.
-     */
-    std::vector<CardinalityEstimate> estimateCardinality(
-        const std::vector<const MatchExpression*>& expr) const override;
 
     /**
      * Estimates the number of keys scanned for the given IndexBounds. This function extracts all
@@ -196,6 +266,12 @@ public:
      */
     SamplingMetadata getSamplingMetadata() const final;
 
+    std::vector<PersistedNDVEntry> getPersistedNDVMetadata() const final;
+
+    size_t getNumPersistedNDVStatsUsed() const final {
+        return _persistedNDVStatsUsed.size();
+    }
+
     /**
      * For each document in a given sample, this helper calculates the number of
      * index keys which satisfy 'bounds', which may be >1 in the case of multi-key
@@ -270,14 +346,13 @@ public:
     }
 
     /*
-     * The sample size is calculated based on the confidence level and margin of error(MoE)
-     * required.  n = Z^2 / W^2
-     * where Z is the z-score for the confidence interval and
-     * W is the width of the confidence interval, W = 2 * MoE.
+     * Returns the sample size as set by the relevant knobs. Unless overridden, calculated from
+     * confidence interval and margin of error:
+     * n = Z^2 / W^2
+     * where Z is the z-score for the confidence interval
+     * and W is the width of the confidence interval, W = 2 * MoE.
      */
-    static size_t calculateSampleSize(SamplingConfidenceIntervalEnum ci,
-                                      double marginOfError,
-                                      int32_t sampleSizeOverride = 0);
+    static size_t calculateSampleSize(const QueryKnobConfiguration& qkc);
 
     /**
      * TODO SERVER-129240: Remove this helper once types are unified
@@ -341,6 +416,14 @@ protected:
     // Lazily computed on the first estimateNDV() call. Counts the number of documents with
     // distinct _id values in the sample to detect duplicates from sampling with replacement.
     mutable boost::optional<size_t> _uniqueDocCount;
+    // Lazily computed on the first estimateNDV() call: whether persisted NDV statistics may be
+    // served (feature flag and knob).
+    mutable boost::optional<bool> _persistentNDVEnabled;
+    // Caches loaded statistics documents and memoized estimates for this estimator.
+    mutable PersistedNDVStatsCache _persistedNDVCache;
+    // Field paths whose NDV was served from persisted statistics; surfaced in explain via
+    // getSamplingMetadata().
+    mutable std::vector<PersistedNDVEntry> _persistedNDVStatsUsed;
     // Set to true when tryLoadPersistentSample() successfully loads sample from stats collection.
     bool _wasSamplePersisted = false;
     SamplingCEMethodEnum _persistentSampleMethod;
@@ -348,6 +431,41 @@ protected:
     SamplingCEMethodEnum _samplingStyle;
 
 private:
+    /**
+     * Serves the NDV from persisted field statistics (built by analyze mode "ndv") when
+     * eligible: feature flag and knob enabled, at most kNdvMaxFields fields and no bounds.
+     * The request's equality semantics select the persisted folding variant; composite requests
+     * folding several fields have none and are ineligible. Returns boost::none when ineligible
+     * or when no usable statistics exist; the caller then falls back to the sample-based
+     * estimate. Loaded documents are cached per sorted path set and results, including misses,
+     * are memoized per path set and variant.
+     */
+    boost::optional<CardinalityEstimate> tryEstimateNDVFromPersistentStats(
+        const std::vector<FieldPathAndEqSemantics>& fields,
+        boost::optional<std::span<const OrderedIntervalList>> bounds) const;
+
+    /**
+     * Whether persisted NDV statistics may be served, i.e. featureFlagPersistentStats and the
+     * internalQueryEnablePersistentNDVStats knob are both enabled. Computed once per instance.
+     */
+    bool persistentNDVStatsEnabled() const;
+
+    /**
+     * Picks the persisted sketch variant a request's equality semantics need: 0 for the strict
+     * tuple sketch, i + 1 for the variant folding the i-th sorted field. Returns boost::none
+     * when no persisted variant can serve the request (several folded fields).
+     */
+    boost::optional<size_t> selectPersistedNDVSketchIndex(
+        const std::vector<std::pair<std::string, bool>>& sortedFields,
+        const SortedFieldPaths& sortedPaths) const;
+
+    /**
+     * Loads and validates the field-stats document for the given sorted path set, returning a
+     * compact summary, or boost::none when no usable document exists.
+     */
+    boost::optional<PersistedNDVEntry> loadPersistedNDVStats(const SortedFieldPaths& sortedPaths,
+                                                             size_t numFields) const;
+
     /**
      * Constructs a sampling SBE plan using the random-walk method.
      * The SBE plan consists of a sbe::ScanStage which uses a random cursor to read documents
@@ -441,6 +559,9 @@ private:
     size_t _requestedSampleSize = 0;
     // The actual sampling strategy used. Set by generateSample() before dispatch.
     boost::optional<SamplingTechniqueEnum> _usedSamplingTechnique;
+
+    // Only set when tryLoadPersistentSample() successfully loads a persisted sample.
+    boost::optional<size_t> _numPages;
 };
 
 }  // namespace mongo::ce

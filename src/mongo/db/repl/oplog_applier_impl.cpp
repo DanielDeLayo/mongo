@@ -3,7 +3,6 @@
 
 #include "mongo/db/repl/oplog_applier_impl.h"
 
-// IWYU pragma: no_include "cxxabi.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
@@ -83,6 +82,7 @@
 #include <boost/none.hpp>
 #include <boost/optional.hpp>
 #include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
@@ -348,6 +348,11 @@ void _dispatchTxnOpsToWriterVectors(OperationContext* opCtx,
                                     std::vector<std::vector<ApplierOperation>>* writerVectors,
                                     CachedCollectionProperties* collPropertiesCache,
                                     RetryImageRectifier* retryImageRectifier) {
+    // Split multi-key container ops so that each key is hashed to a writer thread on its own. This
+    // must happen after any aggregation over 'txnOps' (affected namespaces, size metadata), which
+    // counts packed entries once.
+    OplogApplierUtils::expandBatchedContainerOps(txnOps);
+
     auto& extractedOps = retryImageRectifier->storeExtractedOpsAndDeletes(
         std::move(txnOps), derivedOps, op->shouldPrepare());
 
@@ -1085,7 +1090,20 @@ void OplogApplierImpl::_deriveOpsAndFillWriterVectors(
 
         // Extract applyOps operations and fill writers with extracted operations.
         if (op.isTerminalApplyOps()) {
-            if (op.applyOpsIsLinkedTransactionally()) {
+            // A retryable terminal without 'count' is a single-entry batch with no chain: extract
+            // it directly rather than walk the oplog once per statement on every secondary.
+            const bool isLinked = op.applyOpsIsLinkedTransactionally();
+            const bool isSingleEntryRetryableBatch = isLinked &&
+                op.getMultiOpType() == MultiOplogEntryType::kApplyOpsAppliedAtomically &&
+                op.getObject()["count"].eoo();
+            if (isSingleEntryRetryableBatch) {
+                // Anything cached would be dropped by skipping the walk.
+                tassert(13423904,
+                        "Single-entry retryable batch has cached partial operations",
+                        getPartialTxnList(op)->empty());
+            }
+
+            if (isLinked && !isSingleEntryRetryableBatch) {
                 // On commit of unprepared transactions, get transactional operations from the
                 // oplog and fill writers with those operations.
                 // Flush partialTxnList operations for current transaction.
@@ -1100,8 +1118,10 @@ void OplogApplierImpl::_deriveOpsAndFillWriterVectors(
                 invariant(partialTxnList->empty(), op.toStringForLogging());
             } else {
                 // The applyOps entry was not generated as part of a transaction.
+                auto applyOpsOps = ApplyOps::extractOperations(op);
+                OplogApplierUtils::expandBatchedContainerOps(applyOpsOps);
                 auto& extractedOps = retryImageRectifier.storeExtractedOpsAndDeletes(
-                    ApplyOps::extractOperations(op), derivedOps, false /* isPrepared */);
+                    std::move(applyOpsOps), derivedOps, false /* isPrepared */);
 
                 // Nested entries cannot have different session updates.
                 OplogApplierUtils::addDerivedOps(
@@ -1133,6 +1153,22 @@ void OplogApplierImpl::_deriveOpsAndFillWriterVectors(
                                              &retryImageRectifier);
             invariant(partialTxnList->empty(), op.toStringForLogging());
             continue;
+        }
+
+        // A container op logged outside of an applyOps may still pack multiple keys, which have to
+        // be split apart before they can be hashed to writer threads individually.
+        if (derivedOps && op.isContainerOpType()) {
+            // Note an empty expansion is not the same as no expansion: it means the op was packed
+            // but had no keys, so it is dropped rather than applied as it is.
+            if (auto expandedOps = OplogApplierUtils::expandBatchedContainerOp(op)) {
+                derivedOps->emplace_back(std::move(*expandedOps));
+                OplogApplierUtils::addDerivedOps(opCtx,
+                                                 &derivedOps->back(),
+                                                 writerVectors,
+                                                 &collPropertiesCache,
+                                                 false /*serial*/);
+                continue;
+            }
         }
 
         OplogApplierUtils::addToWriterVector(opCtx, &op, writerVectors, &collPropertiesCache);

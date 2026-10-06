@@ -341,6 +341,20 @@ server_parameters:
             gte: 0
         redact: false
 
+    enableInitialSyncCleanShutdownCheck:
+        description: >-
+            Whether an initial syncing node checks its sync source for clean shutdowns that could
+            have rolled back writes the node has already cloned. Settable at runtime so that a sync
+            source can be deliberately restarted during an initial sync without having to restart
+            the syncing node, which would discard the attempt's progress. This value is read at
+            the start of each initial sync attempt, so any changes to this parameter will not be in
+            effect until the next initial sync attempt.
+        set_at: [startup, runtime]
+        cpp_vartype: Atomic<bool>
+        cpp_varname: enableInitialSyncCleanShutdownCheck
+        default: true
+        redact: false
+
     oplogNetworkTimeoutBufferSeconds:
         description: >-
             Number of seconds to add to the `find` and `getMore` timeouts for oplog fetching to
@@ -728,51 +742,55 @@ server_parameters:
         default: 30000
         redact: false
 
-    initialSyncWaitForSyncSourceLastStableRecoveryTs:
+    minWaitForStreamingHelloMillis:
         description: >-
-            If true, during initial sync, we will wait for the sync source to advance its lastStableRecoveryTimestamp
-            to our beginApplyingTimestamp before starting collection cloning. This is to prevent a bug where we may miss
-            documents during collection clone if our sync source restarts. Please see SERVER-113184 for more details.
-            IMPORTANT: Turning this server parameter off will introduce risk for inconsistent data after initial sync.
-            Only turn this off if initial sync is unable to wait for sync source propagation, and run data consistency
-            validation after initial sync completes.
+            Minimum timeout in milliseconds for pre-auth streamable hello commands.
+            If a client supplies a maxAwaitTimeMS below this value, the server will
+            either abort the operation or clamp the timeout to this floor, depending
+            on the value of abortStreamingHelloWithSmallTimeout.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<long long>
+        cpp_varname: minWaitForStreamingHelloMillis
+        default: 500
+        validator:
+            gte: 0
+        redact: false
+
+    abortStreamingHelloWithSmallTimeout:
+        description: >-
+            When true, pre-auth streamable hello commands with a maxAwaitTimeMS below
+            minWaitForStreamingHelloMillis will fail. When false, the server will
+            clamp the effective timeout to minWaitForStreamingHelloMillis instead.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<bool>
+        cpp_varname: abortStreamingHelloWithSmallTimeout
+        default: false
+        redact: false
+
+    continuousInternodeValidationFatalOnMismatch:
+        description: >-
+            When true, a hash mismatch detected by continuous internode validation crashes the
+            node, unless the node is still in STARTUP or STARTUP2, where the mismatch is only
+            logged so that a mismatch reproducing from the last checkpoint cannot turn into a
+            startup crash loop. When false, the mismatch is only logged in every state.
         set_at: [startup, runtime]
         cpp_vartype: Atomic<bool>
-        cpp_varname: initialSyncWaitForSyncSourceLastStableRecoveryTs
+        cpp_varname: continuousInternodeValidationFatalOnMismatch
         default: true
         redact: false
 
-    initialSyncWaitForSyncSourceLastStableRecoveryTsRetryPeriodSecs:
+    disableContinuousInternodeValidation:
         description: >-
-            The amount of time in seconds that the node will wait for the node's sync source to advance its lastStableRecoveryTimestamp
-            to our beginApplyingTimestamp. No effect if 'initialSyncWaitForSyncSourceLastStableRecoveryTs' is set to false. Default
-            wait period of 10 minutes.
+            Emergency override that turns continuous internode validation off even when the
+            persistence provider mandates it, disabling both the per-document hashes written to the
+            oplog and their verification during oplog application. Intended as a mitigation lever:
+            once validation has been skipped for any window of writes, the divergence it would have
+            caught cannot be recovered by setting this back to false, and any accumulated
+            per-collection hash must be recomputed from scratch.
         set_at: [startup, runtime]
-        cpp_vartype: Atomic<int>
-        cpp_varname: initialSyncWaitForSyncSourceLastStableRecoveryTsRetryPeriodSecs
-        default:
-            expr: 60 * 10
-        validator:
-            gte: 0
-        redact: false
-
-    initialSyncWaitForSyncSourceLastStableRecoveryTsInitiatingSetThresholdSecs:
-        description: >-
-            If the earliest oplog entry on the sync source is the "initiating set" entry and the
-            sync source's lastStableRecoveryTimestamp is within this many seconds of that entry,
-            initial sync skips waiting for the stable recovery timestamp to advance and resets
-            beginApplyingTimestamp back to the initiating set entry. The default is 0, which requires
-            an exact match: the skip fires only when the stable recovery timestamp is still at the
-            initiating-set entry, the all-at-once replSetInitiate case where the primary cannot
-            self-commit and it stays pinned there for all of initial sync. Retained (settable at
-            runtime) as an escape hatch to widen the window. No effect if
-            'initialSyncWaitForSyncSourceLastStableRecoveryTs' is set to false.
-        set_at: [startup, runtime]
-        cpp_vartype: Atomic<int>
-        cpp_varname: initialSyncWaitForSyncSourceLastStableRecoveryTsInitiatingSetThresholdSecs
-        default: 0
-        validator:
-            gte: 0
+        cpp_vartype: Atomic<bool>
+        cpp_varname: disableContinuousInternodeValidation
+        default: false
         redact: false
 
 feature_flags:

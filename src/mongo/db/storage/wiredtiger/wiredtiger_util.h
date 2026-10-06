@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/rss/persistence_provider.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_error_util.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_event_handler.h"
@@ -10,6 +11,7 @@
 #include "mongo/db/validate/validate_results.h"
 #include "mongo/util/modules.h"
 
+#include <cstdint>
 #include <span>
 #include <string_view>
 
@@ -79,6 +81,8 @@ public:
     static constexpr std::string_view kFileUriPrefix = "file:"sv;
     // Suffix of the file backing the stable (checkpointed) table of a disaggregated ident.
     static constexpr std::string_view kStableFileSuffix = ".wt_stable"sv;
+    static constexpr std::string_view kSharedHistoryStoreFileUri =
+        "file:WiredTigerSharedHS.wt_stable"sv;
     static constexpr double memoryThresholdPercentage = 0.8;
 
     static std::string buildTableUri(std::string_view ident);
@@ -228,6 +232,13 @@ public:
     static Status checkTableCreationOptions(const BSONElement& configElem);
 
     /**
+     * Rejects a WiredTiger config string that enables 'import', or that sets 'source' to anything
+     * but empty. Mongod never sets 'source' itself, so empty is the only value that should ever
+     * appear here.
+     */
+    static Status checkConfigStringBannedKeys(std::string_view config);
+
+    /**
      * Reads individual statistics using URI.
      * List of statistics keys WT_STAT_* can be found in wiredtiger.h.
      */
@@ -242,6 +253,21 @@ public:
                                                            const std::string& uri,
                                                            const std::string& config,
                                                            int statisticsKey);
+
+    /**
+     * Reads back the per-b-tree size summary that a debug=(size_stats) cursor accumulated onto the
+     * b-tree backing 'tableUri' as it traversed, and emits it as a single log line. The URI
+     * included in the log line is the on-disk file backing the b-tree not 'tableUri'.
+     */
+    static void logStorageSizeStats(WiredTigerSession& session, const std::string& tableUri);
+
+    static constexpr int kLeafPageSizeHistogramMaxBuckets = 9;
+
+    // Zero publishedBuckets/publishedCeiling: 9 buckets, ceiling maxLeafPage.
+    static BSONArray buildLeafPageSizeHistogram(int64_t publishedBuckets,
+                                                int64_t publishedCeiling,
+                                                int64_t maxLeafPage,
+                                                std::span<const int64_t> bucketCounts);
 
     static int64_t getEphemeralIdentSize(WiredTigerSession& session, const std::string& uri);
 
@@ -370,7 +396,7 @@ public:
     /**
      * Truncates the table identified by uri, removing all entries from it.
      */
-    static void truncate(WiredTigerRecoveryUnit& ru, std::string_view uri);
+    static void truncate(WiredTigerRecoveryUnit& ru, const std::string& uri);
 
     static uint64_t genTableId();
 

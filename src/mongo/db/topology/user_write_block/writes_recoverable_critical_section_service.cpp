@@ -21,8 +21,6 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/shard_role/lock_manager/d_concurrency.h"
 #include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
-#include "mongo/db/shard_role/shard_catalog/collection.h"
-#include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
 #include "mongo/db/shard_role/transaction_resources.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/topology/cluster_role.h"
@@ -89,6 +87,20 @@ void setBlockUserWritesDocumentField(OperationContext* opCtx,
              << NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault())),
         BSON("$set" << BSON(UserWriteBlockingCriticalSectionDocument::kBlockUserWritesFieldName
                             << blockUserWrites)),
+        ShardingCatalogClient::writeConcernLocalHavingUpstreamWaiter());
+}
+
+void setAllowDeletionsDocumentField(OperationContext* opCtx,
+                                    const NamespaceString& nss,
+                                    bool allowDeletions) {
+    PersistentTaskStore<ReplicaSetWriteBlockingCriticalSectionDocument> store(
+        NamespaceString::kReplicaSetWritesCriticalSectionsNamespace);
+    store.update(
+        opCtx,
+        BSON(ReplicaSetWriteBlockingCriticalSectionDocument::kNssFieldName
+             << NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault())),
+        BSON("$set" << BSON(ReplicaSetWriteBlockingCriticalSectionDocument::kAllowDeletionsFieldName
+                            << allowDeletions)),
         ShardingCatalogClient::writeConcernLocalHavingUpstreamWaiter());
 }
 
@@ -466,7 +478,7 @@ void UserWritesRecoverableCriticalSectionService::
     LOGV2_DEBUG(6351911, 2, "Released user writes recoverable critical section", logAttrs(nss));
 }
 
-void UserWritesRecoverableCriticalSectionService::recoverRecoverableCriticalSections(
+void UserWritesRecoverableCriticalSectionService::recoverUserWritesCriticalSection(
     OperationContext* opCtx) {
     if (MONGO_unlikely(skipRecoverUserWriteCriticalSections.shouldFail())) {
         return;
@@ -495,23 +507,50 @@ void UserWritesRecoverableCriticalSectionService::recoverRecoverableCriticalSect
 
         return true;
     });
+}
 
+void UserWritesRecoverableCriticalSectionService::recoverReplicaSetWritesCriticalSection(
+    OperationContext* opCtx) {
     // Recover the persisted replica set writes critical section documents and restore the
     // state into memory.
     PersistentTaskStore<ReplicaSetWriteBlockingCriticalSectionDocument> replicaSetWritesStore(
         NamespaceString::kReplicaSetWritesCriticalSectionsNamespace);
+    auto* replicaSetWriteBlockState = ReplicaSetWriteBlockState::get(opCtx);
+    bool foundReplicaSetWritesCriticalSection = false;
     replicaSetWritesStore.forEach(
-        opCtx, BSONObj{}, [&opCtx](const ReplicaSetWriteBlockingCriticalSectionDocument& doc) {
+        opCtx, BSONObj{}, [&](const ReplicaSetWriteBlockingCriticalSectionDocument& doc) {
             invariant(doc.getNss().isEmpty());
+            foundReplicaSetWritesCriticalSection = true;
+
             if (doc.getEnabled()) {
-                ReplicaSetWriteBlockState::get(opCtx)->enableReplicaSetWriteBlocking(
+                replicaSetWriteBlockState->enableReplicaSetWriteBlocking(
                     doc.getReplicaSetWritesBlockReason());
+            } else {
+                replicaSetWriteBlockState->disableReplicaSetWriteBlocking();
             }
-            if (!doc.getAllowDeletions()) {
-                ReplicaSetWriteBlockState::get(opCtx)->enableReplicaSetDeletionsBlocking();
+
+            if (doc.getAllowDeletions()) {
+                replicaSetWriteBlockState->disableReplicaSetDeletionsBlocking();
+            } else {
+                replicaSetWriteBlockState->enableReplicaSetDeletionsBlocking();
             }
+
             return true;
         });
+    if (!foundReplicaSetWritesCriticalSection) {
+        replicaSetWriteBlockState->disableReplicaSetWriteBlocking();
+        replicaSetWriteBlockState->disableReplicaSetDeletionsBlocking();
+    }
+}
+
+void UserWritesRecoverableCriticalSectionService::recoverRecoverableCriticalSections(
+    OperationContext* opCtx) {
+    if (MONGO_unlikely(skipRecoverUserWriteCriticalSections.shouldFail())) {
+        return;
+    }
+
+    recoverUserWritesCriticalSection(opCtx);
+    recoverReplicaSetWritesCriticalSection(opCtx);
 
     LOGV2_DEBUG(6351913,
                 2,
@@ -581,9 +620,71 @@ void UserWritesRecoverableCriticalSectionService::
                 "reason"_attr = reasonText(reason));
 
     if (!allowDeletions) {
-        opCtx->getServiceContext()->getStorageEngine()->pauseOrResumeAutoCompactForWriteBlock(
-            opCtx, true /* pause */);
+        opCtx->getServiceContext()->getStorageEngine()->pauseAutoCompactForReplicaSetWritesBlock(
+            opCtx);
     }
+}
+
+bool UserWritesRecoverableCriticalSectionService::updateAllowDeletionsForActiveReplicaSetWriteBlock(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    bool allowDeletions,
+    ReplicaSetWritesBlockReasonEnum reason) {
+    LOGV2_DEBUG(12096706,
+                3,
+                "Updating allowDeletions for replica set writes recoverable critical section",
+                logAttrs(nss),
+                "allowDeletions"_attr = allowDeletions,
+                "reason"_attr = reasonText(reason));
+
+    invariant(nss == kBlockReplicaSetWritesNamespace);
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
+
+    {
+        // In-flight deletes that started under allowDeletions:true may still complete, while
+        // new deletes are rejected once the OpObserver commits the updated policy.
+        Lock::GlobalLock globalLock(opCtx, MODE_IX);
+
+        const auto bsonObj = findRecoverableCriticalSectionDoc(
+            opCtx, NamespaceString::kReplicaSetWritesCriticalSectionsNamespace, nss);
+        if (bsonObj.isEmpty()) {
+            return false;
+        }
+
+        const auto collCSDoc = ReplicaSetWriteBlockingCriticalSectionDocument::parse(
+            bsonObj, IDLParserContext("UpdateReplicaSetWritesCS"));
+        uassert(ErrorCodes::IllegalOperation,
+                str::stream() << "Cannot update replica set writes critical section when it is "
+                                 "not enabled",
+                collCSDoc.getEnabled());
+        uassert(
+            ErrorCodes::IllegalOperation,
+            str::stream() << "Cannot update replica set writes critical section with a different "
+                             "reason. reason: "
+                          << reasonText(reason) << ", current: "
+                          << reasonText(collCSDoc.getReplicaSetWritesBlockReason()),
+            collCSDoc.getReplicaSetWritesBlockReason() == reason);
+
+        if (collCSDoc.getAllowDeletions() == allowDeletions) {
+            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
+            return true;
+        }
+
+        setAllowDeletionsDocumentField(opCtx, nss, allowDeletions);
+    }
+
+    if (!allowDeletions) {
+        opCtx->getServiceContext()->getStorageEngine()->pauseAutoCompactForReplicaSetWritesBlock(
+            opCtx);
+    }
+
+    LOGV2_DEBUG(13365900,
+                2,
+                "Updated allowDeletions for replica set writes recoverable critical section",
+                logAttrs(nss),
+                "allowDeletions"_attr = allowDeletions,
+                "reason"_attr = reasonText(reason));
+    return true;
 }
 
 void UserWritesRecoverableCriticalSectionService::
@@ -610,24 +711,5 @@ void UserWritesRecoverableCriticalSectionService::
 
     LOGV2_DEBUG(
         12096407, 2, "Released replica set writes recoverable critical section", logAttrs(nss));
-
-    // Resume auto-compaction if it was paused when the replica set write block was acquired,
-    // recomputing the current oplog ident.
-    std::string oplogIdent;
-    {
-        Lock::GlobalLock lk{
-            opCtx,
-            MODE_IS,
-            Date_t::max(),
-            Lock::InterruptBehavior::kThrow,
-            Lock::GlobalLockOptions{.skipFlowControlTicket = true, .skipRSTLLock = true}};
-        if (auto collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
-                opCtx, NamespaceString::kRsOplogNamespace)) {
-            oplogIdent = collection->getSharedIdent()->getIdent();
-        }
-    }
-
-    opCtx->getServiceContext()->getStorageEngine()->pauseOrResumeAutoCompactForWriteBlock(
-        opCtx, false /* pause */, oplogIdent);
 }
 }  // namespace mongo

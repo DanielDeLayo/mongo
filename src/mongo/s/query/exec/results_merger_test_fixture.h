@@ -25,6 +25,8 @@
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/s/query/exec/async_results_merger.h"
 #include "mongo/s/query/exec/async_results_merger_params_gen.h"
@@ -36,7 +38,9 @@
 #include "mongo/util/duration.h"
 #include "mongo/util/modules.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/str.h"
 
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -48,6 +52,10 @@
 #include <boost/move/utility_core.hpp>
 #include <boost/none.hpp>
 #include <boost/optional/optional.hpp>
+
+#ifndef MONGO_LOGV2_DEFAULT_COMPONENT
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+#endif
 
 namespace mongo {
 
@@ -387,6 +395,83 @@ protected:
         net->exitNetwork();
     }
 
+    // Advance any operations scheduled on 'opCtx's baton, because otherwise they would wait
+    // forever. In these fixtures the baton is not driven by a transport layer, so work scheduled on
+    // it (including SubBaton timers armed by the ARM's attached retry path) only progresses when
+    // something explicitly calls 'Baton::run'. This schedules a sentinel task and runs the baton
+    // until that sentinel completes, which implicitly waits for all previously scheduled work
+    // (and fires any timers whose deadline the mock clock has passed) to run first. Pair with
+    // 'advanceTime()' / 'getMockClockSource()->advance()' to move the mock clock past a timer
+    // deadline before calling this.
+    //
+    // WARNING: never call this while another thread may be blocked in a wait on the same opCtx's
+    // baton (e.g. a BlockingResultsMerger::next() running on a 'launchAsync' thread, which parks
+    // in the baton via 'waitForEvent'). DefaultBaton's _sleeping/_notified/notify_one protocol
+    // assumes a single runner; a second concurrent runner can consume the one-shot notification
+    // or steal queued jobs (including this helper's own sentinel), after which no thread will ever
+    // notify the baton again and both threads deadlock.
+    void runScheduledTasks(OperationContext* opCtx) {
+        Atomic<bool> didRun{false};
+        auto baton = opCtx->getBaton();
+        auto clockSource = opCtx->getServiceContext()->getPreciseClockSource();
+
+        // Schedule a sentinel that runs only after all previously scheduled tasks have run. Waiting
+        // for the sentinel to complete thus waits for all earlier baton work, too.
+        baton->schedule([&](Status status) { didRun.store(true); });
+        while (!didRun.load()) {
+            baton->run(clockSource);
+        }
+    }
+
+    /**
+     * Sleep-poll until 'pred' holds (max ~10s), emitting a progress log line every 100 polls so a
+     * masked hang fails this test loudly instead of consuming the suite's timeout. On exhausting
+     * the budget, run 'unwind' to release whatever thread the wait depends on, then FAIL. Callers
+     * should interrupt an opCtx if a worker may be parked in next(), or pump callbacks if a kill
+     * thread is in flight; never call kill() from unwind.
+     *
+     * 'onEachStep' runs between polls - in case the caller needs to do something like invoke
+     * 'runReadyCallbacks()' when the condition depends on an executor task.
+     */
+    template <std::predicate Pred, std::invocable EachStep, std::invocable Unwind>
+    void waitForCondition(Pred pred, EachStep onEachStep, std::string what, Unwind unwind) {
+        static const auto timeBudget = Seconds{10};
+        const auto deadline = Date_t::now() + timeBudget;
+        size_t iterations = 0;
+        while (!pred() && Date_t::now() < deadline) {
+            if (++iterations % 100 == 0) {
+                LOGV2(13556400,
+                      "waitForCondition: {what} (iterations={iterations})",
+                      "what"_attr = what,
+                      "iterations"_attr = iterations);
+            }
+            sleepmillis(1);
+            onEachStep();
+        }
+        if (!pred()) {
+            unwind();
+            FAIL(str::stream() << "Timed out after " << timeBudget.toString() << " and "
+                               << iterations << " polls: " << what);
+        }
+    }
+
+    /**
+     * Waits until the ARM has scheduled the killCursors command for an open cursor (proving it
+     * has progressed past its cancel step). If the wait's budget is exhausted, a kill thread is
+     * already in flight, so 'kill()' cannot be re-entered; instead flush ready callbacks so
+     * that thread's future gets signaled and it can unwind before the wait FAILs (see
+     * 'waitForCondition').
+     */
+    void waitForKillCursorsIssued() {
+        waitForCondition(
+            [this] {
+                return networkHasReadyRequests() && getNthPendingRequest(0u).cmdObj["killCursors"];
+            },
+            [] {},
+            "Waiting for killCursors command to be scheduled",
+            [this] { runReadyCallbacks(); });
+    }
+
     void blackHoleNextRequest() {
         executor::NetworkInterfaceMock* net = network();
         net->enterNetwork();
@@ -425,3 +510,5 @@ protected:
 };
 
 }  // namespace mongo
+
+#undef MONGO_LOGV2_DEFAULT_COMPONENT

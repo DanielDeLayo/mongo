@@ -20,11 +20,11 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_explainer.h"
 #include "mongo/db/query/plan_insert_listener.h"
+#include "mongo/db/query/plan_ranking/plan_selection_strategy.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/restore_context.h"
 #include "mongo/db/query/stage_builder/classic_stage_builder.h"
-#include "mongo/db/query/write_conflict_storm.h"
 #include "mongo/db/query/write_ops/update_result.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/router_role/routing_cache/shard_cannot_refresh_due_to_locks_held_exception.h"
@@ -65,8 +65,6 @@ template <typename F, typename H>
     invariant(shard_role_details::getRecoveryUnit(opCtx));
     invariant(!expCtx->getTemporarilyUnavailableException());
 
-    // We do not catch ErrorCodes::WriteConflictRetryLimitExceeded. It is thrown to escape
-    // this template so the adaptive retry limit can fire.
     try {
         return f();
     } catch (const ExceptionFor<ErrorCodes::WriteConflict>&) {
@@ -134,7 +132,8 @@ public:
                      PlanYieldPolicy::YieldPolicy yieldPolicy,
                      boost::optional<size_t> cachedPlanHash,
                      boost::optional<std::string> replanReason,
-                     boost::optional<PlanExplainerData> maybeExplainData);
+                     boost::optional<PlanExplainerData> maybeExplainData,
+                     boost::optional<PlanSelectionStrategy> planSelectionStrategy = boost::none);
 
     ~PlanExecutorImpl() override;
     CanonicalQuery* getCanonicalQuery() const final;
@@ -196,12 +195,6 @@ public:
     }
 
     /**
-     * Returns the current value of the process-wide WCE-retry-streak waiter gauge. Test-only
-     * accessor; production code reads the gauge via `Atomic64Metric` through serverStatus.
-     */
-    static int32_t getWriteConflictRetryWaiterCount_forTest();
-
-    /**
      * It is used to detect if the plan executor obtained after multiplanning is using a distinct
      * scan stage. That's because in this scenario modifications to the pipeline in the context of
      * aggregation need to be made.
@@ -253,11 +246,9 @@ public:
 
 private:
     // Co-locates per-call state passed between the two work loops and _handleNeedYield.
-    // Non-copyable/non-movable because it owns a WCStormWaiterGuard.
     struct WriteConflictRetryState {
         size_t writeConflictsInARow = 0;
         size_t tempUnavailErrorsInARow = 0;
-        WCStormWaiterGuard streakGuard;
     };
 
     const QuerySolution* getQuerySolution() const {
@@ -317,8 +308,6 @@ private:
     void doWaitDuringYield();
     void logWriteConflictAndBackoff(size_t numAttempts);
 
-    std::unique_ptr<insert_listener::Notifier> makeNotifier();
-
     // The OperationContext that we're executing within. This can be updated if necessary by using
     // detachFromOperationContext() and reattachToOperationContext().
     OperationContext* _opCtx;
@@ -343,6 +332,9 @@ private:
 
     // Whether the executor must return owned BSON.
     bool _mustReturnOwnedBson;
+
+    // Whether the query requested recordId metadata. Fixed once planning completes.
+    const bool _mustSetRecordIdMetadata;
 
     // If the current operation was "softly" interrupted. Will be set if a configured response
     // deadline is reached. Cleared upon every 'reattachToOperationContext()' call.

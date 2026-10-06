@@ -81,6 +81,8 @@ std::string builtinToString(Builtin b) {
             return "addToArrayCapped";
         case Builtin::mergeObjects:
             return "mergeObjects";
+        case Builtin::mergeObjectsForExpr:
+            return "mergeObjectsForExpr";
         case Builtin::addToSet:
             return "addToSet";
         case Builtin::addToSetCapped:
@@ -105,6 +107,12 @@ std::string builtinToString(Builtin b) {
             return "doubleDoublePartialSumFinalize";
         case Builtin::aggMergeDoubleDoubleSums:
             return "aggMergeDoubleDoubleSums";
+        case Builtin::doubleDoubleSumFromAcc:
+            return "doubleDoubleSumFromAcc";
+        case Builtin::stdDevPopFromAcc:
+            return "stdDevPopFromAcc";
+        case Builtin::stdDevSampFromAcc:
+            return "stdDevSampFromAcc";
         case Builtin::aggStdDev:
             return "aggStdDev";
         case Builtin::aggMergeStdDevs:
@@ -365,12 +373,18 @@ std::string builtinToString(Builtin b) {
             return "aggBottomNMerge";
         case Builtin::aggBottomNFinalize:
             return "aggBottomNFinalize";
+        case Builtin::maxFromAcc:
+            return "maxFromAcc";
+        case Builtin::avgFromAcc:
+            return "avgFromAcc";
         case Builtin::aggMaxN:
             return "aggMaxN";
         case Builtin::aggMaxNMerge:
             return "aggMaxNMerge";
         case Builtin::aggMaxNFinalize:
             return "aggMaxNFinalize";
+        case Builtin::minFromAcc:
+            return "minFromAcc";
         case Builtin::aggMinN:
             return "aggMinN";
         case Builtin::aggMinNMerge:
@@ -509,6 +523,8 @@ std::string builtinToString(Builtin b) {
             return "valueBlockExists";
         case Builtin::valueBlockIsNullish:
             return "valueBlockIsNullish";
+        case Builtin::valueBlockMqlComparisonRank:
+            return "valueBlockMqlComparisonRank";
         case Builtin::valueBlockFillEmpty:
             return "valueBlockFillEmpty";
         case Builtin::valueBlockFillEmptyBlock:
@@ -678,6 +694,8 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builtin
             return builtinAddToArrayCapped(arity).releaseToRaw();
         case Builtin::mergeObjects:
             return builtinMergeObjects(arity).releaseToRaw();
+        case Builtin::mergeObjectsForExpr:
+            return builtinMergeObjectsForExpr(arity).releaseToRaw();
         case Builtin::addToSet:
             return builtinAddToSet(arity).releaseToRaw();
         case Builtin::addToSetCapped:
@@ -698,6 +716,12 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builtin
             return builtinDoubleDoublePartialSumFinalize(arity).releaseToRaw();
         case Builtin::aggMergeDoubleDoubleSums:
             return builtinAggDoubleDoubleSum<true /*merging*/>(arity).releaseToRaw();
+        case Builtin::doubleDoubleSumFromAcc:
+            return builtinDoubleDoubleSumFromAcc(arity).releaseToRaw();
+        case Builtin::stdDevPopFromAcc:
+            return builtinStdDevFromAcc<false /*isSamp*/>(arity).releaseToRaw();
+        case Builtin::stdDevSampFromAcc:
+            return builtinStdDevFromAcc<true /*isSamp*/>(arity).releaseToRaw();
         case Builtin::aggStdDev:
             return builtinAggStdDev<false /*merging*/>(arity).releaseToRaw();
         case Builtin::aggMergeStdDevs:
@@ -962,6 +986,11 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builtin
             return builtinAggTopBottomNMerge<TopBottomSense::kBottom>(arity).releaseToRaw();
         case Builtin::aggBottomNFinalize:
             return builtinAggTopBottomNFinalize(arity).releaseToRaw();
+        case Builtin::avgFromAcc:
+            return builtinAvgFromAcc(arity).releaseToRaw();
+        case Builtin::maxFromAcc:
+            return builtinMinMaxNFromAcc<AccumulatorMinMaxN::MinMaxSense::kMax>(arity)
+                .releaseToRaw();
         case Builtin::aggMaxN:
             return builtinAggMinMaxN<AccumulatorMinMaxN::MinMaxSense::kMax>(arity).releaseToRaw();
         case Builtin::aggMaxNMerge:
@@ -969,6 +998,9 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builtin
                 .releaseToRaw();
         case Builtin::aggMaxNFinalize:
             return builtinAggMinMaxNFinalize<AccumulatorMinMaxN::MinMaxSense::kMax>(arity)
+                .releaseToRaw();
+        case Builtin::minFromAcc:
+            return builtinMinMaxNFromAcc<AccumulatorMinMaxN::MinMaxSense::kMin>(arity)
                 .releaseToRaw();
         case Builtin::aggMinN:
             return builtinAggMinMaxN<AccumulatorMinMaxN::MinMaxSense::kMin>(arity).releaseToRaw();
@@ -1111,6 +1143,8 @@ FastTuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builtin
             return builtinValueBlockExists(arity).releaseToMaybeOwnedRaw();
         case Builtin::valueBlockIsNullish:
             return builtinValueBlockIsNullish(arity).releaseToMaybeOwnedRaw();
+        case Builtin::valueBlockMqlComparisonRank:
+            return builtinValueBlockMqlComparisonRank(arity).releaseToMaybeOwnedRaw();
         case Builtin::valueBlockTypeMatch:
             return builtinValueBlockTypeMatch(arity).releaseToMaybeOwnedRaw();
         case Builtin::valueBlockIsTimezone:

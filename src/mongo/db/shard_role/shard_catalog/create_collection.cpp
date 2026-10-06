@@ -100,6 +100,12 @@ Status validateClusteredIndexSpec(OperationContext* opCtx,
                       "The clusteredIndex option requires unique: true to be specified");
     }
 
+    if (const auto& name = spec.getName()) {
+        if (auto status = index_key_validate::validateIndexName(*name); !status.isOK()) {
+            return status.withContext("Invalid clusteredIndex name");
+        }
+    }
+
     bool clusterKeyOnId =
         SimpleBSONObjComparator::kInstance.evaluate(spec.getKey() == BSON("_id" << 1));
 

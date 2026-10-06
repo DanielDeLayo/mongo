@@ -185,9 +185,10 @@ public:
     void appendBuildInfo(const UUID& buildUUID, BSONObjBuilder* builder) const;
 
     /**
-     * TODO (SERVER-126257): Remove once index build side writes cannot be torn.
+     * Provides passthrough access to MultiIndexBlock for the phase the build is currently in.
+     * Returns boost::none if the build UUID does not refer to an active index build.
      */
-    void writeTearableSideWriteAbortRecord(OperationContext* opCtx, const UUID& buildUUID);
+    boost::optional<IndexBuildPhaseEnum> getPhase(const UUID& buildUUID) const;
 
     /**
      * Checks via invariant that the manager has no index builds presently.

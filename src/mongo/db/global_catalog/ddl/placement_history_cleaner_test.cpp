@@ -27,7 +27,6 @@
 #include "mongo/db/shard_role/ddl/ddl_lock_manager.h"
 #include "mongo/db/sharding_environment/config_server_test_fixture.h"
 #include "mongo/db/sharding_environment/shard_id.h"
-#include "mongo/db/sharding_environment/shard_ref.h"
 #include "mongo/db/topology/cluster_role.h"
 #include "mongo/db/topology/sharding_state.h"
 #include "mongo/db/topology/vector_clock/vector_clock.h"
@@ -80,11 +79,10 @@ public:
             ->setRecoveryCompleted({OID::gen(),
                                     {ClusterRole::ShardServer, ClusterRole::ConfigServer},
                                     ConnectionString::forLocal(),
-                                    ShardHandle(ShardId("config"), UUID::gen())});
+                                    ShardId("config")});
 
         // Create indexes for config.placementHistory and other config collections.
-        ASSERT_OK(ShardingCatalogManager::get(operationContext())
-                      ->initializeConfigDatabaseIfNeeded(operationContext()));
+        ASSERT_OK(initializeConfigDatabaseIfNeededAtStepUp());
 
         // The DDL lock manager must be "recovered" so that getHistoricalPlacement() can acquire
         // its shared lock on config.placementHistory.
@@ -109,10 +107,10 @@ public:
         // The correct approach for this fixture is: insert shard docs, reload the registry
         // synchronously, then configure mock targeters on the resulting shard objects.
         ShardType shard0Doc;
-        shard0Doc.setHandle(ShardHandle{ShardId(kShard0.toString()), boost::none});
+        shard0Doc.setName(kShard0.toString());
         shard0Doc.setHost(kShard0Host.toString());
         ShardType shard1Doc;
-        shard1Doc.setHandle(ShardHandle{ShardId(kShard1.toString()), boost::none});
+        shard1Doc.setName(kShard1.toString());
         shard1Doc.setHost(kShard1Host.toString());
         setupShards({shard0Doc, shard1Doc});
         shardRegistry()->reload(operationContext());
@@ -133,7 +131,7 @@ public:
 
     NamespacePlacementType insertPlacementChangeDoc(const std::string& nss,
                                                     const Timestamp& timestamp,
-                                                    const std::vector<ShardRef>& shards = {}) {
+                                                    const std::vector<ShardId>& shards = {}) {
         NamespacePlacementType doc(
             NamespaceString::createNamespaceString_forTest(nss), timestamp, shards);
         doc.setUuid(UUID::gen());
@@ -146,7 +144,7 @@ public:
     // Insert the operational initialization marker at the given timestamp.
     // `shards` is empty for the "real" init marker (the one used by getHistoricalPlacement to
     // determine that accurate data is available) and non-empty for the dawn-of-time approximation.
-    void insertInitMarker(Timestamp ts, std::vector<ShardRef> shards = {}) {
+    void insertInitMarker(Timestamp ts, std::vector<ShardId> shards = {}) {
         NamespacePlacementType marker(
             ShardingCatalogClient::kConfigPlacementHistoryInitializationMarker, ts, shards);
         ASSERT_OK(insertToConfigCollection(operationContext(),

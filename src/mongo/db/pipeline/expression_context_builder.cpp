@@ -112,6 +112,12 @@ ExpressionContextBuilder& ExpressionContextBuilder::excludeOperationMemoryTracki
     return *this;
 }
 
+ExpressionContextBuilder&
+ExpressionContextBuilder::excludeExpressionFallbackFromOperationMemoryTracking(bool exclude) {
+    params.excludeExpressionFallbackFromOperationMemoryTracking = exclude;
+    return *this;
+}
+
 ExpressionContextBuilder& ExpressionContextBuilder::allowDiskUse(bool allowDiskUse) {
     params.allowDiskUse = allowDiskUse;
     return *this;
@@ -165,6 +171,12 @@ ExpressionContextBuilder& ExpressionContextBuilder::isParsingCollectionValidator
     return *this;
 }
 
+ExpressionContextBuilder& ExpressionContextBuilder::isReparsingRepresentativeQueryShape(
+    bool isReparsingRepresentativeQueryShape) {
+    params.isReparsingRepresentativeQueryShape = isReparsingRepresentativeQueryShape;
+    return *this;
+}
+
 ExpressionContextBuilder& ExpressionContextBuilder::isIdHackQuery(bool isIdHackQuery) {
     params.isIdHackQuery = isIdHackQuery;
     return *this;
@@ -172,11 +184,6 @@ ExpressionContextBuilder& ExpressionContextBuilder::isIdHackQuery(bool isIdHackQ
 
 ExpressionContextBuilder& ExpressionContextBuilder::isFleQuery(bool isFleQuery) {
     params.isFleQuery = isFleQuery;
-    return *this;
-}
-
-ExpressionContextBuilder& ExpressionContextBuilder::canBeRejected(bool canBeRejected) {
-    params.canBeRejected = canBeRejected;
     return *this;
 }
 
@@ -427,10 +434,12 @@ ExpressionContextBuilder& ExpressionContextBuilder::fromRequest(
     } else {
         if (collectionCollator) {
             collator(collectionCollator->clone());
+        } else {
+            // If there is no collection or request collator we call
+            // isIdHackEligibleQueryWithoutCollator() in order to evaluate if 'request' is an
+            // IDHACK query.
+            isIdHackQuery(isIdHackEligibleQueryWithoutCollator(request));
         }
-        // With no request collation the inherited collation always matches the collection's
-        // default, so IDHACK eligibility depends only on the query structure.
-        isIdHackQuery(isIdHackEligibleQueryWithoutCollator(request));
     }
 
     isFleQuery(request.getEncryptionInformation().has_value());
@@ -599,6 +608,8 @@ boost::intrusive_ptr<ExpressionContext> makeCopyFromExpressionContext(
         .mergeType(other->mergeType())
         .forPerShardCursor(other->getForPerShardCursor())
         .excludeOperationMemoryTracking(other->getExcludeOperationMemoryTracking())
+        .excludeExpressionFallbackFromOperationMemoryTracking(
+            other->getExcludeExpressionFallbackFromOperationMemoryTracking())
         .allowDiskUse(other->getAllowDiskUse())
         .allowPartialResults(other->getAllowPartialResults())
         .bypassDocumentValidation(other->getBypassDocumentValidation())
@@ -609,6 +620,7 @@ boost::intrusive_ptr<ExpressionContext> makeCopyFromExpressionContext(
         .serializationContext(other->getSerializationContext())
         .inLookup(other->getInLookup())
         .isParsingViewDefinition(other->getIsParsingViewDefinition())
+        .isReparsingRepresentativeQueryShape(other->getIsReparsingRepresentativeQueryShape())
         .exprUnstableForApiV1(other->getExprUnstableForApiV1())
         .exprDeprecatedForApiV1(other->getExprDeprecatedForApiV1())
         .jsHeapLimitMB(other->getJsHeapLimitMB())

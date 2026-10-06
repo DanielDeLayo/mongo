@@ -415,6 +415,16 @@ public:
     }
 
     /**
+     * Returns true to bypass rejection by query settings with 'reject: true'.
+     *
+     * Reserved for admin operations whose rejection would render the cluster unusable
+     * (e.g. $querySettings). Do NOT override for ordinary stages.
+     */
+    virtual bool shouldBypassQuerySettingsRejection() const {
+        return false;
+    }
+
+    /**
      * Returns true if this is a $currentOp stage.
      */
     virtual bool isCurrentOpStage() const {
@@ -440,9 +450,9 @@ public:
     }
 
     /**
-     * Stage-specific validation. Called by LiteParsedPipeline::validate().
+     * Stage-specific validation. Called by LiteParsedPipeline::validate() after parsing.
      */
-    virtual void validate() const {};
+    virtual void validate(const OperationContext* opCtx) const {};
 
     /**
      * Returns true if this stage is allowed inside a $lookup sub-pipeline.

@@ -10,7 +10,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/shard_role/lock_manager/dump_lock_manager.h"
 #include "mongo/db/shard_role/lock_manager/lock_manager.h"
-#include "mongo/db/shard_role/lock_manager/locker.h"
 #include "mongo/db/shard_role/lock_manager/resource_catalog.h"
 #include "mongo/logv2/log.h"
 #include "mongo/stdx/unordered_map.h"
@@ -268,12 +267,13 @@ Locker::~Locker() {
 }
 
 void Locker::_setClientState(ClientState newState) {
-    auto oldState = _clientState.swap(newState);
+    auto oldState = _clientState.loadRelaxed();
     if (newState == oldState) {
         return;
     }
     globalClientStateCounts.update(oldState, -1);
     globalClientStateCounts.update(newState, 1);
+    _clientState.store(newState);
 }
 
 Locker::ClientStateCounts Locker::getGlobalClientStateCounts() {

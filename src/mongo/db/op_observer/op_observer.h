@@ -74,6 +74,9 @@ struct OpStateAccumulator : Decorable<OpStateAccumulator> {
     // ApplyOpsEntries used for changestreams with batched writes.
     std::vector<TransactionOperations::ApplyOpsInfo::ApplyOpsEntry> applyOpsEntries;
 
+    // Whether an atomically-grouped batched write is retryable.
+    bool isRetryableAtomicBatch = false;
+
 private:
     OpStateAccumulator(const OpStateAccumulator&) = delete;
     OpStateAccumulator& operator=(const OpStateAccumulator&) = delete;
@@ -249,7 +252,7 @@ public:
                            std::vector<InsertStatement>::const_iterator begin,
                            std::vector<InsertStatement>::const_iterator end,
                            const std::vector<RecordId>& recordIds,
-                           std::vector<bool> fromMigrate,
+                           const std::vector<bool>& fromMigrate,
                            bool defaultFromMigrate,
                            OpStateAccumulator* opAccumulator = nullptr) = 0;
 
@@ -285,6 +288,16 @@ public:
                                    std::span<const char> key,
                                    std::span<const char> value) = 0;
 
+    virtual void onContainerInsert(OperationContext* opCtx,
+                                   std::string_view ident,
+                                   std::span<const std::span<const char>> keys,
+                                   std::span<const char> value) = 0;
+
+    virtual void onContainerInsert(OperationContext* opCtx,
+                                   std::string_view ident,
+                                   int64_t key,
+                                   std::span<const std::span<const char>> vals) = 0;
+
     virtual void onContainerUpdate(OperationContext* opCtx,
                                    std::string_view ident,
                                    int64_t key,
@@ -302,6 +315,10 @@ public:
     virtual void onContainerDelete(OperationContext* opCtx,
                                    std::string_view ident,
                                    std::span<const char> key) = 0;
+
+    virtual void onContainerDelete(OperationContext* opCtx,
+                                   std::string_view ident,
+                                   std::span<const std::span<const char>> keys) = 0;
 
     /**
      * Logs a no-op with "msgObj" in the o field into oplog.
@@ -737,6 +754,18 @@ public:
      */
     virtual void onInvalidateCollectionMetadata(OperationContext* opCtx,
                                                 const repl::OplogEntry& op) = 0;
+
+    /**
+     * Called to clear every CSS entry on the applying node.
+     */
+    virtual void onInvalidateAllCollectionMetadata(OperationContext* opCtx,
+                                                   const repl::OplogEntry& op) = 0;
+
+    /**
+     * Called to clear every DSS entry on the applying node.
+     */
+    virtual void onInvalidateAllDatabaseMetadata(OperationContext* opCtx,
+                                                 const repl::OplogEntry& op) = 0;
 
     /**
      * Called when the authoritative CSS needs to update the value of allowChunkOperations.

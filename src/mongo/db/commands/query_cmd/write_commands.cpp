@@ -389,6 +389,8 @@ public:
                    const OpMsgRequest& opMsgRequest)
             : InvocationBaseGen(opCtx, command, opMsgRequest), _commandObj(opMsgRequest.body) {
             UpdateOp::validate(request());
+            Variables::validateRuntimeConstantsArePermitted(opCtx,
+                                                            request().getLegacyRuntimeConstants());
 
             invariant(_commandObj.isOwned());
 
@@ -398,8 +400,19 @@ public:
                 // Assuming identical collation for all elements in `updates`, future design could
                 // use the disjunction primitive (i.e, `$or`) to compile all queries into a single
                 // filter. Such a design also requires a sound way of combining hints.
+                // TODO (SERVER-134509): Make update commands mirror all elements in the updates
+                // array.
                 invariant(seq->objs.front().isOwned());
                 _updateOpObj = seq->objs.front();
+            } else if (_commandObj.hasField("updates")) {
+                // When updates are not sent as a DocumentSequence, extract the first update object
+                // from the command body.
+                // TODO (SERVER-134509): Make update commands mirror all elements in the updates
+                // array.
+                auto updatesArray = _commandObj["updates"].Array();
+                if (!updatesArray.empty()) {
+                    _updateOpObj = updatesArray[0].Obj();
+                }
             }
         }
 
@@ -432,9 +445,6 @@ public:
                 // "filter", "sort", "hint", and "collation" fields are optional.
                 if (update.isEmpty())
                     return;
-
-                // The constructor verifies the following.
-                invariant(update.isOwned());
 
                 if (update.hasField("q"))
                     bob->append("filter", update["q"].Obj());
@@ -526,11 +536,15 @@ public:
             if (isTimeseriesRetryableUpdate && !wrappedByShardingRouter) {
                 auto executor = getLocalExecutor(opCtx);
                 ON_BLOCK_EXIT([&] {
-                    // Increments the counter if the command contains retries. This is normally done
-                    // within write_ops_exec::performUpdates. But for retryable timeseries updates,
-                    // we should handle the metrics only once at the caller since each statement
-                    // will be run as a separate update command through the internal transaction
-                    // API. See write_ops_exec::performUpdates for more details.
+                    // Increments the counters of retryable writes and if the command contains
+                    // retries, retried writes. This is normally done within
+                    // write_ops_exec::performUpdates. But for retryable timeseries updates, we
+                    // should handle the metrics only once at the caller since each statement will
+                    // be run as a separate update command through the internal transaction API. See
+                    // write_ops_exec::performUpdates for more details.
+                    if (opCtx->isRetryableWrite()) {
+                        RetryableWritesStats::get(opCtx)->incrementRetryableCommandsCount();
+                    }
                     if (!reply.retriedStmtIds.empty()) {
                         RetryableWritesStats::get(opCtx)->incrementRetriedCommandsCount();
                     }
@@ -728,6 +742,8 @@ public:
                    const OpMsgRequest& opMsgRequest)
             : InvocationBaseGen(opCtx, command, opMsgRequest), _commandObj(opMsgRequest.body) {
             DeleteOp::validate(request());
+            Variables::validateRuntimeConstantsArePermitted(opCtx,
+                                                            request().getLegacyRuntimeConstants());
         }
 
         bool supportsWriteConcern() const final {

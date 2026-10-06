@@ -31,19 +31,13 @@ int64_t getRandomIndex(const std::vector<T>& items) {
 }
 
 /**
- * Returns whether or not the cluster contains any sharded collections that can be balanced. If we
- * are draining, this includes config collections, otherwise this excludes any config collections.
+ * Returns whether or not the cluster contains any sharded collections that can be balanced.
  */
-bool clusterHasShardedCollections(OperationContext* opCtx, bool draining) {
+bool clusterHasShardedCollections(OperationContext* opCtx) {
     auto client = ShardingCatalogManager::get(opCtx)->localCatalogClient();
 
     BSONObjBuilder matchBuilder;
     matchBuilder.append(CollectionType::kUnsplittableFieldName, BSON("$ne" << true));
-    // Skip config.system.sessions if we are not draining as it isn't balanced as part of the random
-    // migrations failpoint. If we are draining shards, though, we need to include this collection.
-    if (!draining) {
-        matchBuilder.append(CollectionType::kNssFieldName, BSON("$regex" << "^(?!config\\.).*"));
-    }
 
     std::vector<BSONObj> rawPipelineStages{
         BSON("$match" << matchBuilder.obj()),
@@ -261,8 +255,16 @@ void MoveUnshardedPolicy::applyActionResult(OperationContext* opCtx,
                 status.isA<ErrorCategory::WriteConcernError>() ||
                 status.isA<ErrorCategory::NeedRetargettingError>() ||
                 status.isA<ErrorCategory::NotPrimaryError>();
+            // TODO SERVER-131381: Remove this once the race where resharding starts before an FCV
+            // transition and completes before the FCV transition has a chance to abort it has been
+            // fixed.
+            //
+            // This is similar to ReshardCollectionInterruptedDueToFCVChange, but can occur when
+            // resharding completes before the FCV transition has a chance to abort it.
+            const bool isReshardingFCVMismatchError = status.code() == 13222300;
             // ReshardingImrpovements flag is not enabled (refer to SERVER-90675)
-            if (isErrorInAcceptableCategory || status.code() == 90675) {
+            if (isErrorInAcceptableCategory || status.code() == 90675 ||
+                isReshardingFCVMismatchError) {
                 return true;
             }
 
@@ -386,6 +388,13 @@ MigrateInfoVector MoveUnshardedPolicy::selectCollectionsToMove(
             return result;
         }
 
+        // Probability of skipping a moveCollection in favor of a chunk migration when there are
+        // sharded collections that could be balanced.
+        double skipMoveCollectionThreshold = 0.6;
+        if (auto elem = sfp.getData()["skipMoveCollectionThreshold"]; elem.isNumber()) {
+            skipMoveCollectionThreshold = elem.numberDouble();
+        }
+
         // Don't issue moveCollection if reshardingMinimumOperationDuration is greater than 5
         // seconds to prevent tests from taking too long.
         if (resharding::gReshardingMinimumOperationDurationMillis.load() > 5000) {
@@ -422,13 +431,18 @@ MigrateInfoVector MoveUnshardedPolicy::selectCollectionsToMove(
             return result;
         }
 
-
-        // Randomly skip moveCollections if there are sharded collections that could be balanced.
+        // Don't issue moveCollection if there are only two non-draining shards, as that would
+        // consume both, leaving the draining shard unable to migrate chunks off in this round.
         auto drainingShardIter = std::find_if(
             allShards.begin(), allShards.end(), [](const auto& stat) { return stat.isDraining; });
         bool isDraining = drainingShardIter != allShards.end();
-        if (opCtx->getClient()->getPrng().trueWithProbability(0.5) &&
-            clusterHasShardedCollections(opCtx, isDraining)) {
+        if (isDraining && randomizedAvailableShards.size() <= 2) {
+            return result;
+        }
+
+        // Randomly skip moveCollections if there are sharded collections that could be balanced.
+        if (opCtx->getClient()->getPrng().trueWithProbability(skipMoveCollectionThreshold) &&
+            clusterHasShardedCollections(opCtx)) {
             return result;
         }
 

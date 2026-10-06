@@ -7,6 +7,74 @@ import {
     getWinningPlanFromExplain,
 } from "jstests/libs/query/analyze_plan.js";
 import {runWithParamsAllNonConfigNodes} from "jstests/noPassthrough/libs/server_parameter_helpers.js";
+import {getLatestProfilerEntry} from "jstests/libs/profiler.js";
+
+/**
+ * Returns {hits, misses, invalidations} from serverStatus.metrics.query.planCache.join.
+ */
+export function joinPlanCacheStats(db) {
+    const planCache = db.serverStatus().metrics.query.planCache;
+    assert(planCache.hasOwnProperty("join"), "missing metrics.query.planCache.join", {planCache});
+    const join = planCache.join;
+    return {hits: join.hits, misses: join.misses, invalidations: join.invalidations};
+}
+
+/**
+ * Runs 'fn' and returns the change in the join plan cache counters during its execution:
+ * {hitDelta, missDelta, invalidationDelta}.
+ */
+export function joinPlanCacheStatsDelta(db, fn) {
+    const before = joinPlanCacheStats(db);
+    fn();
+    const after = joinPlanCacheStats(db);
+    return {
+        hitDelta: after.hits - before.hits,
+        missDelta: after.misses - before.misses,
+        invalidationDelta: after.invalidations - before.invalidations,
+    };
+}
+
+/**
+ * Returns {numEntries, estimatedSizeBytes} from serverStatus.metrics.query.planCache.join.
+ */
+export function joinPlanCacheOccupancy(db) {
+    const entries = db
+        .getSiblingDB("admin")
+        .aggregate([{$joinPlanCacheStats: {}}])
+        .toArray();
+    let estimatedSizeBytes = 0;
+    for (const entry of entries) {
+        estimatedSizeBytes += Number(entry.estimatedSizeBytes);
+    }
+    return {numEntries: entries.length, estimatedSizeBytes};
+}
+
+/**
+ * Asserts that the join plan cache stats change by the expected amounts during the execution of 'fn'.
+ */
+export function assertJoinPlanCacheStats({
+    db,
+    fn,
+    expectedHits,
+    expectedMisses,
+    expectedInvalidations = 0,
+}) {
+    const {hitDelta, missDelta, invalidationDelta} = joinPlanCacheStatsDelta(db, fn);
+    assert.eq(hitDelta, expectedHits, "unexpected join plan cache hits", {
+        expectedHits,
+        hitDelta,
+    });
+    assert.eq(missDelta, expectedMisses, "unexpected join plan cache misses", {
+        expectedMisses,
+        missDelta,
+    });
+    assert.eq(
+        invalidationDelta,
+        expectedInvalidations,
+        "unexpected join plan cache invalidations",
+        {expectedInvalidations, invalidationDelta},
+    );
+}
 
 // Runs the given test case with join optimization enabled and disabled, verifies that the results
 // match expectedResults with UNORDERED comparison, and checks whether the join optimizer was used as expected.
@@ -155,6 +223,62 @@ export function assertAllJoinsUseMethod(explain, expectedMethod) {
 }
 
 /**
+ * Hooks 'actionFun' to run before the body of 'prototype[funName]'.
+ * 'actionFun' receives the same args as the wrapped function.
+ * Returns a cleanup function which restores the original 'funName'.
+ */
+function insertBeforeHook(prototype, funName, actionFun) {
+    const originalFun = prototype[funName];
+    assert.eq(typeof originalFun, "function");
+    prototype[funName] = function (...args) {
+        actionFun.call(this, ...args);
+        return originalFun.call(this, ...args);
+    };
+    return () => {
+        prototype[funName] = originalFun;
+    };
+}
+
+/**
+ * Hooks fsync before relevant commands run, ensuring stable on-disk size when join-opt runs.
+ * Returns a cleanup function which removes the hooks.
+ */
+function hookFsyncForJoinOpt() {
+    const fsync = function () {
+        assert.commandWorked(this.getDB().adminCommand({fsync: 1}));
+    };
+    const unhookAggregate = insertBeforeHook(DBCollection.prototype, "aggregate", fsync);
+    const unhookExplain = insertBeforeHook(DBCollection.prototype, "explain", fsync);
+
+    return () => {
+        unhookAggregate();
+        unhookExplain();
+    };
+}
+
+/**
+ * Runs 'pipeline' on 'coll' and returns its results along with the plan summary the server recorded
+ * for the execution, as reported in the slow query log and the profiler.
+ */
+export function runPipelineAndGetPlanSummary(coll, pipeline) {
+    const db = coll.getDB();
+    const previousProfilingLevel = assert.commandWorked(db.setProfilingLevel(2)).was;
+    try {
+        const results = coll.aggregate(pipeline).toArray();
+        const entry = getLatestProfilerEntry(db, {
+            op: "command",
+            ns: coll.getFullName(),
+            "command.aggregate": coll.getName(),
+            "command.pipeline": {$exists: true},
+        });
+        assert(entry.hasOwnProperty("planSummary"), "no planSummary was profiled", {entry});
+        return {results, planSummary: entry.planSummary};
+    } finally {
+        assert.commandWorked(db.setProfilingLevel(previousProfilingLevel));
+    }
+}
+
+/**
  * Restores join-opt parameters to state before test.
  */
 export function joinTestWrapper(db, testFun) {
@@ -178,9 +302,11 @@ export function joinTestWrapper(db, testFun) {
     delete params.ok;
     delete params.operationTime;
 
+    const unhookFsync = hookFsyncForJoinOpt();
     try {
         testFun();
     } finally {
+        unhookFsync();
         assert.commandWorked(db.adminCommand({setParameter: 1, ...params}));
     }
 }

@@ -7,9 +7,12 @@
 #include "mongo/db/exec/agg/document_source_to_stage_registry.h"
 #include "mongo/db/exec/matcher/matcher.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
+#include "mongo/db/matcher/expression_reordering.h"
+#include "mongo/db/pipeline/change_stream_hashed_field_accessors.h"
 #include "mongo/db/pipeline/change_stream_helpers.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/db/pipeline/document_source_change_stream_unwind_transaction.h"
+#include "mongo/db/repl/apply_ops_command_info.h"
 #include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/transaction/transaction_history_iterator.h"
 #include "mongo/util/str.h"
@@ -17,6 +20,8 @@
 #include <string_view>
 
 namespace mongo {
+using FieldAccessors = change_stream::HashedFieldAccessors;
+
 using namespace std::literals::string_view_literals;
 
 boost::intrusive_ptr<exec::agg::Stage> documentSourceChangeStreamUnwindTransactionToStageFn(
@@ -67,6 +72,11 @@ ChangeStreamUnwindTransactionStage::ChangeStreamUnwindTransactionStage(
             str::stream() << DocumentSourceChangeStreamUnwindTransaction::kStageName
                           << " cannot be executed from router",
             !pExpCtx->getInRouter());
+
+    // This filter is applied to every individual operation unwound from an 'applyOps' entry, so a
+    // single large transaction can evaluate it many times. The expression belongs to this execution
+    // stage and is not serialized back out, so it is safe to reorder.
+    allowReordering(pExpCtx->getOperationContext(), _expression.get());
 }
 
 GetNextResult ChangeStreamUnwindTransactionStage::doGetNext() {
@@ -109,21 +119,23 @@ GetNextResult ChangeStreamUnwindTransactionStage::doGetNext() {
     }
 }
 
-
 bool ChangeStreamUnwindTransactionStage::_isTransactionOplogEntry(const Document& doc) {
-    auto op = doc[repl::OplogEntry::kOpTypeFieldName];
+    auto op = doc[FieldAccessors::kOpType];
     auto opType = idl::deserialize<repl::OpTypeEnum>(op.getStringData(),
                                                      IDLParserContext("ChangeStreamEntry.op"));
 
     if (opType != repl::OpTypeEnum::kCommand) {
+        // Hot path.
         return false;
     }
 
-    auto commandVal = doc["o"sv];
+    // Cold path.
+    auto commandVal = doc[FieldAccessors::kObject];
     if (commandVal["applyOps"sv].missing() && commandVal["commitTransaction"sv].missing()) {
         // We should never see an "abortTransaction" command at this point.
         tassert(5543802,
-                str::stream() << "Unexpected op at " << doc["ts"sv].getTimestamp().toString(),
+                str::stream() << "Unexpected op at "
+                              << doc[FieldAccessors::kTimestamp].getTimestamp().toString(),
                 commandVal["abortTransaction"sv].missing());
         return false;
     }
@@ -174,12 +186,12 @@ ChangeStreamUnwindTransactionStage::TransactionOpIterator::TransactionOpIterator
                                                       << input[repl::OpTime::kTermFieldName]));
     _clusterTime = txnOpTime.getTimestamp();
 
-    Value wallTime = input[repl::OplogEntry::kWallClockTimeFieldName];
+    Value wallTime = input[FieldAccessors::kWallClockTime];
     DocumentSourceChangeStream::checkValueType(
         wallTime, repl::OplogEntry::kWallClockTimeFieldName, BSONType::date);
     _wallTime = wallTime.getDate();
 
-    auto commandObj = input["o"sv].getDocument();
+    auto commandObj = input[FieldAccessors::kObject].getDocument();
     Value applyOps = commandObj["applyOps"sv];
 
     if (!applyOps.missing()) {
@@ -197,7 +209,8 @@ ChangeStreamUnwindTransactionStage::TransactionOpIterator::TransactionOpIterator
         // the transaction, but this entry does not have any updates in it, so we do not include
         // it in the '_txnOplogEntries' stack.
         tassert(5543803,
-                str::stream() << "Unexpected op at " << input["ts"sv].getTimestamp().toString(),
+                str::stream() << "Unexpected op at "
+                              << input[FieldAccessors::kTimestamp].getTimestamp().toString(),
                 !commandObj["commitTransaction"].missing());
 
         if (auto commitTimestamp = commandObj["commitTimestamp"]; !commitTimestamp.missing()) {
@@ -215,7 +228,18 @@ ChangeStreamUnwindTransactionStage::TransactionOpIterator::TransactionOpIterator
 
     // When operations span multiple applyOps entries linked by 'prevOpTime', walk that chain to
     // gather them all. kApplyOpsAppliedSeparately entries are standalone, so there is no chain to
-    // follow.
+    // follow. kApplyOpsAppliedAtomically entries also use 'prevOpTime' to link between retryable
+    // write statements, so bound its walk by the terminal's 'count' of operations. A terminal
+    // entry without 'count' is a single-entry batch with no chain to walk. See walkApplyOpsChain().
+    boost::optional<std::size_t> opsStillToCollect;
+    if (isRetryableApplyOps) {
+        const Value count = commandObj["count"sv];
+        opsStillToCollect = count.missing()
+            ? 0
+            : repl::remainingApplyOpsChainOps(static_cast<std::size_t>(count.getLong()),
+                                              repl::numOperationsInApplyOps(applyOps));
+    }
+
     if (!applyOpsAppliedSeparately &&
         BSONType::object ==
             input[repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName].getType()) {
@@ -223,7 +247,8 @@ ChangeStreamUnwindTransactionStage::TransactionOpIterator::TransactionOpIterator
         // in order to parse an OpTime, this time from the "prevOpTime" field.
         repl::OpTime prevOpTime = repl::OpTime::parse(
             input[repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName].getDocument().toBson());
-        _collectAllOpTimesFromTransaction(expCtx->getOperationContext(), prevOpTime);
+        _collectAllOpTimesFromTransaction(
+            expCtx->getOperationContext(), prevOpTime, opsStillToCollect);
     }
 
     // Pop the first OpTime off the stack and use it to load the first oplog entry into the
@@ -308,7 +333,7 @@ ChangeStreamUnwindTransactionStage::TransactionOpIterator::getNextTransactionOp(
 
 void ChangeStreamUnwindTransactionStage::TransactionOpIterator::
     _assertExpectedTransactionEventFormat(const Document& doc) const {
-    Value op = doc["op"sv];
+    Value op = doc[FieldAccessors::kOpType];
     tassert(5543808,
             str::stream() << "Unexpected format for entry within a transaction oplog entry: "
                              "'op' field was type "
@@ -368,14 +393,30 @@ ChangeStreamUnwindTransactionStage::TransactionOpIterator::_lookUpOplogEntryByOp
 }
 
 void ChangeStreamUnwindTransactionStage::TransactionOpIterator::_collectAllOpTimesFromTransaction(
-    OperationContext* opCtx, repl::OpTime firstOpTime) {
+    OperationContext* opCtx,
+    repl::OpTime firstOpTime,
+    boost::optional<std::size_t> opsStillToCollect) {
+    // A single-entry batch links to the previous applyOps chain with nothing of its own to walk.
+    if (opsStillToCollect && *opsStillToCollect == 0) {
+        return;
+    }
+
     std::unique_ptr<TransactionHistoryIteratorBase> iterator(
         _mongoProcessInterface->createTransactionHistoryIterator(firstOpTime));
 
     try {
-        while (iterator->hasNext()) {
-            _txnOplogEntries.push(iterator->nextOpTime(opCtx));
-        }
+        walkApplyOpsChain(*iterator, opsStillToCollect, [&]() -> std::size_t {
+            if (!opsStillToCollect) {
+                // A transaction walks the whole chain and only needs each entry's optime; the
+                // returned op count is unused when there is no budget to decrement.
+                _txnOplogEntries.push(iterator->nextOpTime(opCtx));
+                return 0;
+            }
+            // A retryable chain is bounded by 'count', so fetch the entry to count its operations.
+            const auto entry = iterator->next(opCtx);
+            _txnOplogEntries.push(entry.getOpTime());
+            return repl::numOperationsInApplyOps(entry);
+        });
     } catch (ExceptionFor<ErrorCodes::IncompleteTransactionHistory>& ex) {
         ex.addContext(
             str::stream()
@@ -391,7 +432,7 @@ void ChangeStreamUnwindTransactionStage::TransactionOpIterator::_addAffectedName
     const auto dbCmdNs = NamespaceStringUtil::deserialize(boost::none /* tenantId */,
                                                           doc["ns"sv].getStringData(),
                                                           SerializationContext::stateDefault());
-    if (doc["op"sv].getStringData() != "c"sv) {
+    if (doc[FieldAccessors::kOpType].getStringData() != "c"sv) {
         _affectedNamespaces.insert(dbCmdNs);
         return;
     }
@@ -400,7 +441,7 @@ void ChangeStreamUnwindTransactionStage::TransactionOpIterator::_addAffectedName
     // Creating databases, dropping collections, databases or indexes are not supported. Neither are
     // renaming nor collMod operations.
     constexpr std::array<std::string_view, 2> kCollectionField = {"create"sv, "createIndexes"sv};
-    const Document& object = doc["o"sv].getDocument();
+    const Document& object = doc[FieldAccessors::kObject].getDocument();
     for (const auto& fieldName : kCollectionField) {
         const auto field = object[fieldName];
         if (field.getType() == BSONType::string) {

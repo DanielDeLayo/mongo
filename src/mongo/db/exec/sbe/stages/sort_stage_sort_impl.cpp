@@ -52,9 +52,10 @@ public:
             _limitCode = _stage._limitExpr->compile(ctx);
         }
 
-        _stage._memoryTracker = OperationMemoryUsageTracker::createSimpleMemoryUsageTrackerForSBE(
-            _stage._opCtx,
-            MemoryUsageLimit{static_cast<int64_t>(_stage._specificStats.maxMemoryUsageBytes)});
+        _stage._memoryTracker =
+            OperationMemoryUsageTracker::createChunkedSimpleMemoryUsageTrackerForSBE(
+                _stage._opCtx,
+                MemoryUsageLimit{static_cast<int64_t>(_stage._specificStats.maxMemoryUsageBytes)});
     }
 
     value::SlotAccessor* getAccessor(CompileCtx& ctx, value::SlotId slot) override {
@@ -80,13 +81,14 @@ public:
 
         _makeSorter();
 
+        auto& memoryTracker = _stage._memoryTracker.value();
+
         while (_stage._children[0]->getNext() == PlanState::ADVANCED) {
             KeyRow keys{_inKeyAccessors.size()};
 
             size_t idx = 0;
             for (auto accessor : _inKeyAccessors) {
-                auto [tag, val] = accessor->getViewOfValue();
-                keys.reset(idx++, false, tag, val);
+                keys.reset(idx++, accessor->getViewOfValue());
             }
 
             // Do not allocate the values here, instead let the sorter decide, since the sorter may
@@ -95,13 +97,12 @@ public:
                 ValueRow vals{_inValueAccessors.size()};
                 size_t idx = 0;
                 for (auto accessor : _inValueAccessors) {
-                    auto [tag, val] = accessor->getViewOfValue();
-                    vals.reset(idx++, false, tag, val);
+                    vals.reset(idx++, accessor->getViewOfValue());
                 }
                 return vals;
             });
 
-            _stage._memoryTracker.value().set(_sorter->stats().memUsage());
+            memoryTracker.set(_sorter->stats().memUsage());
         }
 
         _stage._specificStats.peakTrackedMemBytes =

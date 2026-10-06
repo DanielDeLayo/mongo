@@ -3,9 +3,6 @@
 
 #include "mongo/db/sharding_environment/sharding_mongos_test_fixture.h"
 
-#include <boost/move/utility_core.hpp>
-#include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "cxxabi.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsontypes.h"
@@ -74,6 +71,10 @@
 #include <utility>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+
 namespace mongo {
 
 using executor::NetworkTestEnv;
@@ -133,25 +134,23 @@ ShardingTestFixture::ShardingTestFixture(
     auto targeterFactoryPtr = targeterFactory.get();
     _targeterFactory = targeterFactoryPtr;
 
-    ShardFactory::BuilderCallable setBuilder = [targeterFactoryPtr,
-                                                service](const ShardHandle& handle,
-                                                         const ConnectionString& connStr) {
-        auto& shardSharedStateCache = ShardSharedStateCache::get(service);
-        return std::make_unique<ShardRemote>(handle,
-                                             connStr,
-                                             targeterFactoryPtr->create(connStr),
-                                             shardSharedStateCache.getShardState(handle.name()));
-    };
+    ShardFactory::BuilderCallable setBuilder =
+        [targeterFactoryPtr, service](const ShardId& shardId, const ConnectionString& connStr) {
+            auto& shardSharedStateCache = ShardSharedStateCache::get(service);
+            return std::make_unique<ShardRemote>(shardId,
+                                                 connStr,
+                                                 targeterFactoryPtr->create(connStr),
+                                                 shardSharedStateCache.getShardState(shardId));
+        };
 
-    ShardFactory::BuilderCallable masterBuilder = [targeterFactoryPtr,
-                                                   service](const ShardHandle& handle,
-                                                            const ConnectionString& connStr) {
-        auto& shardSharedStateCache = ShardSharedStateCache::get(service);
-        return std::make_unique<ShardRemote>(handle,
-                                             connStr,
-                                             targeterFactoryPtr->create(connStr),
-                                             shardSharedStateCache.getShardState(handle.name()));
-    };
+    ShardFactory::BuilderCallable masterBuilder =
+        [targeterFactoryPtr, service](const ShardId& shardId, const ConnectionString& connStr) {
+            auto& shardSharedStateCache = ShardSharedStateCache::get(service);
+            return std::make_unique<ShardRemote>(shardId,
+                                                 connStr,
+                                                 targeterFactoryPtr->create(connStr),
+                                                 shardSharedStateCache.getShardState(shardId));
+        };
 
     ShardFactory::BuildersMap buildersMap{
         {ConnectionString::ConnectionType::kReplicaSet, std::move(setBuilder)},

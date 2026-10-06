@@ -22,6 +22,7 @@
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
+#include <algorithm>
 #include <functional>
 #include <memory>
 #include <utility>
@@ -79,6 +80,7 @@ Status SubplanStage::choosePlanWholeQuery(const QueryPlannerParams& plannerParam
         _compositeSolution = std::move(solutions.back());
         solutions.pop_back();
 
+        _usesWholeQueryPlan = true;
         return Status::OK();
     } else {
         // Many solutions. Create a MultiPlanStage to pick the best, update the cache,
@@ -110,6 +112,7 @@ Status SubplanStage::choosePlanWholeQuery(const QueryPlannerParams& plannerParam
             return planSelectStat;
         }
 
+        _usesWholeQueryPlan = true;
         return Status::OK();
     }
 }
@@ -155,7 +158,7 @@ Status SubplanStage::pickBestPlan(const QueryPlannerParams& plannerParams,
     //  CanonicalQuery.
     //  2. Extract the fields of the relevant indexes for each branch of the rooted $or by passing
     //  in the pointer to 'topLevelSampleFieldNames' to planSubqueries().
-    StringSet topLevelSampleFieldNames;
+    auto topLevelSampleFieldNames = ce::TopLevelSampleFields::allFields();
     std::unique_ptr<ce::SamplingEstimator> samplingEstimator{nullptr};
     std::unique_ptr<ce::ExactCardinalityEstimator> exactCardinality{nullptr};
     if (cbrEnabled) {
@@ -178,22 +181,15 @@ Status SubplanStage::pickBestPlan(const QueryPlannerParams& plannerParams,
 
     // Run the plan enumerator for each of the $or branches thus enumerating all plans for each
     // $or branch.
-    auto subplanningStatus = samplingEstimator
-        ? QueryPlanner::planSubqueries(expCtx()->getOperationContext(),
-                                       getSolutionCachedData,
-                                       collection(),
-                                       *_query,
-                                       plannerParams,
-                                       samplingEstimator.get(),
-                                       exactCardinality.get(),
-                                       topLevelSampleFieldNames)
-        : QueryPlanner::planSubqueries(expCtx()->getOperationContext(),
-                                       getSolutionCachedData,
-                                       collection(),
-                                       *_query,
-                                       plannerParams,
-                                       samplingEstimator.get(),
-                                       exactCardinality.get());
+    auto subplanningStatus =
+        QueryPlanner::planSubqueries(expCtx()->getOperationContext(),
+                                     getSolutionCachedData,
+                                     collection(),
+                                     *_query,
+                                     plannerParams,
+                                     samplingEstimator.get(),
+                                     exactCardinality.get(),
+                                     topLevelSampleFieldNames.relevantIndexOutput());
 
 
     // If the plan ranker is cost-based, plan each branch of the $or using the respective
@@ -209,9 +205,7 @@ Status SubplanStage::pickBestPlan(const QueryPlannerParams& plannerParams,
             // TODO: SERVER-119839 This generates a sample even for trivial queries.
             // The subplanner should use the CBRPlanRankingStrategy instead.
             samplingEstimator->generateSample(
-                topLevelSampleFieldNames.empty()
-                    ? ce::ProjectionParams{ce::NoProjection{}}
-                    : ce::TopLevelFieldsProjection{std::move(topLevelSampleFieldNames)});
+                std::move(topLevelSampleFieldNames).toProjectionParams());
         }
 
         for (const auto& branchResult : subplanningStatus.getValue().branches) {
@@ -229,7 +223,13 @@ Status SubplanStage::pickBestPlan(const QueryPlannerParams& plannerParams,
                 subplanningStatus = statusWithCBRSolns.getStatus().withContext(ss);
                 break;
             }
-            branchResult->solutions = std::move(statusWithCBRSolns.getValue().solutions);
+            auto& cbrResult = statusWithCBRSolns.getValue();
+            // Store costBased strategy only when it picked a single
+            // winning plan for a branch.
+            if (cbrResult.planSelectionStrategy == PlanSelectionStrategy::kCostBasedRanker) {
+                _anyBranchCostBasedRanked = true;
+            }
+            branchResult->solutions = std::move(cbrResult.solutions);
         }
     }
 
@@ -251,6 +251,10 @@ Status SubplanStage::pickBestPlan(const QueryPlannerParams& plannerParams,
                                  std::vector<std::unique_ptr<QuerySolution>> solutions)
         -> StatusWith<std::unique_ptr<QuerySolution>> {
         _ws->clear();
+
+        // This callback runs only for branches with more than one candidate solution, so reaching
+        // it means the multi-planner ranked at least one branch.
+        _anyBranchMultiPlanned = true;
 
         // We temporarily add the MPS to _children to ensure that we pass down all save/restore
         // messages that can be generated if pickBestPlan yields.
@@ -324,6 +328,25 @@ Status SubplanStage::pickBestPlan(const QueryPlannerParams& plannerParams,
     _ws->clear();
 
     return Status::OK();
+}
+
+PlanSelectionStrategy SubplanStage::planSelectionStrategy() const {
+    if (_usesWholeQueryPlan) {
+        return _usesMultiplanning ? PlanSelectionStrategy::kMultiPlanner
+                                  : PlanSelectionStrategy::kSinglePlan;
+    }
+    if (_anyBranchMultiPlanned) {
+        return PlanSelectionStrategy::kMultiPlanner;
+    }
+    if (_anyBranchCostBasedRanked) {
+        return PlanSelectionStrategy::kCostBasedRanker;
+    }
+    if (std::any_of(_branchPlannedFromCache.begin(),
+                    _branchPlannedFromCache.end(),
+                    [](bool fromCache) { return fromCache; })) {
+        return PlanSelectionStrategy::kCachedPlan;
+    }
+    return PlanSelectionStrategy::kSinglePlan;
 }
 
 bool SubplanStage::isEOF() const {

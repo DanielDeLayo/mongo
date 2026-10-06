@@ -455,6 +455,7 @@ mongo_cc_library(
         "//src/mongo/db/stats:top",
         "//src/mongo/db/topology/cluster_parameters:cluster_server_parameter_server_status",
         "//src/mongo/s/commands:cluster_commands_common",
+        "//src/mongo/s/query/exec:cluster_cursor",
         "//src/mongo/transport:session_manager",
     ],
 )
@@ -475,6 +476,8 @@ mongo_cc_library(
         "//src/mongo/db:dbdirectclient",
         "//src/mongo/db:default_max_time_ms_cluster_parameter",
         "//src/mongo/db:incremental_rollout_metrics",
+        "//src/mongo/db:landlock_init",
+        "//src/mongo/db:metrics_policy_manager_mongos",
         "//src/mongo/db/topology/vector_clock:logical_time_metadata_hook",
         "//src/mongo/db/pipeline/process_interface:mongos_process_interface_factory",
         "//src/mongo/db/process_health:config_server_health_observer",
@@ -554,9 +557,9 @@ mongo_cc_library(
         "//conditions:default": [],
     }) + select({
         "//bazel/config:enterprise_feature_ldap_enabled": [
+            "//src/mongo/db/modules/enterprise/src/ldap:ldap_check_cyrus_sasl_version",
             "//src/mongo/db/modules/enterprise/src/ldap:ldap_health_observer",
             "//src/mongo/db/modules/enterprise/src/ldap:ldap_manager_init",
-            "//src/mongo/db/modules/enterprise/src/ldap:openssl_init_legacy",
         ],
         "//conditions:default": [],
     }) + select({
@@ -572,7 +575,14 @@ mongo_cc_library(
         ],
         "//conditions:default": [],
     }) + select({
-        "//bazel/config:server_js_enabled": [
+        # Not gated on any one enterprise feature: the enterprise Landlock policy
+        # names paths from several of them but links against none.
+        "//bazel/config:build_enterprise_linux_enabled": [
+            "//src/mongo/db/modules/enterprise/src/landlock:landlock_enterprise",
+        ],
+        "//conditions:default": [],
+    }) + select({
+        "//bazel/config:server_js_engine_allowed": [
             "//src/mongo/scripting:scripting_server",
         ],
         "//conditions:default": ["//src/mongo/scripting:scripting_none"],
@@ -626,6 +636,7 @@ mongo_cc_library(
         "//src/mongo/transport:session_manager",
         "//src/mongo/transport:transport_layer_manager",
         "//src/mongo/util:allocator_thread",
+        "//src/mongo/util/landlock",
         "//src/mongo/util:periodic_runner_factory",
         "//src/mongo/util:signal_handlers",
         "//src/mongo/db/sharding_environment/client:sharding_client",

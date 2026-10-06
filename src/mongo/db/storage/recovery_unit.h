@@ -252,6 +252,14 @@ public:
     virtual void setOperationContext(OperationContext* opCtx);
 
     /**
+     * Returns the OperationContext that currently owns this RecoveryUnit, or nullptr if none is set
+     * (e.g. for internal RecoveryUnits not tied to a user operation).
+     */
+    OperationContext* getOperationContext() const {
+        return _opCtx;
+    }
+
+    /**
      * Extensible structure for configuring options to begin a new transaction.
      *
      * - roundUpPreparedTimestamps dictates whether to round up prepare and commit timestamp of a
@@ -366,6 +374,24 @@ public:
      * while a commit timestamp is set.
      */
     virtual void setCommitTimestamp(Timestamp timestamp) {}
+
+    /**
+     * Sets a schema epoch for a transaction which creates tables using untimestamped writes. Must
+     * be called inside a WriteUnitOfWork, may only be called once, and is mutually exclusive with
+     * having timestamps set.
+     *
+     * The schema epoch for table creations is normally derived from the commit timestamp, but
+     * timestamps are not available until the oplog table has been created. Any operations which
+     * create tables prior to that must explicitly set a schema epoch to use.
+     */
+    virtual void setSchemaEpoch(uint64_t schemaEpoch) {}
+
+    /**
+     * Returns the schema epoch set via setSchemaEpoch(), or boost::none if not set.
+     */
+    virtual boost::optional<uint64_t> getSchemaEpoch() const {
+        return boost::none;
+    }
 
     /**
      * Sets a timestamp that decides when all the future writes on this RecoveryUnit will be
@@ -580,6 +606,16 @@ public:
     virtual void setReadOnce(bool readOnce) {};
 
     virtual bool getReadOnce() const {
+        return false;
+    };
+
+    /**
+     * Sets whether cursors subsequently opened on this RecoveryUnit should accumulate a size
+     * summary as they traverse.
+     */
+    virtual void setSizeStatsCursor(bool sizeStatsCursor) {};
+
+    virtual bool getSizeStatsCursor() const {
         return false;
     };
 
@@ -889,11 +925,13 @@ public:
     }
 
     /**
-     * Sets a maximum timeout that the storage engine will block an operation when the cache is
-     * under pressure.
-     * If not set (default 0) then the storage engine will block indefinitely.
+     * Bounds every storage operation on this recovery unit's session: once exceeded, WiredTiger
+     * fails the operation with WT_ROLLBACK (surfaced as a WriteConflict/TemporarilyUnavailable
+     * error) instead of waiting indefinitely. Unlike a cache-wait bound, this also makes a
+     * read-only transaction eligible for rollback when it is stuck behind cache eviction that
+     * cannot progress. 0 disables.
      */
-    virtual void setCacheMaxWaitTimeout(Milliseconds) {}
+    virtual void setOperationTimeout(Milliseconds) {}
 
     /**
      * Marks this recovery unit as exempt from participating in optional cache eviction.

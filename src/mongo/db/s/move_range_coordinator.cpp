@@ -13,16 +13,17 @@
 #include "mongo/db/global_catalog/ddl/sharding_recovery_service.h"
 #include "mongo/db/global_catalog/type_chunk.h"
 #include "mongo/db/persistent_task_store.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/router_role/routing_cache/catalog_cache.h"
 #include "mongo/db/s/migration_coordinator_document_gen.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/migration_util.h"
+#include "mongo/db/s/range_deleter_service.h"
 #include "mongo/db/s/range_deletion_util.h"
 #include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
 #include "mongo/db/shard_role/shard_catalog/shard_filtering_metadata_refresh.h"
 #include "mongo/db/sharding_environment/client/shard.h"
 #include "mongo/db/sharding_environment/grid.h"
-#include "mongo/db/sharding_environment/shard_ref.h"
 #include "mongo/db/sharding_environment/sharding_statistics.h"
 #include "mongo/db/topology/shard_registry.h"
 #include "mongo/db/write_concern_options.h"
@@ -192,7 +193,11 @@ ExecutorFuture<void> MoveRangeCoordinator::_runImpl(
             [this, anchor = shared_from_this(), token](OperationContext* opCtx) {
                 LOGV2(
                     12894207, "MoveRangeCoordinator executing kMigrate", getCoordinatorLogAttrs());
-                uassert(ErrorCodes::InterruptedDueToReplStateChange,
+
+                // The MigrationSourceManager doesn't support resuming a chunk migration after a
+                // primary failover (new term). If this is not the first execution, abort so the
+                // caller can retry the migration from scratch.
+                uassert(ErrorCodes::RetriableRemoteCommandFailure,
                         "MoveRangeCoordinator interrupted during data transfer",
                         _firstExecution);
 
@@ -214,10 +219,15 @@ ExecutorFuture<void> MoveRangeCoordinator::_runImpl(
                 LOGV2(12795314,
                       "MoveRangeCoordinator executing kEnterCriticalSection",
                       getCoordinatorLogAttrs());
-                uassert(ErrorCodes::InterruptedDueToReplStateChange,
+
+                // The MigrationSourceManager doesn't support resuming a chunk migration after a
+                // primary failover (new term). If this is not the first execution, abort so the
+                // caller can retry the migration from scratch.
+                uassert(ErrorCodes::RetriableRemoteCommandFailure,
                         "MoveRangeCoordinator interrupted before entering the commit critical "
                         "section",
                         _firstExecution);
+
                 tassert(12795311,
                         "Migrate and enterCriticalSection must only run during the same term",
                         _migrationAttempt.has_value());
@@ -503,14 +513,13 @@ void MoveRangeCoordinator::_commitToShardCatalog(
     // donating the last chunk) and any split side chunks, must overwrite its now-stale ownership of
     // the migrated range, and appears in the migrated chunk's history, so holding all of them in
     // its shard catalog is valid.
-    sharding_ddl_util::commitChunkOperationsMetadataToShardCatalog(
-        opCtx,
-        nss(),
-        changedChunks,
-        {ShardRef(_request.getFromShard())},
-        getNewSession(opCtx),
-        executor,
-        token);
+    sharding_ddl_util::commitChunkOperationsMetadataToShardCatalog(opCtx,
+                                                                   nss(),
+                                                                   changedChunks,
+                                                                   {_request.getFromShard()},
+                                                                   getNewSession(opCtx),
+                                                                   executor,
+                                                                   token);
 
     // The recipient keeps only chunks it currently owns or has owned before (that is, chunks whose
     // history includes the recipient). This always includes the migrated chunk, because its history
@@ -542,7 +551,7 @@ void MoveRangeCoordinator::_commitToShardCatalog(
     sharding_ddl_util::commitChunkOperationsMetadataToShardCatalog(opCtx,
                                                                    nss(),
                                                                    std::move(recipientChunks),
-                                                                   {ShardRef(toShard)},
+                                                                   {toShard},
                                                                    getNewSession(opCtx),
                                                                    executor,
                                                                    token,
@@ -580,6 +589,14 @@ MoveRangeCoordinator::_getMigrationCoordinatorDocumentIfExists(OperationContext*
 }
 
 void MoveRangeCoordinator::_finalizeMigration(OperationContext* opCtx) {
+    auto notifyRecoveryJobComplete = [this, opCtx] {
+        if (_recoveredFromDisk) {
+            const auto term = repl::ReplicationCoordinator::get(opCtx)->getTerm();
+            RangeDeleterService::get(opCtx)->notifyRecoveryJobComplete(
+                term, RecoveryJob::kMoveRangeCoordinator);
+        }
+    };
+
     if (_migrationAttempt) {
         LOGV2(12795323,
               "MoveRangeCoordinator finalizing migration via the live MigrationSourceManager",
@@ -599,6 +616,7 @@ void MoveRangeCoordinator::_finalizeMigration(OperationContext* opCtx) {
     if (!doc) {
         // Nothing left to do: finalize() already completed it, or the migration aborted before a
         // coordinator document was ever persisted.
+        notifyRecoveryJobComplete();
         return;
     }
 
@@ -618,11 +636,29 @@ void MoveRangeCoordinator::_finalizeMigration(OperationContext* opCtx) {
     migrationutil::MigrationCoordinator coordinator(*doc);
     coordinator.setShardKeyPattern(
         rangedeletionutil::getShardKeyPatternFromRangeDeletionTask(opCtx, doc->getId()));
-    coordinator.completeMigration(opCtx, false);
+
+    const auto cleanupFuture = coordinator.completeMigration(opCtx, false);
+
+    notifyRecoveryJobComplete();
+
+    if (cleanupFuture && _request.getWaitForDelete()) {
+        const auto cleanupStatus = cleanupFuture->getNoThrow(opCtx);
+        if (!cleanupStatus.isOK()) {
+            uasserted(
+                ErrorCodes::OrphanedRangeCleanUpFailed,
+                str::stream()
+                    << "Migration committed but failed to clean up orphans for a waitForDelete "
+                       "request due to: "
+                    << redact(cleanupStatus));
+        }
+    }
 }
 
 void MoveRangeCoordinator::_releaseCriticalSectionAndFinalize(OperationContext* opCtx,
                                                               const Status& outcome) {
+    const bool isCompletingMigration =
+        _migrationAttempt || _getMigrationCoordinatorDocumentIfExists(opCtx).has_value();
+
     // Release the donor critical section (no-op if never acquired / already released).
     ShardingRecoveryService::get(opCtx)->releaseRecoverableCriticalSection(
         opCtx,
@@ -653,6 +689,17 @@ void MoveRangeCoordinator::_releaseCriticalSectionAndFinalize(OperationContext* 
             store.count(
                 opCtx, BSON(MigrationCoordinatorDocument::kIdFieldName << _doc.getMigrationId())) ==
                 0);
+
+    if (isCompletingMigration) {
+        BSONObjBuilder infoBuilder;
+        infoBuilder.append("status", outcome.isOK() ? "success" : "failed");
+        if (!outcome.isOK()) {
+            infoBuilder.append("errorCode", ErrorCodes::errorString(outcome.code()));
+        }
+        LOGV2(12960100,
+              "MoveRange coordinator terminated",
+              logv2::DynamicAttributes{getCoordinatorLogAttrs(), "info"_attr = infoBuilder.obj()});
+    }
 
     _scopedDonateChunk->signalComplete(outcome);
 }

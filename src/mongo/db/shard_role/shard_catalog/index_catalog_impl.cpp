@@ -40,6 +40,7 @@
 #include "mongo/db/query/collection_index_usage_tracker_decoration.h"
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/compiler/parsers/matcher/expression_parser.h"
+#include "mongo/db/query/plan_cache/join_plan_cache.h"
 #include "mongo/db/query/query_execution_knobs_gen.h"
 #include "mongo/db/query/query_integration_knobs_gen.h"
 #include "mongo/db/query/query_optimization_knobs_gen.h"
@@ -840,7 +841,8 @@ Status _checkValidFilterExpressions(const MatchExpression* expression, int level
  * GEO_2DSPHERE provide additional validation on the index spec, and tweak the index spec
  * object to conform to their expected format.
  */
-StatusWith<BSONObj> adjustIndexSpecObject(const BSONObj& obj) {
+StatusWith<BSONObj> adjustIndexSpecObject(const BSONObj& obj,
+                                          const VersionContext& versionContext) {
     std::string pluginName = IndexNames::findPluginName(obj.getObjectField("key"));
 
     if (IndexNames::TEXT == pluginName) {
@@ -848,11 +850,11 @@ StatusWith<BSONObj> adjustIndexSpecObject(const BSONObj& obj) {
     }
 
     if (IndexNames::GEO_2DSPHERE == pluginName) {
-        return S2AccessMethod::fixSpec(obj);
+        return S2AccessMethod::fixSpec(obj, versionContext);
     }
 
     if (IndexNames::GEO_2DSPHERE_BUCKET == pluginName) {
-        return S2BucketAccessMethod::fixSpec(obj);
+        return S2BucketAccessMethod::fixSpec(obj, versionContext);
     }
 
     return obj;
@@ -943,12 +945,10 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx,
     if (nameElem.type() != BSONType::string)
         return Status(ErrorCodes::CannotCreateIndex, "index name must be specified as a string");
 
-    const std::string_view name = nameElem.valueStringData();
-    if (name.find('\0') != std::string::npos)
-        return Status(ErrorCodes::CannotCreateIndex, "index name cannot contain NUL bytes");
-
-    if (name.empty())
-        return Status(ErrorCodes::CannotCreateIndex, "index name cannot be empty");
+    if (auto status = index_key_validate::validateIndexName(nameElem.valueStringData());
+        !status.isOK()) {
+        return status;
+    }
 
     const BSONObj key = spec.getObjectField("key");
     const Status keyStatus = index_key_validate::validateKeyPattern(key, indexVersion);
@@ -1483,6 +1483,7 @@ Status IndexCatalogImpl::dropIndexEntry(OperationContext* opCtx,
     if (feature_flags::gFeatureFlagPathArrayness.isEnabled()) {
         collectionQueryInfo.rebuildPathArrayness(opCtx, collection);
     }
+    join_ordering::bumpCollectionVersionForDDL(collection);
     CollectionIndexUsageTrackerDecoration::write(collection).unregisterIndex(indexName);
     _deleteIndexFromDisk(opCtx, collection, indexName, std::move(ownedEntry));
 
@@ -1750,6 +1751,7 @@ const IndexCatalogEntry* IndexCatalogImpl::refreshEntry(OperationContext* opCtx,
     if (feature_flags::gFeatureFlagPathArrayness.isEnabled()) {
         collectionQueryInfo.rebuildPathArrayness(opCtx, collection);
     }
+    join_ordering::bumpCollectionVersionForDDL(collection);
 
     // Return the new entry.
     return newEntry;
@@ -1757,20 +1759,6 @@ const IndexCatalogEntry* IndexCatalogImpl::refreshEntry(OperationContext* opCtx,
 
 // ---------------------------
 
-
-Status IndexCatalogImpl::_indexFilteredRecords(OperationContext* opCtx,
-                                               const CollectionPtr& coll,
-                                               const IndexCatalogEntry* index,
-                                               const std::vector<BsonRecord>& bsonRecords,
-                                               int64_t* keysInsertedOut) const {
-    SharedBufferFragmentBuilder pooledBuilder(key_string::HeapBuilder::kHeapAllocatorDefaultBytes);
-
-    InsertDeleteOptions options;
-    prepareInsertDeleteOptions(opCtx, coll->ns(), index->descriptor(), &options);
-
-    return index->accessMethod()->insert(
-        opCtx, pooledBuilder, coll, index, bsonRecords, options, keysInsertedOut);
-}
 
 Status IndexCatalogImpl::_indexRecords(OperationContext* opCtx,
                                        const CollectionPtr& coll,
@@ -1789,17 +1777,13 @@ Status IndexCatalogImpl::_indexRecords(OperationContext* opCtx,
     if (skip)
         return Status::OK();
 
-    const MatchExpression* filter = index->getFilterExpression();
-    if (!filter)
-        return _indexFilteredRecords(opCtx, coll, index, bsonRecords, keysInsertedOut);
 
-    std::vector<BsonRecord> filteredBsonRecords;
-    for (const auto& bsonRecord : bsonRecords) {
-        if (exec::matcher::matchesBSON(filter, *(bsonRecord.docPtr)))
-            filteredBsonRecords.push_back(bsonRecord);
-    }
+    InsertDeleteOptions options;
+    prepareInsertDeleteOptions(opCtx, coll->ns(), index->descriptor(), &options);
 
-    return _indexFilteredRecords(opCtx, coll, index, filteredBsonRecords, keysInsertedOut);
+    SharedBufferFragmentBuilder pooledBuilder(key_string::HeapBuilder::kHeapAllocatorDefaultBytes);
+    return index->accessMethod()->insert(
+        opCtx, pooledBuilder, coll, index, bsonRecords, options, keysInsertedOut);
 }
 
 Status IndexCatalogImpl::_updateRecord(OperationContext* const opCtx,
@@ -2168,7 +2152,7 @@ void IndexCatalogImpl::indexBuildSuccess(OperationContext* opCtx,
 StatusWith<BSONObj> IndexCatalogImpl::_fixIndexSpec(OperationContext* opCtx,
                                                     const CollectionPtr& collection,
                                                     const BSONObj& spec) const {
-    auto statusWithSpec = adjustIndexSpecObject(spec);
+    auto statusWithSpec = adjustIndexSpecObject(spec, VersionContext::getDecoration(opCtx));
     if (!statusWithSpec.isOK()) {
         return statusWithSpec;
     }

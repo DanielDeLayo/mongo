@@ -233,6 +233,9 @@ JoinCostEstimate JoinCostEstimatorImpl::costINLJFragment(const JoinPlanNode& lef
     numSeqIOs =
         CardinalityEstimate{CardinalityType{sortedSparse.numSeqIOs}, EstimationSource::Sampling};
 
+    const auto& rhsCardBeforeJoinPred =
+        _jCtx.singleTableAccess.nodeCardinalitiesOriginalFilter[right];
+
     return JoinCostEstimate(
         numDocsProcessed,
         numDocsOutput,
@@ -240,7 +243,8 @@ JoinCostEstimate JoinCostEstimatorImpl::costINLJFragment(const JoinPlanNode& lef
         CardinalityEstimate{CardinalityType{numRandIOsCollection}, EstimationSource::Sampling},
         getNodeCost(left),
         JoinCostEstimate(zeroCE, zeroCE, zeroCE, zeroCE),
-        mlCase);
+        mlCase,
+        rhsCardBeforeJoinPred);
 }
 
 JoinCostEstimate JoinCostEstimatorImpl::costNLJFragment(const JoinPlanNode& left,
@@ -375,6 +379,12 @@ SortedSparseIO estimateSortedSparseIO(double numPagesAccessedColl,
             "estimateSortedSparseIO() expected numPagesInStorageEngineCache > 0",
             numPagesInStorageEngineCache > 0);
 
+    // Guard against the case where the collection is empty, which would result in a division by 0
+    // in the sorted-sparse IO calculation below.
+    if (numPagesAccessedColl == 0) {
+        return {.numSeqIOs = 0.0, .numRandIOs = 0.0};
+    }
+
     // M-L charges one random I/O per group (probe or distinct key); the remaining
     // (numPagesAccessedColl - numLogicalPageRequests) accesses within each group follow RID order
     // and are sorted-sparse: cheaper than random access, but costlier than a purely sequential
@@ -383,14 +393,23 @@ SortedSparseIO estimateSortedSparseIO(double numPagesAccessedColl,
 
     switch (mlCase) {
         case MackertLohmanCase::kCollectionFitsCache:
-            // For case 1 of M-L, do not charge sorted-sparse I/O. The accessed pages fit in cache,
-            // and the random I/O cost is already accounted for in the M-L formula.
+            // For the collection-fits-cache M-L case, do not charge sorted-sparse I/O. The accessed
+            // pages fit in cache, and the random I/O cost is already accounted for in the M-L
+            // formula.
             return {.numSeqIOs = 0.0, .numRandIOs = 0.0};
         case MackertLohmanCase::kReturnedDocsFitCache:
         case MackertLohmanCase::kPartialEviction: {
+            // The returned-documents-fit-cache and partial-eviction M-L cases only apply when the
+            // number of pages accessed exceeds the cache size, so the overflow factor below is
+            // guaranteed to be non-negative.
+            tassert(
+                13290900,
+                "The returned-documents-fit-cache and partial-eviction M-L cases imply that the "
+                "number of pages accessed exceeds the cache size",
+                numPagesAccessedColl > numPagesInStorageEngineCache);
+
             // The overflowFactor (0.0 to 1.0): what fraction of these pages overflow the buffer
             // pool?
-            // Case 2 and 3 of M-L, where the number of pages accessed exceeds the cache size.
             double overflowFactor = 1 - (numPagesInStorageEngineCache / numPagesAccessedColl);
 
             // Apply the sorted spatial locality dampening curve. The square root function models

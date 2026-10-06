@@ -44,8 +44,7 @@ struct WriteOpAnalyzerTestImpl : public ShardingTestFixture {
         std::vector<ShardType> shards;
         for (size_t i = 0; i < remoteShards.size(); i++) {
             ShardType shardType;
-            shardType.setHandle(
-                ShardHandle{ShardId(get<0>(remoteShards[i]).toString()), boost::none});
+            shardType.setName(get<0>(remoteShards[i]).toString());
             shardType.setHost(get<1>(remoteShards[i]).toString());
             shards.push_back(shardType);
 
@@ -944,74 +943,6 @@ TEST_F(WriteOpAnalyzerTestImpl, ViewfulTimeSeriesRetryableWrite) {
 
     rtx->onRequestSentForNss(nss);
 }
-TEST_F(WriteOpAnalyzerTestImpl, FindAndModifyWithSortOnUnsplittableTimeseries) {
-    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "tscoll");
-    auto uuid = UUID::gen();
-    auto dbVersion = DatabaseVersion(uuid, Timestamp{1, 1});
-    TimeseriesOptions tsOptions(std::string("ts"));
-    auto cri = CatalogCacheMock::makeCollectionRoutingInfoUnsplittable(
-        nss, kShard1Name, dbVersion, kShard1Name, {tsOptions});
-    auto rtx = RoutingContext::createSynthetic({{nss, cri}});
-
-    write_ops::FindAndModifyCommandRequest fam(nss);
-    fam.setQuery(BSON("ts" << BSON("$gt" << 0)));
-    fam.setUpdate(write_ops::UpdateModification(BSON("$set" << BSON("a" << 1))));
-    fam.setSort(BSON("ts" << 1));
-    WriteOp op(fam);
-    ASSERT_OK(analyzer.analyze(operationContext(), *rtx, op).getStatus());
-    rtx->onRequestSentForNss(nss);
-}
-
-TEST_F(WriteOpAnalyzerTestImpl, FindAndModifyRemoveWithSortOnUnsplittableTimeseries) {
-    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "tscoll");
-    auto uuid = UUID::gen();
-    auto dbVersion = DatabaseVersion(uuid, Timestamp{1, 1});
-    TimeseriesOptions tsOptions(std::string("ts"));
-    auto cri = CatalogCacheMock::makeCollectionRoutingInfoUnsplittable(
-        nss, kShard1Name, dbVersion, kShard1Name, {tsOptions});
-    auto rtx = RoutingContext::createSynthetic({{nss, cri}});
-
-    write_ops::FindAndModifyCommandRequest fam(nss);
-    fam.setQuery(BSON("ts" << BSON("$gt" << 0)));
-    fam.setRemove(true);
-    fam.setSort(BSON("ts" << 1));
-    WriteOp op(fam);
-    ASSERT_OK(analyzer.analyze(operationContext(), *rtx, op).getStatus());
-    rtx->onRequestSentForNss(nss);
-}
-
-TEST_F(WriteOpAnalyzerTestImpl, FindAndModifyWithSortOnUntrackedCollectionSucceeds) {
-    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "tscoll");
-    auto uuid = UUID::gen();
-    auto dbVersion = DatabaseVersion(uuid, Timestamp{1, 1});
-    // Untracked collections have no routing table, so isTimeseriesCollection is false and the
-    // sort restriction never fires.
-    auto cri = CatalogCacheMock::makeCollectionRoutingInfoUntracked(nss, kShard1Name, dbVersion);
-    auto rtx = RoutingContext::createSynthetic({{nss, cri}});
-
-    write_ops::FindAndModifyCommandRequest fam(nss);
-    fam.setQuery(BSON("ts" << BSON("$gt" << 0)));
-    fam.setUpdate(write_ops::UpdateModification(BSON("$set" << BSON("a" << 1))));
-    fam.setSort(BSON("ts" << 1));
-    WriteOp op(fam);
-    ASSERT_OK(analyzer.analyze(operationContext(), *rtx, op).getStatus());
-    rtx->onRequestSentForNss(nss);
-}
-
-TEST_F(WriteOpAnalyzerTestImpl, FindAndModifyWithSortOnShardedTimeseriesIsRejected) {
-    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "tscoll");
-    UUID uuid = UUID::gen();
-    auto rtx = createRoutingContextShardedTimeseries({{uuid, nss}});
-
-    write_ops::FindAndModifyCommandRequest fam(nss);
-    fam.setQuery(BSON("x" << -1));
-    fam.setUpdate(write_ops::UpdateModification(BSON("$set" << BSON("a" << 1))));
-    fam.setSort(BSON("x" << 1));
-    WriteOp op(fam);
-    ASSERT_EQ(analyzer.analyze(operationContext(), *rtx, op).getStatus().code(),
-              ErrorCodes::InvalidOptions);
-}
-
 }  // namespace
 }  // namespace unified_write_executor
 }  // namespace mongo

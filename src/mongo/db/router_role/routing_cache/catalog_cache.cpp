@@ -19,7 +19,6 @@
 #include "mongo/db/shard_role/transaction_resources.h"
 #include "mongo/db/sharding_environment/grid.h"
 #include "mongo/db/sharding_environment/mongod_and_mongos_server_parameters_gen.h"
-#include "mongo/db/sharding_environment/shard_ref.h"
 #include "mongo/db/topology/shard_registry.h"
 #include "mongo/db/versioning_protocol/chunk_version.h"
 #include "mongo/db/versioning_protocol/shard_version_factory.h"
@@ -150,15 +149,6 @@ bool CollectionRoutingInfo::hasRoutingTable() const {
 }
 
 const ShardId& CollectionRoutingInfo::getDbPrimaryShardId() const {
-    const auto& shardRef = _dbInfo->getPrimary();
-    uassert(ErrorCodes::BadValue,
-            str::stream() << "Cannot represent shard " << shardRef
-                          << " as a ShardId because it is a UUID; use getShardRefAt() instead",
-            shardRef.isString());
-    return shardRef.getShardId();
-}
-
-const ShardRef& CollectionRoutingInfo::getDbPrimaryShardRef() const {
     return _dbInfo->getPrimary();
 }
 
@@ -335,7 +325,7 @@ StatusWith<CachedDatabaseInfo> CatalogCache::_getDatabase(OperationContext* opCt
         // finding the CatalogCache thread pool is full when the aggregation itself needs to refresh
         // the cache (i.e. $unionWith).
         return CachedDatabaseInfo{
-            DatabaseType(dbName, ShardRef{ShardId::kConfigServerId}, DatabaseVersion::makeFixed())};
+            DatabaseType(dbName, ShardId::kConfigServerId, DatabaseVersion::makeFixed())};
     }
 
     Timer t{};

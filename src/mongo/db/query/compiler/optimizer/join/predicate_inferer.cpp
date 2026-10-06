@@ -13,6 +13,7 @@
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/query/compiler/optimizer/join/join_graph.h"
 #include "mongo/db/query/compiler/optimizer/join/path_resolver.h"
+#include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/query/query_shape/serialization_options.h"
 #include "mongo/db/query/util/disjoint_set.h"
 
@@ -294,22 +295,34 @@ StatusWith<std::unique_ptr<MatchExpression>> finalizeSTPForTargetNode(
 }
 
 StatusWith<std::unique_ptr<CanonicalQuery>> cloneCQWithUpdatedFilter(
-    boost::intrusive_ptr<ExpressionContext> expCtx,
-    NamespaceString nss,
-    std::unique_ptr<MatchExpression> expr,
-    const CanonicalQuery& cqOld) {
-    ExpressionContext::PlanCacheOptions oldPlanCache = expCtx->getPlanCache();
+    const CanonicalQuery& cqOld, std::unique_ptr<MatchExpression> expr, bool enableSimplification) {
+    const auto& oldExpCtx = cqOld.getExpCtx();
+    auto expCtx = makeCopyFromExpressionContext(oldExpCtx, cqOld.nss(), oldExpCtx->getUUID());
+    // Share the collator instance so it is the same object as on the source ExpressionContext,
+    // which the $expr nodes in 'expr' still point at.
+    if (!expCtx->getIgnoreCollator()) {
+        expCtx->setCollator(oldExpCtx->getCollatorShared());
+    }
+    if (enableSimplification) {
+        expCtx->setInLookup(false);
+    }
     expCtx->setPlanCache(ExpressionContext::PlanCacheOptions::kDisablePlanCache);
-    auto fcr = std::make_unique<FindCommandRequest>(nss);
-    fcr->setProjection(cqOld.getFindCommandRequest().getProjection());
+
+    expr->setCollator(expCtx->getCollator());
+
+    auto fcr = query_request_helper::makeFromFindCommand(cqOld.getFindCommandRequest());
+    // Replace the old filter with the new one.
+    fcr->setFilter(expr->serialize());
     auto pfc = ParsedFindCommand::withExistingFilter(expCtx,
                                                      nullptr,
                                                      std::move(expr),
                                                      std::move(fcr),
                                                      ProjectionPolicies::findProjectionPolicies());
+    if (!pfc.isOK()) {
+        return pfc.getStatus();
+    }
     CanonicalQueryParams params{.expCtx = expCtx, .parsedFind = std::move(pfc.getValue())};
     auto cq = CanonicalQuery::make(std::move(params));
-    expCtx->setPlanCache(oldPlanCache);
     if (cq.isOK() && SubPlanningUtils::canUseSubplanning(*cq.getValue())) {
         return Status(ErrorCodes::QueryFeatureNotAllowed,
                       "Encountered rooted $or, can't use subplanning together with join opt");
@@ -326,7 +339,8 @@ Status propagateSingleTablePredicate(absl::InlinedVector<PathId, 8> equivalenceC
                                      const std::vector<ResolvedPath>& resolvedPaths,
                                      MutableJoinGraph& graph,
                                      const FieldPath& sourceFieldName,
-                                     std::vector<BSONObj>& accessPathsBackingBson) {
+                                     std::vector<BSONObj>& accessPathsBackingBson,
+                                     OpDebug::JoinOptimizationMetrics& metrics) {
     for (PathId pathId : equivalenceClass) {
         if (pathId == sourcePathId) {
             // This node produced the STP we're propagating - no work to do, skip.
@@ -354,18 +368,11 @@ Status propagateSingleTablePredicate(absl::InlinedVector<PathId, 8> equivalenceC
 
         // After construction, CanonicalQuery's MatchExpression is read-only. Since the propogation
         // logic above requires updating the root of the MatchExpression, updating the join node's
-        // access path will require constructing an entirely new CQ with the newFilter.
-        auto nss = targetNode.collectionName;
-        // TODO (SERVER-130378): Clone target.acessPath->getExpCtx() and pass that CQ construction
-        // below.
-        auto expCtx = ExpressionContextBuilder{}
-                          .opCtx(targetNode.accessPath->getExpCtx()->getOperationContext())
-                          .ns(nss)
-                          .build();
-        // This will normalize and optimize the Match Expression (eg flattening an unnecessary AND
-        // wrapper) before creating the new CQ.
-        auto swCq =
-            cloneCQWithUpdatedFilter(expCtx, nss, std::move(newFilter), *targetNode.accessPath);
+        // access path will require constructing an entirely new CQ with the newFilter. This will
+        // normalize and optimize the MatchExpression (eg flattening an unnecessary AND wrapper)
+        // before creating the new CQ.
+        auto swCq = cloneCQWithUpdatedFilter(
+            *targetNode.accessPath, std::move(newFilter), /*enableSimplification=*/true);
         if (!swCq.isOK()) {
             uassertStatusOK(swCq.getStatus());
         }
@@ -378,6 +385,8 @@ Status propagateSingleTablePredicate(absl::InlinedVector<PathId, 8> equivalenceC
         // hold onto the original BSONObj.
         accessPathsBackingBson.emplace_back(targetNode.accessPath->getQueryObj());
         targetNode.accessPath = std::move(swCq.getValue());
+
+        metrics.numInferredSingleTablePredicates++;
     }
     return Status::OK();
 }
@@ -432,7 +441,8 @@ StatusWith<std::vector<BSONObj>> inferSingleTablePredicate(
     MutableJoinGraph& graph,
     const std::vector<ResolvedPath>& resolvedPaths,
     stdx::unordered_map<size_t, absl::InlinedVector<PathId, 8>> pathSets,
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    OpDebug::JoinOptimizationMetrics& metrics) {
     std::vector<BSONObj> accessPathsBackingBson;
 
     for (const auto& [setId, equivalenceClass] : pathSets) {
@@ -446,7 +456,8 @@ StatusWith<std::vector<BSONObj>> inferSingleTablePredicate(
                                                     resolvedPaths,
                                                     graph,
                                                     fieldName,
-                                                    accessPathsBackingBson);
+                                                    accessPathsBackingBson,
+                                                    metrics);
             if (!sw.isOK()) {
                 return sw;
             }
@@ -471,7 +482,8 @@ StatusWith<std::vector<BSONObj>> addImplicitEdgesAndInferPredicates(
     MutableJoinGraph& graph,
     const std::vector<ResolvedPath>& resolvedPaths,
     size_t maxNodes,
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    OpDebug::JoinOptimizationMetrics& metrics) {
     DisjointSet ds{resolvedPaths.size()};
     for (const auto& edge : graph.edges()) {
         for (const auto& pred : edge.predicates) {
@@ -511,16 +523,13 @@ StatusWith<std::vector<BSONObj>> addImplicitEdgesAndInferPredicates(
                     // unoptimized.
                     break;
                 }
+                metrics.numInferredEqJoinPredicates++;
             }
             pathSet.push_back(currentPathId);
         }
     }
-    // TODO SERVER-117385 remove this flag and this check once we can handle inferred predicates in
-    // our CE.
-    if (!expCtx->getQueryKnobConfiguration().getInferSingleTablePredicates()) {
-        return std::vector<BSONObj>{};
-    }
-    return inferSingleTablePredicate(graph, resolvedPaths, pathSets, expCtx);
+
+    return inferSingleTablePredicate(graph, resolvedPaths, pathSets, expCtx, metrics);
 }
 
 }  // namespace mongo::join_ordering

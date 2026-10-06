@@ -12,7 +12,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/sharding_environment/client/shard.h"
 #include "mongo/db/sharding_environment/client/shard_factory.h"
-#include "mongo/db/sharding_environment/shard_handle.h"
 #include "mongo/db/sharding_environment/shard_id.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/atomic.h"
@@ -51,9 +50,8 @@ namespace shard_registry_stats {
 class [[MONGO_MOD_PRIVATE]] ShardRegistryData {
 public:
     using ShardMap = stdx::unordered_map<ShardId, std::shared_ptr<Shard>, ShardId::Hasher>;
-    using ShardUUIDMap = stdx::unordered_map<UUID, std::shared_ptr<Shard>, UUID::Hash>;
-    using ShardHandleToConnectionStringMap =
-        stdx::unordered_map<ShardHandle, ConnectionString, ShardHandle::HashByName>;
+    using ShardIdToConnectionStringMap =
+        stdx::unordered_map<ShardId, ConnectionString, ShardId::Hasher>;
 
     /**
      * Creates a basic ShardRegistryData, that only contains the config shard.  Needed during
@@ -66,7 +64,7 @@ public:
      * Builds a ShardRegistryData from a map of shardId -> connectionString.
      * Creates Shard instances (and their RSMs) for each entry.
      */
-    static ShardRegistryData buildFromShardDocs(const ShardHandleToConnectionStringMap& shardDocs,
+    static ShardRegistryData buildFromShardDocs(const ShardIdToConnectionStringMap& shardDocs,
                                                 ShardFactory* shardFactory);
 
     /**
@@ -92,13 +90,12 @@ public:
                                                 ShardFactory* shardFactory);
 
     /**
-     * Returns the shard matching the given ShardRef, or nullptr if no such shard.
+     * Returns the shard matching the given identifier, or nullptr if no such shard.
      *
-     * If shardRef holds a UUID, looks up the shard in the UUID index only. If shardRef holds a
-     * string, looks up first by shard name (ShardId). If 'allowNonShardIdIdentifiers' is true, the
-     * lookup will continue by connection string and host and port.
+     * If 'allowNonShardIdIdentifiers' is false, only shard ids are considered. If true, the
+     * identifier may also be a connection string or host and port.
      */
-    std::shared_ptr<Shard> findShard(const ShardRef& shardRef,
+    std::shared_ptr<Shard> findShard(const ShardId& shardId,
                                      bool allowNonShardIdIdentifiers = false) const;
 
     /**
@@ -132,11 +129,6 @@ private:
     friend class ShardRegistryTest;
 
     /**
-     * Returns the shard with the given shard uuid, or nullptr if no such shard.
-     */
-    std::shared_ptr<Shard> _findByShardUUID(const UUID& shardUUID) const;
-
-    /**
      * Returns the shard with the given shard id, or nullptr if no such shard.
      */
     std::shared_ptr<Shard> _findByShardId(const ShardId&) const;
@@ -150,9 +142,6 @@ private:
      * Puts the given shard object into the lookup maps.
      */
     void _addShard(std::shared_ptr<Shard>);
-
-    // Map of ShardUUID -> Shard
-    ShardUUIDMap _shardUUIDLookup;
 
     // Map of shardName -> Shard
     ShardMap _shardIdLookup;
@@ -272,20 +261,20 @@ public:
     std::shared_ptr<Shard> getConfigShard() const;
 
     /**
-     * Returns a shared pointer to the shard object matching the given ShardRef, or ShardNotFound
-     * otherwise.
+     * Returns a shared pointer to the shard object with the given identifier, or ShardNotFound
+     * error otherwise.
      *
-     * If 'allowNonShardIdIdentifiers' is false, only shard uuid/ids are considered. If true, the
+     * If 'allowNonShardIdIdentifiers' is false, only shard ids are considered. If true, the
      * identifier may also be a connection string or host and port.
      *
      * May refresh the shard registry if there's no cached information about the shard.
      */
     StatusWith<std::shared_ptr<Shard>> getShard(OperationContext* opCtx,
-                                                const ShardRef& shardRef,
+                                                const ShardId& shardId,
                                                 bool allowNonShardIdIdentifiers = false);
 
     SemiFuture<std::shared_ptr<Shard>> getShard(ExecutorPtr executor,
-                                                const ShardRef& shardRef,
+                                                const ShardId& shardId,
                                                 bool allowNonShardIdIdentifiers = false) noexcept;
 
     /**
@@ -450,9 +439,9 @@ private:
          * Create a Time which will cause merging of force reload requests that have been made
          * before 'lookupFn' is evaluated, and contain the topologyTime returned by 'lookupFn'.
          */
-        using LookupFn = std::function<
-            std::pair<ShardRegistryData::ShardHandleToConnectionStringMap, Timestamp>()>;
-        static std::pair<ShardRegistryData::ShardHandleToConnectionStringMap, Time> makeWithLookup(
+        using LookupFn =
+            std::function<std::pair<ShardRegistryData::ShardIdToConnectionStringMap, Timestamp>()>;
+        static std::pair<ShardRegistryData::ShardIdToConnectionStringMap, Time> makeWithLookup(
             LookupFn&& lookupFn);
 
         /**
@@ -559,10 +548,9 @@ private:
      * Tears down RSMs and fires removal hooks for shards that are present in cachedData
      * but absent from the fetched shardDocs.
      */
-    void _tearDownRemovedShards(
-        OperationContext* opCtx,
-        const Cache::ValueHandle& cachedData,
-        const ShardRegistryData::ShardHandleToConnectionStringMap& shardDocs);
+    void _tearDownRemovedShards(OperationContext* opCtx,
+                                const Cache::ValueHandle& cachedData,
+                                const ShardRegistryData::ShardIdToConnectionStringMap& shardDocs);
 
     void _initializeCacheIfNecessary() const;
 

@@ -4,6 +4,8 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 
 #include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/util/builder.h"
@@ -21,6 +23,7 @@
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/db/storage/exceptions.h"
 #include "mongo/db/storage/execution_context.h"
+#include "mongo/db/storage/record_store_write_conflict_fail_points.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/spill_wiredtiger_kv_engine.h"
@@ -148,6 +151,24 @@ MONGO_FAIL_POINT_DEFINE(WTCompactRecordStoreEBUSY);
 MONGO_FAIL_POINT_DEFINE(WTRecordStoreUassertOutOfOrder);
 MONGO_FAIL_POINT_DEFINE(WTWriteConflictException);
 MONGO_FAIL_POINT_DEFINE(WTWriteConflictExceptionForReads);
+
+void registerWiredTigerWriteConflictFailPoints(std::string_view engineName) {
+    registerWriteConflictForWritesFactory(engineName, [](FailPoint::ModeOptions mode) {
+        return std::make_unique<FailPointEnableBlock>(&WTWriteConflictException, std::move(mode));
+    });
+    registerWriteConflictForReadsFactory(engineName, [](FailPoint::ModeOptions mode) {
+        return std::make_unique<FailPointEnableBlock>(&WTWriteConflictExceptionForReads,
+                                                      std::move(mode));
+    });
+}
+
+namespace {
+
+MONGO_INITIALIZER(WiredTigerRegisterWriteConflictFailPoints)(InitializerContext*) {
+    registerWiredTigerWriteConflictFailPoints(kWiredTigerEngineName);
+}
+
+}  // namespace
 
 std::variant<WiredTigerIntegerKeyedContainer, WiredTigerStringKeyedContainer>
 WiredTigerRecordStore::_makeContainer(Params& params) {
@@ -473,7 +494,7 @@ StatusWith<int64_t> WiredTigerRecordStore::wtCompact(OperationContext* opCtx,
     if (options.freeSpaceTargetMB) {
         config << ",free_space_target=" << std::to_string(*options.freeSpaceTargetMB) << "MB";
     }
-    const std::string uri(getURI());
+    const std::string& uri = getURI();
     int ret = s->compact(uri.c_str(), config.str().c_str());
 
     if (ret == WT_ERROR && !opCtx->checkForInterruptNoAssert().isOK()) {
@@ -634,8 +655,7 @@ WiredTigerRecordStore::WiredTigerRecordStore(WiredTigerKVEngineBase* kvEngine,
         }
     }
 
-    uassertStatusOK(
-        WiredTigerUtil::setTableLogging(*ru.getSession(), std::string{getURI()}, _isLogged));
+    uassertStatusOK(WiredTigerUtil::setTableLogging(*ru.getSession(), getURI(), _isLogged));
 
     // If no SizeStorer is in use, start counting at zero. In practice, this will only ever be the
     // case for temporary RecordStores (those not associated with any collection) and in unit
@@ -696,11 +716,19 @@ void WiredTigerRecordStore::checkSize(OperationContext* opCtx, RecoveryUnit& ru)
 }
 
 long long WiredTigerRecordStore::dataSize() const {
+    if (!_sizeStorer) {
+        return _accurateDataSize.load();
+    }
+
     auto dataSize = _sizeInfo->dataSize.load();
     return dataSize > 0 ? dataSize : 0;
 }
 
 long long WiredTigerRecordStore::numRecords() const {
+    if (!_sizeStorer) {
+        return _accurateNumRecords.load();
+    }
+
     auto numRecords = _sizeInfo->numRecords.load();
     return numRecords > 0 ? numRecords : 0;
 }
@@ -724,10 +752,8 @@ int64_t WiredTigerRecordStore::storageSize(RecoveryUnit& ru,
         return dataSize();
     }
     WiredTigerSession* session = WiredTigerRecoveryUnit::get(ru).getSessionNoTxn();
-    auto result = WiredTigerUtil::getStatisticsValue(*session,
-                                                     "statistics:" + std::string{getURI()},
-                                                     "statistics=(size)",
-                                                     WT_STAT_DSRC_BLOCK_SIZE);
+    auto result = WiredTigerUtil::getStatisticsValue(
+        *session, "statistics:" + getURI(), "statistics=(size)", WT_STAT_DSRC_BLOCK_SIZE);
     uassertStatusOK(result.getStatus());
 
     return result.getValue();
@@ -742,7 +768,25 @@ int64_t WiredTigerRecordStore::Capped::storageSize(RecoveryUnit& ru,
 
 int64_t WiredTigerRecordStore::freeStorageSize(RecoveryUnit& ru) const {
     WiredTigerSession* session = WiredTigerRecoveryUnit::get(ru).getSessionNoTxn();
-    return WiredTigerUtil::getIdentReuseSize(*session, std::string{getURI()});
+    return WiredTigerUtil::getIdentReuseSize(*session, getURI());
+}
+
+boost::optional<int64_t> WiredTigerRecordStore::approxNumLeafPages(RecoveryUnit& ru) const {
+    WiredTigerSession* session = WiredTigerRecoveryUnit::get(ru).getSessionNoTxn();
+    // WT maintains this count incrementally and persists it in the checkpoint metadata, so
+    // reading it does not require a tree walk. It is only populated at the "fast" statistics
+    // level; "size" statistics bypass btree statistics entirely.
+    auto result = WiredTigerUtil::getStatisticsValue(
+        *session, "statistics:" + getURI(), "statistics=(fast)", WT_STAT_DSRC_BTREE_ROW_LEAF_PAGES);
+    // A positive count is always trustworthy: a table whose checkpoint metadata predates the
+    // counter holds WT's internal "never tracked" marker (UINT64_MAX) rather than a partially
+    // tracked count, and the marker reads as 0 here because the statistics API clamps negative
+    // aggregates (the marker is -1 in the int64_t statistics slot). A 0 therefore means either
+    // "never tracked" or "tree never split", neither is a usable page count.
+    if (!result.isOK() || result.getValue() <= 0) {
+        return boost::none;
+    }
+    return result.getValue();
 }
 
 void WiredTigerRecordStore::_updateLargestRecordId(OperationContext* opCtx,
@@ -949,6 +993,16 @@ StatusWith<RecordData> WiredTigerRecordStore::_updateWithDamages(
 
 void WiredTigerRecordStore::printRecordMetadata(const RecordId& recordId,
                                                 std::set<Timestamp>* recordTimestamps) const {
+    if (!rss::ReplicatedStorageService::get(getGlobalServiceContext())
+             .getPersistenceProvider()
+             .supportsVersionCursor()) {
+        LOGV2_WARNING(13351201,
+                      "Skipping printing record metadata because the persistence provider does not "
+                      "support version cursors",
+                      "recordId"_attr = recordId);
+        return;
+    }
+
     // Printing the record metadata requires a new session. We cannot open other cursors when there
     // are open history store cursors in the session.
     WiredTigerSession session(&_kvEngine->getConnection());
@@ -1094,7 +1148,7 @@ void WiredTigerRecordStore::validate(RecoveryUnit& ru,
     }
 
     int err = WiredTigerUtil::verifyTable(*WiredTigerRecoveryUnit::get(ru).getSession(),
-                                          std::string{getURI()},
+                                          getURI(),
                                           options.verifyConfigurationOverride(),
                                           results->getErrorsUnsafe());
     if (!err) {
@@ -1134,7 +1188,7 @@ void WiredTigerRecordStore::appendNumericCustomStats(RecoveryUnit& ru,
 
     BSONObjBuilder bob(result->subobjStart(_engineName));
 
-    appendNumericStats(*session, std::string{getURI()}, bob);
+    appendNumericStats(*session, getURI(), bob);
 }
 
 void WiredTigerRecordStore::appendAllCustomStats(RecoveryUnit& ru,
@@ -1153,7 +1207,7 @@ void WiredTigerRecordStore::appendAllCustomStats(RecoveryUnit& ru,
     }
 
     std::string type, sourceURI;
-    WiredTigerUtil::fetchTypeAndSourceURI(*session, std::string{getURI()}, &type, &sourceURI);
+    WiredTigerUtil::fetchTypeAndSourceURI(*session, getURI(), &type, &sourceURI);
     StatusWith<std::string> metadataResult = WiredTigerUtil::getMetadataCreate(*session, sourceURI);
     std::string_view creationStringName("creationString");
     if (!metadataResult.isOK()) {
@@ -1167,7 +1221,7 @@ void WiredTigerRecordStore::appendAllCustomStats(RecoveryUnit& ru,
         bob.append("type", type);
     }
 
-    appendNumericStats(*session, std::string{getURI()}, bob);
+    appendNumericStats(*session, getURI(), bob);
 }
 
 void WiredTigerRecordStore::updateStatsAfterRepair(long long numRecords, long long dataSize) {
@@ -1467,14 +1521,22 @@ Status WiredTigerRecordStore::Oplog::_rangeTruncate(OperationContext* opCtx,
                                                     const RecordId& maxRecordId,
                                                     int64_t hintDataSizeIncrement,
                                                     int64_t hintNumRecordsIncrement) {
+    // A range beginning after the cached earliest record would strand records no later truncate
+    // could remove.
+    auto cached = Timestamp(_cachedEarliestTimestamp.load());
+    dassert(minRecordId.isNull() || cached.isNull() ||
+            Timestamp(static_cast<uint64_t>(minRecordId.getLong())) <= cached);
+
     auto status = WiredTigerRecordStore::_rangeTruncate(
         opCtx, ru, minRecordId, maxRecordId, hintDataSizeIncrement, hintNumRecordsIncrement);
     if (status.isOK()) {
-        auto swTs = _readEarliestTimestamp(ru);
+        // Oplog truncation passes either a null lower bound or the node's own oldest record, so
+        // the oldest one left is the first record past the range we removed.
+        auto swTs = _readEarliestTimestamp(ru, maxRecordId);
         if (swTs.isOK()) {
             ru.onCommit(
                 [this, ts = swTs.getValue()](OperationContext*, boost::optional<Timestamp>) {
-                    _cachedEarliestTimestamp.store(ts.asULL());
+                    _advanceCachedEarliestTimestamp(ts);
                 });
         }
     }
@@ -1514,7 +1576,7 @@ WiredTigerRecordStore::Oplog::Oplog(WiredTigerKVEngine* engine,
       _maxSize(oplogParams.oplogMaxSize) {
     invariant(WiredTigerRecordStore::keyFormat() == KeyFormat::Long);
     invariant(oplogParams.oplogMaxSize);
-    checkOplogFormatVersion(ru, std::string{getURI()});
+    checkOplogFormatVersion(ru, getURI());
     // The oplog always needs to be marked for size adjustment since it is journaled and also
     // may change during replication recovery (if truncated).
     sizeRecoveryState(getGlobalServiceContext())
@@ -1602,7 +1664,8 @@ StatusWith<Timestamp> WiredTigerRecordStore::Oplog::getLatestTimestamp(RecoveryU
     return {Timestamp(static_cast<unsigned long long>(recordId.getLong()))};
 }
 
-StatusWith<Timestamp> WiredTigerRecordStore::Oplog::_readEarliestTimestamp(RecoveryUnit& ru) {
+StatusWith<Timestamp> WiredTigerRecordStore::Oplog::_readEarliestTimestamp(RecoveryUnit& ru,
+                                                                           const RecordId& after) {
     auto wtRu = WiredTigerRecoveryUnit::get(&ru);
 
     bool ruWasActive = wtRu->isActive();
@@ -1616,6 +1679,13 @@ StatusWith<Timestamp> WiredTigerRecordStore::Oplog::_readEarliestTimestamp(Recov
     WiredTigerCursor curwrap(std::move(cursorParams), getURI(), *wtRu->getSession());
 
     auto cursor = curwrap.get();
+    if (!after.isNull()) {
+        auto key = makeCursorKey(after, KeyFormat::Long);
+        setKey(cursor, &key);
+        invariantWTOK(
+            cursor->bound(cursor, lowerExclusiveBoundConfig.getConfig(wtRu->getSession())),
+            cursor->session);
+    }
     auto ret = cursor->next(cursor);
     if (ret == WT_NOTFOUND) {
         return Status(ErrorCodes::CollectionIsEmpty, "oplog is empty");
@@ -1627,11 +1697,18 @@ StatusWith<Timestamp> WiredTigerRecordStore::Oplog::_readEarliestTimestamp(Recov
 }
 
 StatusWith<Timestamp> WiredTigerRecordStore::Oplog::getEarliestTimestamp(RecoveryUnit& ru) {
-    auto swTs = _readEarliestTimestamp(ru);
+    auto swTs = _readEarliestTimestamp(ru, RecordId());
     if (swTs.isOK()) {
-        _cachedEarliestTimestamp.store(swTs.getValue().asULL());
+        _advanceCachedEarliestTimestamp(swTs.getValue());
     }
     return swTs;
+}
+
+void WiredTigerRecordStore::Oplog::_advanceCachedEarliestTimestamp(Timestamp ts) {
+    auto expected = _cachedEarliestTimestamp.load();
+    while (ts.asULL() > expected &&
+           !_cachedEarliestTimestamp.compareAndSwap(&expected, ts.asULL())) {
+    }
 }
 
 Timestamp WiredTigerRecordStore::Oplog::getCachedEarliestTimestamp() const {
@@ -1789,6 +1866,9 @@ RecordId WiredTigerRecordStoreCursorBase::nextIdCommon() {
         if (advanceRet == WT_NOTFOUND) {
             _eof = true;
             _positioned = false;
+            if (_forward) {
+                _cursor->onScanComplete();
+            }
             return {};
         }
         invariantWTOK(advanceRet, c->session);

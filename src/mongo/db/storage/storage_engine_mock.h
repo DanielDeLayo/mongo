@@ -8,6 +8,7 @@
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/util/modules.h"
 
+#include <mutex>
 #include <string_view>
 
 namespace mongo {
@@ -72,7 +73,7 @@ public:
         return {};
     }
 
-    void dropSpillTable(RecoveryUnit& ru, std::string_view ident) final {
+    void dropSpillTable(RecoveryUnit& ru, std::string_view ident) override {
         _droppedSpillIdents.emplace_back(ident);
     };
 
@@ -114,16 +115,29 @@ public:
     }
 
     void setLastMaterializedLsn(uint64_t lsn) final {
+        if (lsn <= _lastSetMaterializedLsn) {
+            return;
+        }
         _lastSetMaterializedLsn = lsn;
+        _operations.push_back("setLastMaterializedLsn");
     }
 
-    void setRecoveryCheckpointMetadata(std::string_view checkpointMetadata) final {
+    Status setRecoveryCheckpointMetadata(std::string_view checkpointMetadata) final {
         _operations.push_back("setRecoveryCheckpointMetadata");
+        auto status = _nextRecoveryCheckpointMetadataStatus;
+        _nextRecoveryCheckpointMetadataStatus = Status::OK();
+        return status;
     }
 
-    void promoteToLeader() final {}
+    void failNextSetRecoveryCheckpointMetadata(Status status) {
+        _nextRecoveryCheckpointMetadataStatus = std::move(status);
+    }
 
-    void demoteFromLeader() final {}
+    void promoteToLeader() final {
+        _operations.push_back("promoteToLeader");
+    }
+
+    void demoteToFollower() final {}
 
     void setStableTimestamp(Timestamp stableTimestamp, bool force = false) override {
         _stableTimestamp = stableTimestamp;
@@ -143,15 +157,21 @@ public:
     Timestamp getOldestTimestamp() const final {
         return {};
     };
-    void setStepDownTimestamp(Timestamp stepDownTimestamp) override {}
+    void setStepDownTimestamp(WithLock, Timestamp stepDownTimestamp) override {
+        _stepDownTimestamp = stepDownTimestamp;
+        ++_setStepDownTimestampCount;
+    }
+    std::unique_lock<std::mutex> lockStepDown() override {
+        return std::unique_lock(_stepdownMutex);
+    }
     Timestamp getStepDownTimestamp() const override {
-        return {};
+        return _stepDownTimestamp;
     }
     void setOldestActiveTransactionTimestampCallback(
         OldestActiveTransactionTimestampCallback callback) final {}
 
     Timestamp getAllDurableTimestamp() const final {
-        return {};
+        return _allDurableTimestamp;
     }
     boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final {
         return boost::none;
@@ -169,9 +189,7 @@ public:
     void dropIdentTimestamped(OperationContext* opCtx,
                               std::string_view ident,
                               Timestamp timestamp) final {}
-    void addDropPendingIdent(const DropTime& dropTime,
-                             std::shared_ptr<Ident> ident,
-                             DropIdentCallback&& onDrop) final {}
+    void addDropPendingIdent(const DropTime& dropTime, std::shared_ptr<Ident> ident) final {}
     void dropUnknownIdent(RecoveryUnit& ru,
                           const Timestamp& stableTimestamp,
                           std::string_view ident) final {}
@@ -186,7 +204,9 @@ public:
     void stopTimestampMonitor() final {}
     void restartTimestampMonitor() final {}
 
-    void checkpoint() final {}
+    void checkpoint() final {
+        ++_checkpointCount;
+    }
 
     StorageEngine::CheckpointIteration getCheckpointIteration() const final {
         return StorageEngine::CheckpointIteration{0};
@@ -329,6 +349,18 @@ public:
         return _operations;
     }
 
+    int getSetStepDownTimestampCount() const {
+        return _setStepDownTimestampCount;
+    }
+
+    void setAllDurableTimestamp(Timestamp allDurableTimestamp) {
+        _allDurableTimestamp = allDurableTimestamp;
+    }
+
+    int getCheckpointCount() const {
+        return _checkpointCount;
+    }
+
 private:
     bool _isInLeaderMode = false;
     uint64_t _lastSetMaterializedLsn = 0;
@@ -336,7 +368,13 @@ private:
     Timestamp _lastSetOldestTimestamp;
     bool _lastSetOldestTimestampForce = false;
     Timestamp _stableTimestamp;
+    Timestamp _stepDownTimestamp;
+    std::mutex _stepdownMutex;
+    Timestamp _allDurableTimestamp;
+    int _setStepDownTimestampCount = 0;
+    int _checkpointCount = 0;
     std::vector<std::string> _operations;
+    Status _nextRecoveryCheckpointMetadataStatus = Status::OK();
 };
 
 }  // namespace mongo

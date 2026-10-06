@@ -951,6 +951,17 @@ private:
     std::pair<SbStage, PlanStageSlots> buildSort(const QuerySolutionNode* root,
                                                  const PlanStageReqs& reqs);
 
+    // This function is called as the last step of buildSort, to build the sort stage and produce
+    // its outputs. Its aim is to reduce the stack space required by the buildSort function, which
+    // is valuable in case we have to build pipelines composed of multiple $sort.
+    MONGO_COMPILER_NOINLINE
+    std::pair<SbStage, PlanStageSlots> buildSortStageAndOutputs(const QuerySolutionNode* root,
+                                                                const PlanStageReqs& reqs,
+                                                                const PlanStageReqs& forwardingReqs,
+                                                                BuildSortKeysPlan plan,
+                                                                SbStage stage,
+                                                                PlanStageSlots childOutputs);
+
     std::pair<SbStage, PlanStageSlots> buildSortCovered(const QuerySolutionNode* root,
                                                         const PlanStageReqs& reqs);
 
@@ -1019,9 +1030,6 @@ private:
     std::pair<SbStage, PlanStageSlots> buildSearch(const QuerySolutionNode* root,
                                                    const PlanStageReqs& reqs);
 
-    std::pair<SbStage, PlanStageSlots> buildWindow(const QuerySolutionNode* root,
-                                                   const PlanStageReqs& reqs);
-
     /**
      * Constructs an optimized SBE plan for 'root' in the case that the fields of the shard key
      * pattern are provided by the child index scan. In this case, the SBE plan for the child
@@ -1034,6 +1042,12 @@ private:
 
     std::pair<SbStage, PlanStageSlots> buildGroup(const QuerySolutionNode* root,
                                                   const PlanStageReqs& reqs);
+
+    MONGO_COMPILER_NOINLINE
+    std::pair<SbStage, PlanStageSlots> buildGroupFinalizeOutputs(const PlanStageReqs& reqs,
+                                                                 const GroupNode* groupNode,
+                                                                 SbStage stage,
+                                                                 PlanStageSlots childOutputs);
 
     std::tuple<SbStage, std::vector<std::string>, SbSlotVector, PlanStageSlots> buildGroupImpl(
         SbStage stage,
@@ -1065,6 +1079,9 @@ private:
 
     std::pair<SbStage, PlanStageSlots> buildIndexedJoinEmbeddingNode(const QuerySolutionNode* root,
                                                                      const PlanStageReqs& reqs);
+
+    std::pair<SbStage, PlanStageSlots> buildIndexedJoinIndexProbe(const QuerySolutionNode* root,
+                                                                  const PlanStageReqs& reqs);
 
     std::pair<SbStage, PlanStageSlots> buildUnpackTsBucket(const QuerySolutionNode* root,
                                                            const PlanStageReqs& reqs);
@@ -1169,8 +1186,8 @@ private:
     // Hash set tracking the Collators used by the SBE plan being built.
     absl::flat_hash_map<const CollatorInterface*, const CollatorInterface*> _collatorsMap;
 
-    // Maintains a mapping from AccumulationStatements / WindowFunctionStatements to their
-    // corresponding SortSpecs (stored in slots).
+    // Maintains a mapping from AccumulationStatements to their corresponding SortSpecs (stored in
+    // slots).
     absl::flat_hash_map<const void*, sbe::value::SlotId> _sortSpecMap;
 
     const MultipleCollectionAccessor& _collections;

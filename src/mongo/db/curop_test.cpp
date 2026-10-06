@@ -10,19 +10,24 @@
 #include "mongo/db/admission/execution_control/execution_admission_context.h"
 #include "mongo/db/admission/execution_control/execution_control_parameters_gen.h"
 #include "mongo/db/admission/execution_control/ticketing_system.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status/server_status_metric.h"
+#include "mongo/db/namespace_string_util.h"
 #include "mongo/db/operation_context_options_gen.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_stats/mock_key.h"
 #include "mongo/db/query/query_stats/plan_shape_counters/plan_shape_counts.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/storage/storage_stats.h"
 #include "mongo/db/topology/cluster_role.h"
 #include "mongo/transport/mock_session.h"
 #include "mongo/transport/transport_layer_mock.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/server_parameter_guard.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/tick_source_mock.h"
 
 #include <algorithm>
@@ -708,7 +713,8 @@ TEST(CurOpTest, OptionalAdditiveMetricsNotDisplayedIfUninitialized) {
                                          "millis",
                                          "micros",
                                          "flowControl",
-                                         "planRanker"};
+                                         "planRanker",
+                                         "queues"};
 
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
@@ -748,7 +754,46 @@ TEST(CurOpTest, OptionalAdditiveMetricsNotDisplayedIfUninitialized) {
     }
 }
 
-TEST(CurOpTest, PlanRankerMethodAppendedToProfilerOutput) {
+TEST(CurOpTest, AppendReportsUserAcquisitionAndLDAPOperationStatsAsDistinctObjects) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    SingleThreadedLockStats ls;
+
+    auto curop = CurOp::get(*opCtx);
+    const OpDebug& od = curop->debug();
+
+    // Record one user-cache acquisition (authorization)and one LDAP bind (LDAPOperations) so that
+    // both sets of stats report.
+    auto userAcquisitionStats = curop->getUserAcquisitionStats();
+    auto* tickSource = opCtx->getServiceContext()->getTickSource();
+    {
+        UserAcquisitionStatsHandle handle(userAcquisitionStats.get(), tickSource, kCache);
+    }
+    {
+        UserAcquisitionStatsHandle handle(userAcquisitionStats.get(), tickSource, kBind);
+    }
+    ASSERT_TRUE(userAcquisitionStats->shouldReportUserCacheAccessStats());
+    ASSERT_TRUE(userAcquisitionStats->shouldReportLDAPOperationStats());
+
+    BSONObjBuilder builder;
+    od.append(opCtx.get(), ls, {}, {}, 0, false /*omitCommand*/, builder);
+    BSONObj bs = builder.done();
+
+    ASSERT_TRUE(bs.hasField("authorization")) << bs;
+    ASSERT_EQ(bs["authorization"].type(), BSONType::object) << bs;
+    ASSERT_FALSE(bs.getObjectField("authorization").isEmpty()) << bs;
+
+    ASSERT_TRUE(bs.hasField("LDAPOperations")) << bs;
+    ASSERT_EQ(bs["LDAPOperations"].type(), BSONType::object) << bs;
+    BSONObj ldapObj = bs.getObjectField("LDAPOperations");
+    ASSERT_TRUE(ldapObj.hasField("LDAPNumberOfReferrals")) << ldapObj;
+    ASSERT_TRUE(ldapObj.hasField("bindStats")) << ldapObj;
+
+    // The two objects are distinct top-level fields.
+    ASSERT_BSONOBJ_NE(bs.getObjectField("authorization"), bs.getObjectField("LDAPOperations"));
+}
+
+TEST(CurOpTest, PlanSelectionStrategyAppendedToProfilerOutput) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
     SingleThreadedLockStats ls;
@@ -776,18 +821,24 @@ TEST(CurOpTest, PlanRankerMethodAppendedToProfilerOutput) {
         return boost::none;
     };
 
-    // 'kNone' (the default) should always emit "none" so readers can distinguish "no ranking
-    // occurred" from "field missing / old server".
+    // An unset strategy emits "none", and the field is always present so readers can distinguish
+    // "no plan was selected" from "field missing / old server".
     ASSERT_EQ(appendAndGetPlanRanker().value_or(""), "none");
 
-    curop->debug().planRankerMethod = PlanRankerMethod::kMultiPlanner;
-    ASSERT_EQ(appendAndGetPlanRanker().value_or(""), "mp");
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kSinglePlan;
+    ASSERT_EQ(appendAndGetPlanRanker().value_or(""), "singlePlan");
 
-    curop->debug().planRankerMethod = PlanRankerMethod::kCostBasedRanker;
-    ASSERT_EQ(appendAndGetPlanRanker().value_or(""), "cbr");
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kMultiPlanner;
+    ASSERT_EQ(appendAndGetPlanRanker().value_or(""), "multiPlanning");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kCostBasedRanker;
+    ASSERT_EQ(appendAndGetPlanRanker().value_or(""), "costBased");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kCachedPlan;
+    ASSERT_EQ(appendAndGetPlanRanker().value_or(""), "cachedPlan");
 }
 
-TEST(CurOpTest, PlanRankerMethodInSlowQueryLogReport) {
+TEST(CurOpTest, PlanSelectionStrategyInSlowQueryLogReport) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
     SingleThreadedLockStats ls;
@@ -819,17 +870,23 @@ TEST(CurOpTest, PlanRankerMethodInSlowQueryLogReport) {
         return boost::none;
     };
 
-    // report() should always emit planRanker for all three values.
+    // report() should always emit planRanker for every strategy.
     ASSERT_EQ(getPlanRankerAttr().value_or(""), "none");
 
-    curop->debug().planRankerMethod = PlanRankerMethod::kMultiPlanner;
-    ASSERT_EQ(getPlanRankerAttr().value_or(""), "mp");
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kSinglePlan;
+    ASSERT_EQ(getPlanRankerAttr().value_or(""), "singlePlan");
 
-    curop->debug().planRankerMethod = PlanRankerMethod::kCostBasedRanker;
-    ASSERT_EQ(getPlanRankerAttr().value_or(""), "cbr");
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kMultiPlanner;
+    ASSERT_EQ(getPlanRankerAttr().value_or(""), "multiPlanning");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kCostBasedRanker;
+    ASSERT_EQ(getPlanRankerAttr().value_or(""), "costBased");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kCachedPlan;
+    ASSERT_EQ(getPlanRankerAttr().value_or(""), "cachedPlan");
 }
 
-TEST(CurOpTest, PlanRankerMethodInProfileFilterAppendStaged) {
+TEST(CurOpTest, PlanSelectionStrategyInProfileFilterAppendStaged) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
@@ -858,11 +915,184 @@ TEST(CurOpTest, PlanRankerMethodInProfileFilterAppendStaged) {
     // appendStaged() is used for profile filter evaluation; planRanker must be accessible there.
     ASSERT_EQ(stagedAndGetPlanRanker().value_or(""), "none");
 
-    curop->debug().planRankerMethod = PlanRankerMethod::kMultiPlanner;
-    ASSERT_EQ(stagedAndGetPlanRanker().value_or(""), "mp");
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kSinglePlan;
+    ASSERT_EQ(stagedAndGetPlanRanker().value_or(""), "singlePlan");
 
-    curop->debug().planRankerMethod = PlanRankerMethod::kCostBasedRanker;
-    ASSERT_EQ(stagedAndGetPlanRanker().value_or(""), "cbr");
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kMultiPlanner;
+    ASSERT_EQ(stagedAndGetPlanRanker().value_or(""), "multiPlanning");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kCostBasedRanker;
+    ASSERT_EQ(stagedAndGetPlanRanker().value_or(""), "costBased");
+
+    curop->debug().planSelectionStrategy = PlanSelectionStrategy::kCachedPlan;
+    ASSERT_EQ(stagedAndGetPlanRanker().value_or(""), "cachedPlan");
+}
+
+TEST(CurOpTest, UsedJoinOptimizationExposedInAllOutputs) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    SingleThreadedLockStats ls;
+
+    auto curop = CurOp::get(*opCtx);
+    BSONObj command = BSON("a" << 3);
+    {
+        std::lock_guard<Client> clientLock(*opCtx->getClient());
+        curop->setGenericOpRequestDetails(
+            clientLock,
+            NamespaceString::createNamespaceString_forTest("myDb.coll"),
+            nullptr,
+            command,
+            NetworkOp::dbQuery);
+    }
+    curop->ensureStarted();
+    curop->done();
+
+    // Profiler output.
+    auto appendAndGetUsedJoinOptimization = [&]() -> boost::optional<bool> {
+        BSONObjBuilder builder;
+        curop->debug().append(opCtx.get(), ls, {}, {}, 0, false /*omitCommand*/, builder);
+        auto bs = builder.done();
+        if (auto elem = bs["usedJoinOptimization"]) {
+            return elem.Bool();
+        }
+        return boost::none;
+    };
+
+    // Slow query log output.
+    auto reportAndGetUsedJoinOptimization = [&]() -> boost::optional<bool> {
+        logv2::DynamicAttributes pAttrs;
+        Date_t deadline = opCtx->getDeadline();
+        curop->debug().report(opCtx.get(), &ls, {}, 0, &deadline, &pAttrs);
+        logv2::TypeErasedAttributeStorage attrs{pAttrs};
+        for (auto it = attrs.begin(); it != attrs.end(); ++it) {
+            if (it->name == "usedJoinOptimization"sv) {
+                return std::get<bool>(it->value);
+            }
+        }
+        return boost::none;
+    };
+
+    // Profile filter evaluation.
+    auto stagedAndGetUsedJoinOptimization = [&]() -> boost::optional<bool> {
+        auto fn = OpDebug::appendStaged(
+            opCtx.get(), {"usedJoinOptimization"}, false /*needWholeDocument*/);
+        OpDebug::AppendArgs args{opCtx.get(), curop->debug(), *curop};
+        BSONObj result = fn(args);
+        if (auto elem = result["usedJoinOptimization"]) {
+            return elem.Bool();
+        }
+        return boost::none;
+    };
+
+    // The field is omitted when the join optimizer was not used, so that the vast majority of
+    // queries don't pay for an extra field.
+    ASSERT_FALSE(appendAndGetUsedJoinOptimization().has_value());
+    ASSERT_FALSE(reportAndGetUsedJoinOptimization().has_value());
+    ASSERT_FALSE(stagedAndGetUsedJoinOptimization().has_value());
+
+    curop->debug().usedJoinOptimization = true;
+    ASSERT_EQ(appendAndGetUsedJoinOptimization().value_or(false), true);
+    ASSERT_EQ(reportAndGetUsedJoinOptimization().value_or(false), true);
+    ASSERT_EQ(stagedAndGetUsedJoinOptimization().value_or(false), true);
+}
+
+TEST(CurOpTest, JoinOptimizationFallbackReasonExposedInAllOutputs) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    SingleThreadedLockStats ls;
+
+    auto curop = CurOp::get(*opCtx);
+    BSONObj command = BSON("a" << 3);
+    {
+        std::lock_guard<Client> clientLock(*opCtx->getClient());
+        curop->setGenericOpRequestDetails(
+            clientLock,
+            NamespaceString::createNamespaceString_forTest("myDb.coll"),
+            nullptr,
+            command,
+            NetworkOp::dbQuery);
+    }
+    curop->ensureStarted();
+    curop->done();
+
+    auto setFallbackReason = [&](join_ordering::JoinFallbackReason reason) {
+        curop->debug().joinOptimizationMetrics.emplace();
+        curop->debug().joinOptimizationMetrics->fallbackReason = reason;
+    };
+
+    auto appendAndGetFallbackReason = [&]() -> boost::optional<std::string> {
+        BSONObjBuilder builder;
+        curop->debug().append(opCtx.get(), ls, {}, {}, 0, false /*omitCommand*/, builder);
+        auto bs = builder.done();
+        if (auto elem = bs["fallbackReason"]) {
+            return elem.String();
+        }
+        return boost::none;
+    };
+
+    auto reportAndGetFallbackReason = [&]() -> boost::optional<std::string> {
+        logv2::DynamicAttributes pAttrs;
+        Date_t deadline = opCtx->getDeadline();
+        curop->debug().report(opCtx.get(), &ls, {}, 0, &deadline, &pAttrs);
+        logv2::TypeErasedAttributeStorage attrs{pAttrs};
+        for (auto it = attrs.begin(); it != attrs.end(); ++it) {
+            if (it->name == "fallbackReason"sv) {
+                return std::string{std::get<std::string_view>(it->value)};
+            }
+        }
+        return boost::none;
+    };
+
+    auto stagedAndGetFallbackReason = [&]() -> boost::optional<std::string> {
+        auto fn =
+            OpDebug::appendStaged(opCtx.get(), {"fallbackReason"}, false /*needWholeDocument*/);
+        OpDebug::AppendArgs args{opCtx.get(), curop->debug(), *curop};
+        BSONObj result = fn(args);
+        if (auto elem = result["fallbackReason"]) {
+            return elem.String();
+        }
+        return boost::none;
+    };
+
+    ASSERT_FALSE(appendAndGetFallbackReason().has_value());
+    ASSERT_FALSE(reportAndGetFallbackReason().has_value());
+    ASSERT_FALSE(stagedAndGetFallbackReason().has_value());
+
+    setFallbackReason(join_ordering::JoinFallbackReason::kGraphDisconnected);
+    ASSERT_EQ(appendAndGetFallbackReason().value_or(""), "graphDisconnected");
+    ASSERT_EQ(reportAndGetFallbackReason().value_or(""), "graphDisconnected");
+    ASSERT_EQ(stagedAndGetFallbackReason().value_or(""), "graphDisconnected");
+}
+
+TEST(CurOpTest, UsedJoinOptimizationPropagatedFromPlanSummaryStats) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+
+    ASSERT_FALSE(curop->debug().usedJoinOptimization);
+
+    {
+        PlanSummaryStats stats;
+        stats.usedJoinOptimization = false;
+        curop->debug().setPlanSummaryMetrics(std::move(stats));
+    }
+    ASSERT_FALSE(curop->debug().usedJoinOptimization);
+
+    {
+        PlanSummaryStats stats;
+        stats.usedJoinOptimization = true;
+        curop->debug().setPlanSummaryMetrics(std::move(stats));
+    }
+    ASSERT_TRUE(curop->debug().usedJoinOptimization);
+
+    // Once any part of the operation used the join optimizer, a subsequent plan which did not must
+    // not clear the flag.
+    {
+        PlanSummaryStats stats;
+        stats.usedJoinOptimization = false;
+        curop->debug().setPlanSummaryMetrics(std::move(stats));
+    }
+    ASSERT_TRUE(curop->debug().usedJoinOptimization);
 }
 
 TEST(CurOpTest, ShouldUpdateMemoryStats) {
@@ -1800,6 +2030,184 @@ TEST(CurOpTest, ExecutionTimeMicrosPreservesSubMillisecondPrecision) {
     // The microsecond value must not be a round multiple of 1,000 (which would indicate it was
     // derived from a millisecond value rather than stored directly).
     ASSERT_NE(bson["durationMicros"].safeNumberLong() % 1'000, 0LL);
+}
+
+// A mock command with one redacted field, used to verify that reportState() applies the command's
+// field-level redaction (the same the slow-query log uses) to its output.
+class CurOpMockCmd : public BasicCommand {
+public:
+    CurOpMockCmd() : BasicCommand("curOpMockCmd") {}
+
+    std::set<std::string_view> sensitiveFieldNames() const final {
+        return {"field"};
+    }
+    bool run(OperationContext*, const DatabaseName&, const BSONObj&, BSONObjBuilder&) override {
+        return true;
+    }
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+    bool supportsWriteConcern(const BSONObj&) const override {
+        return false;
+    }
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();
+    }
+};
+
+TEST(CurOpTest, ReportStateRedactsCommandFields) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curOp = CurOp::get(*opCtx);
+
+    CurOpMockCmd cmd;
+    BSONObj cmdObj = BSON("curOpMockCmd" << 1 << "field"
+                                         << "value"
+                                         << "$db"
+                                         << "admin");
+    {
+        std::lock_guard<Client> clientLock(*opCtx->getClient());
+        curOp->setGenericOpRequestDetails(
+            clientLock,
+            NamespaceString::createNamespaceString_forTest("admin.$cmd"),
+            &cmd,
+            cmdObj,
+            NetworkOp::dbQuery);
+    }
+
+    BSONObjBuilder bob;
+    curOp->reportState(&bob, SerializationContext{});
+    BSONObj state = bob.obj();
+
+    ASSERT_TRUE(state.hasField("command"));
+    BSONObj command = state["command"].Obj();
+    ASSERT_TRUE(command.hasField("field"));
+    // A field the command marks for redaction is scrubbed in the output, the
+    // same as the slow-query log.
+    ASSERT_EQ(command["field"].str(), "xxx");
+}
+
+TEST(CurOpTest, ReportStateReportsUnrecognizedCommand) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curOp = CurOp::get(*opCtx);
+
+    // A command op with no resolved Command* (unrecognized command).
+    BSONObj cmdObj = BSON("someUnknownCommand" << 1 << "field"
+                                               << "value"
+                                               << "$db"
+                                               << "admin");
+    {
+        std::lock_guard<Client> clientLock(*opCtx->getClient());
+        curOp->setGenericOpRequestDetails(
+            clientLock,
+            NamespaceString::createNamespaceString_forTest("admin.$cmd"),
+            /*command*/ nullptr,
+            cmdObj,
+            NetworkOp::dbQuery);
+    }
+
+    BSONObjBuilder bob;
+    curOp->reportState(&bob, SerializationContext{});
+    BSONObj state = bob.obj();
+
+    // With no Command*, the request is reported as "unrecognized" rather than echoed, consistent
+    // with the slow-query log.
+    ASSERT_EQ(state["command"].str(), "unrecognized");
+}
+
+// A minimal StorageStats implementation so the test can populate CurOp's storage statistics
+// without depending on a storage engine. Only toBSON()/bytesRead() are exercised here.
+class MockStorageStats : public StorageStats {
+public:
+    explicit MockStorageStats(uint64_t bytesRead) : _bytesRead(bytesRead) {}
+
+    void appendToBsonObjBuilder(BSONObjBuilder& builder) const override {
+        BSONObjBuilder dataSection(builder.subobjStart("data"));
+        dataSection.append("bytesRead", static_cast<long long>(_bytesRead));
+    }
+
+    BSONObj toBSON() const override {
+        BSONObjBuilder builder;
+        appendToBsonObjBuilder(builder);
+        return builder.obj();
+    }
+
+    uint64_t bytesRead() const override {
+        return _bytesRead;
+    }
+    Microseconds readingTime() const override {
+        return Microseconds{0};
+    }
+    std::unique_ptr<StorageStats> clone() const override {
+        return std::make_unique<MockStorageStats>(_bytesRead);
+    }
+    StorageStats& operator+=(const StorageStats&) override {
+        return *this;
+    }
+    StorageStats& operator-=(const StorageStats&) override {
+        return *this;
+    }
+
+private:
+    uint64_t _bytesRead;
+};
+
+TEST(CurOpTest, ReportDebugInfoIncludesCurOpState) {
+    QueryTestServiceContext serviceContext;
+
+    auto tickSourceMock = std::make_unique<TickSourceMock<Microseconds>>();
+    // The tick source is initialized to a non-zero value as CurOp equates a value of 0 with a
+    // not-started timer.
+    tickSourceMock->advance(Milliseconds{100});
+
+    auto opCtx = serviceContext.makeOperationContext();
+    auto curop = CurOp::get(*opCtx);
+    curop->setTickSource_forTest(tickSourceMock.get());
+
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.coll");
+    const BSONObj command = BSON("find" << "coll");
+    {
+        std::lock_guard<Client> lk(*opCtx->getClient());
+        curop->setNS(lk, nss);
+        curop->setOpDescription(lk, command);
+        curop->setPlanSummary(lk, std::string{"COLLSCAN"});
+    }
+    curop->ensureStarted();
+    // Advance beyond one second so that 'secs_running' rounds to a non-zero value.
+    tickSourceMock->advance(Seconds{2});
+
+    curop->debug().planCacheShapeHash = 12345u;
+    curop->debug().planCacheKey = 67890u;
+    curop->debug().storageStats = std::make_unique<MockStorageStats>(4096);
+    curop->yielded(3);
+
+    BSONObjBuilder builder;
+    {
+        std::lock_guard<Client> lk(*opCtx->getClient());
+        curop->reportDebugInfo(&builder);
+    }
+    auto bsonObj = builder.done();
+
+    // ns
+    ASSERT_EQ(bsonObj.getStringField("ns"),
+              NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
+    // redacted command
+    ASSERT_TRUE(bsonObj.hasField("command"));
+    ASSERT_EQ(bsonObj["command"].Obj().firstElementFieldName(), std::string{"find"});
+    // planCacheShapeHash (formerly 'queryHash') and planCacheKey
+    ASSERT_EQ(bsonObj.getStringField("planCacheShapeHash"), zeroPaddedHex(12345u));
+    ASSERT_EQ(bsonObj.getStringField("planCacheKey"), zeroPaddedHex(67890u));
+    // planSummary
+    ASSERT_EQ(bsonObj.getStringField("planSummary"), "COLLSCAN");
+    // secs_running
+    ASSERT_EQ(bsonObj["secs_running"].numberLong(), 2);
+    // numYields
+    ASSERT_EQ(bsonObj["numYields"].numberInt(), 3);
+    // storage.data.bytesRead
+    ASSERT_EQ(bsonObj["storage"]["data"]["bytesRead"].numberLong(), 4096);
 }
 
 }  // namespace

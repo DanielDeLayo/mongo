@@ -9,6 +9,7 @@
 #include "mongo/util/modules.h"
 #include "mongo/util/uuid.h"
 
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -37,10 +38,17 @@ public:
 
     void clear();
 
+    bool contains(const UUID& buildUUID) const;
+
     std::vector<std::pair<UUID, Entry>> all() const;
 
+    void setOnChangeHandler(std::function<void()> handler);
+
 private:
+    void _onChange() const noexcept;
+
     mutable std::mutex _mutex;
+    std::function<void()> _onChangeHandler;
     stdx::unordered_map<UUID, Entry, UUID::Hash> _entries;  // Keyed by index build UUID.
 };
 

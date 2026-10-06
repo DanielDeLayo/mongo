@@ -5,6 +5,7 @@
 
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsontypes.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/exec/docval_to_sbeval.h"
 #include "mongo/db/exec/js_function.h"
 #include "mongo/db/exec/sbe/expressions/runtime_environment.h"
@@ -270,6 +271,8 @@ SbExpr generateTraverseF(SbExpr inputExpr,
     };
 
     if (omitTraverseF) {
+        auto& opDebug = CurOp::get(state.opCtx)->debug();
+        opDebug.pathArraynessSimplified = true;
         return makeResultExpr(fieldExpr, false /* canPathBeArray */);
     }
 
@@ -422,6 +425,12 @@ void generatePredicate(MatchExpressionVisitorContext* context,
     const bool canPathBeArray = !context->canUsePathArrayness ||
         context->state.expCtx->canPathBeArrayForNss(path,
                                                     context->state.expCtx->getNamespaceString());
+
+    // Update metrics.
+    if (context->canUsePathArrayness) {
+        auto& opDebug = CurOp::get(context->state.opCtx)->debug();
+        opDebug.pathArraynessLeadingFilter = true;
+    }
 
     frame.pushExpr(generateTraverseF(frame.inputExpr.clone(),
                                      topLevelFieldSlot,
@@ -949,10 +958,12 @@ public:
         // 'bsonRegex' and are considered equal to any of the regexes. For the case where both
         // regexes and equalities are present, we use the "logicOr" operator to combine the logic
         // for equalities with the logic for regexes.
-        sbe::value::TagValueOwned pcreRegexes{sbe::value::makeNewArray()};
+        sbe::value::TagValueOwned pcreRegexes =
+            sbe::value::TagValueOwned::fromRaw(sbe::value::makeNewArray());
         auto pcreArr = sbe::value::getArrayView(pcreRegexes.value());
 
-        sbe::value::TagValueOwned regexSet{sbe::value::makeNewArraySet()};
+        sbe::value::TagValueOwned regexSet =
+            sbe::value::TagValueOwned::fromRaw(sbe::value::makeNewArraySet());
         auto regexArrSet = sbe::value::getArraySetView(regexSet.value());
 
         if (auto& regexes = expr->getRegexes(); regexes.size() > 0) {
@@ -1309,7 +1320,8 @@ std::pair<sbe::value::TypeTags, sbe::value::Value> convertBitTestBitPositions(
     // Build an array set of bit positions for the bitmask, and remove duplicates in the
     // bitPositions vector since duplicates aren't handled in the match expression parser by
     // checking if an item has already been seen.
-    sbe::value::TagValueOwned bitPosArr{sbe::value::makeNewArray()};
+    sbe::value::TagValueOwned bitPosArr =
+        sbe::value::TagValueOwned::fromRaw(sbe::value::makeNewArray());
 
     auto arr = sbe::value::getArrayView(bitPosArr.value());
     if (bitPositions.size()) {

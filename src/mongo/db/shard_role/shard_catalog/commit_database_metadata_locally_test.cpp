@@ -55,11 +55,12 @@ protected:
             operationContext(), dbType, fromClone);
     }
 
-    void dropDatabase() {
+    void dropDatabase(bool writeDropDBMetadataEntry = true) {
         BypassDatabaseMetadataAccess bypass(  // NOLINT
             operationContext(),
             BypassDatabaseMetadataAccess::Type::kWriteOnly);
-        shard_catalog_commit::commitDropDatabaseMetadataLocally(operationContext(), kDbName);
+        shard_catalog_commit::commitDropDatabaseMetadataLocally(
+            operationContext(), kDbName, writeDropDBMetadataEntry);
     }
 
     long long countLocalDocs(const NamespaceString& nss) {
@@ -96,7 +97,26 @@ protected:
         const auto scopedDsr = DatabaseShardingRuntime::acquireShared(operationContext(), kDbName);
         return scopedDsr->getDbVersion(operationContext());
     }
+
+    repl::MutableOplogEntry makeOplogEntry() {
+        repl::MutableOplogEntry oplogEntry;
+        oplogEntry.setOpType(repl::OpTypeEnum::kCommand);
+        oplogEntry.setNss(NamespaceString::makeCommandNamespace(kDbName));
+        oplogEntry.setObject(BSON("test" << 1));
+        oplogEntry.setOpTime(OplogSlot());
+        oplogEntry.setWallClockTime(operationContext()->fastClockSource().now());
+        return oplogEntry;
+    }
 };
+
+TEST_F(CommitDatabaseMetadataLocallyTest, WriteDatabaseMetadataOplogEntrySetsOpTime) {
+    auto oplogEntry = makeOplogEntry();
+
+    shard_catalog_commit::writeDatabaseMetadataOplogEntry(
+        operationContext(), oplogEntry, "testDatabaseMetadataOplogEntry");
+
+    ASSERT_FALSE(oplogEntry.getOpTime().isNull());
+}
 
 TEST_F(CommitDatabaseMetadataLocallyTest, CommitCreatePersistsMetadataAndInstallsDSR) {
     const auto dbType = makeDatabaseType();
@@ -184,6 +204,46 @@ TEST_F(CommitDatabaseMetadataLocallyTest, CommitCreateIsIdempotent) {
               2);
 }
 
+TEST_F(CommitDatabaseMetadataLocallyTest, DropClearsUnownedAndUntrackedCollectionMetadata) {
+    const auto dbType = makeDatabaseType();
+    commitCreate(dbType);
+
+    const auto unownedNss = NamespaceString::createNamespaceString_forTest(kDbName, "unowned");
+    createTestCollection(operationContext(), unownedNss);
+    {
+        auto scopedCsr =
+            CollectionShardingRuntime::acquireExclusive(operationContext(), unownedNss);
+        scopedCsr->setCollectionMetadata(operationContext(),
+                                         CollectionMetadata::UNTRACKED(),
+                                         CollectionShardingRuntime::NoRoutingTableAs::kUnowned);
+    }
+
+    const auto untrackedNss = NamespaceString::createNamespaceString_forTest(kDbName, "untracked");
+    createTestCollection(operationContext(), untrackedNss);
+    {
+        auto scopedCsr =
+            CollectionShardingRuntime::acquireExclusive(operationContext(), untrackedNss);
+        scopedCsr->setCollectionMetadata(operationContext(),
+                                         CollectionMetadata::UNTRACKED(),
+                                         CollectionShardingRuntime::NoRoutingTableAs::kUntracked);
+    }
+
+    dropDatabase();
+
+    {
+        // A stale, UNOWNED classification left over from before this shard became the DB primary
+        // must be cleared so a fresh recovery can classify the collection correctly.
+        auto scopedCsr = CollectionShardingRuntime::acquireShared(operationContext(), unownedNss);
+        ASSERT_FALSE(scopedCsr->getCurrentMetadataIfKnown());
+    }
+    {
+        // A stale, UNTRACKED classification left over from before this shard stopped being the DB
+        // primary must be cleared so a fresh recovery can classify the collection correctly.
+        auto scopedCsr = CollectionShardingRuntime::acquireShared(operationContext(), untrackedNss);
+        ASSERT_FALSE(scopedCsr->getCurrentMetadataIfKnown());
+    }
+}
+
 TEST_F(CommitDatabaseMetadataLocallyTest, DropDeletesMetadataAndClearsDSR) {
     const auto dbType = makeDatabaseType();
 
@@ -204,6 +264,58 @@ TEST_F(CommitDatabaseMetadataLocallyTest, DropDeletesMetadataAndClearsDSR) {
     auto counters = getDatabaseVersionUpdateCounters();
     ASSERT_EQ(counters.getIntField("countLocalDatabaseMetadataDrops"), 1);
     ASSERT_EQ(counters.getIntField("countLocalDatabaseMetadataCommits"), 1);
+}
+
+TEST_F(CommitDatabaseMetadataLocallyTest, DropDeletesMetadataWithoutInvalidationOplogEntry) {
+    const auto dbType = makeDatabaseType();
+    commitCreate(dbType);
+    ASSERT_EQ(countLocalDocs(NamespaceString::kConfigShardCatalogDatabasesNamespace), 1);
+
+    dropDatabase(false /* writeDropDBMetadataEntry */);
+
+    ASSERT_EQ(countLocalDocs(NamespaceString::kConfigShardCatalogDatabasesNamespace), 0);
+    ASSERT_EQ(countCommandOplogEntries("dropDatabaseMetadata"), 0);
+}
+
+TEST_F(CommitDatabaseMetadataLocallyTest, InvalidateAllDatabaseMetadataClearsAllDSRs) {
+    // Seed two databases so we can confirm both are cleared.
+    const auto dbType1 = makeDatabaseType();
+    commitCreate(dbType1);
+
+    const auto dbName2 = DatabaseName::createDatabaseName_forTest(boost::none, "TestDB2");
+    const DatabaseType dbType2{dbName2,
+                               ShardingState::get(operationContext())->shardId(),
+                               DatabaseVersion(UUID::gen(), Timestamp(20, 0))};
+    {
+        BypassDatabaseMetadataAccess bypass(  // NOLINT
+            operationContext(),
+            BypassDatabaseMetadataAccess::Type::kWriteOnly);
+        shard_catalog_commit::commitCreateDatabaseMetadataLocally(operationContext(), dbType2);
+    }
+
+    ASSERT_TRUE(getInstalledDbVersion());
+    {
+        const auto scopedDsr = DatabaseShardingRuntime::acquireShared(operationContext(), dbName2);
+        ASSERT_TRUE(scopedDsr->getDbVersion(operationContext()));
+    }
+
+    {
+        BypassDatabaseMetadataAccess bypass(  // NOLINT
+            operationContext(),
+            BypassDatabaseMetadataAccess::Type::kWriteOnly);
+        shard_catalog_commit::commitInvalidateAllDatabaseMetadata(operationContext());
+    }
+
+    // Exactly one 'c' oplog entry with an `invalidateAllDatabaseMetadata` field is emitted.
+    ASSERT_EQ(countCommandOplogEntries("invalidateAllDatabaseMetadata"), 1);
+
+    // Every DSR is cleared, but the durable catalog is untouched.
+    ASSERT_FALSE(getInstalledDbVersion());
+    {
+        const auto scopedDsr = DatabaseShardingRuntime::acquireShared(operationContext(), dbName2);
+        ASSERT_FALSE(scopedDsr->getDbVersion(operationContext()));
+    }
+    ASSERT_EQ(countLocalDocs(NamespaceString::kConfigShardCatalogDatabasesNamespace), 2);
 }
 
 TEST_F(CommitDatabaseMetadataLocallyTest, DropIsNoOpOnEmptyCatalog) {

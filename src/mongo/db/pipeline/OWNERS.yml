@@ -49,6 +49,9 @@ filters:
     approvers:
       - 10gen/query-integration-features
       - 10gen/query-execution-classic
+  - "accumulator_internal_construct_ndv_sketch*":
+    approvers:
+      - 10gen/query-optimization
   - "accumulator_internal_construct_stats.cpp":
     approvers:
       - 10gen/query-optimization
@@ -214,6 +217,9 @@ filters:
   - "lite_parsed_score_fusion*":
     approvers:
       - 10gen/query-integration-search
+  - "lite_parsed_hybrid_search*":
+    approvers:
+      - 10gen/query-integration-search
   - "hybrid_search_pipeline_builder*":
     approvers:
       - 10gen/query-integration
@@ -334,5 +340,8 @@ filters:
     approvers:
       - 10gen/query-integration-extensions-api
   - "document_source_list_extensions*":
+    approvers:
+      - 10gen/query-integration-extensions-api
+  - "wrapped_extension_source_hooks*":
     approvers:
       - 10gen/query-integration-extensions-api

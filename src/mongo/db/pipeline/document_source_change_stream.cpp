@@ -230,10 +230,10 @@ std::string DocumentSourceChangeStream::getNsRegexForChangeStream(
 
 BSONObj DocumentSourceChangeStream::getNsMatchObjForChangeStream(
     const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    // TODO SERVER-105554
-    // Currently we always return a BSONRegEx with the ns match string. We may optimize this to
-    // exact matches ('$eq') for single collection change streams in the future to improve matching
-    // performance. This is currently not safe because of collations that can affect the matching.
+    const auto& nss = expCtx->getNamespaceString();
+    if (ChangeStream::getChangeStreamType(nss) == ChangeStreamType::kCollection) {
+        return BSON("" << NamespaceStringUtil::serialize(nss, expCtx->getSerializationContext()));
+    }
     return BSON("" << BSONRegEx(getNsRegexForChangeStream(expCtx)));
 }
 
@@ -258,11 +258,12 @@ std::string DocumentSourceChangeStream::getViewNsRegexForChangeStream(
 
 BSONObj DocumentSourceChangeStream::getViewNsMatchObjForChangeStream(
     const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    // TODO SERVER-105554
-    // Currently we always return a BSONRegEx with the view ns match string. We may optimize this to
-    // exact matches ('$eq') for single database change streams in the future to improve matching
-    // performance. This currently may not be safe because of collations that can affect the
-    // matching.
+    const auto& nss = expCtx->getNamespaceString();
+    if (ChangeStream::getChangeStreamType(nss) == ChangeStreamType::kDatabase) {
+        return BSON("" << fmt::format("{}.system.views",
+                                      DatabaseNameUtil::serialize(
+                                          nss.dbName(), expCtx->getSerializationContext())));
+    }
     return BSON("" << BSONRegEx(getViewNsRegexForChangeStream(expCtx)));
 }
 
@@ -284,11 +285,10 @@ std::string DocumentSourceChangeStream::getCollRegexForChangeStream(
 
 BSONObj DocumentSourceChangeStream::getCollMatchObjForChangeStream(
     const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    // TODO SERVER-105554
-    // Currently we always return a BSONRegEx with the collection match string. We may optimize this
-    // to exact matches ('$eq') for single collection change streams in the future to improve
-    // matching performance. This currently may not be safe because of collations that can affect
-    // the matching.
+    const auto& nss = expCtx->getNamespaceString();
+    if (ChangeStream::getChangeStreamType(nss) == ChangeStreamType::kCollection) {
+        return BSON("" << nss.coll());
+    }
     return BSON("" << BSONRegEx(getCollRegexForChangeStream(expCtx)));
 }
 
@@ -312,11 +312,11 @@ std::string DocumentSourceChangeStream::getCmdNsRegexForChangeStream(
 
 BSONObj DocumentSourceChangeStream::getCmdNsMatchObjForChangeStream(
     const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    // TODO SERVER-105554
-    // Currently we always return a BSONRegEx with the collection-less aggregate ns match string. We
-    // may optimize this to exact matches ('$eq') for single collection and single database change
-    // streams in the future to improve matching performance. This currently may not be safe because
-    // of collations that can affect the matching.
+    const auto& nss = expCtx->getNamespaceString();
+    if (ChangeStream::getChangeStreamType(nss) != ChangeStreamType::kAllDatabases) {
+        return BSON("" << NamespaceStringUtil::serialize(nss.getCommandNS(),
+                                                         SerializationContext::stateDefault()));
+    }
     return BSON("" << BSONRegEx(getCmdNsRegexForChangeStream(expCtx)));
 }
 
@@ -572,10 +572,6 @@ void DocumentSourceChangeStream::assertIsLegalSpecification(
             !expCtx->getNamespaceString().isSystem() ||
                 (spec.getAllowToRunOnSystemNS() && !expCtx->getInRouter()));
 
-    uassert(31123,
-            "Change streams from router may not show migration events",
-            !(expCtx->getInRouter() && spec.getShowMigrationEvents()));
-
     uassert(12888201,
             "matchCollectionUUIDForUpdateLookup may only be specified when fullDocument is "
             "'updateLookup'",
@@ -598,6 +594,18 @@ void DocumentSourceChangeStream::assertIsLegalSpecification(
             "Attempting to resume a change stream using 'resumeAfter' is not allowed from an "
             "invalidate notification",
             !(spec.getResumeAfter() && resumeToken->fromInvalidate));
+
+    // A resume token from a 'namespacePlacementChanged' control event cannot be used to resume a
+    // change stream. These events are not exposed to users, so an event resume token referring to
+    // one is not a valid resumption point. High-water-mark tokens are unaffected.
+    uassert(ErrorCodes::InvalidResumeToken,
+            "Attempting to resume a change stream from a 'namespacePlacementChanged' event is not "
+            "allowed",
+            !resumeToken || ResumeToken::isHighWaterMarkToken(*resumeToken) ||
+                Value::compare(
+                    resumeToken->eventIdentifier[DocumentSourceChangeStream::kOperationTypeField],
+                    Value(DocumentSourceChangeStream::kNamespacePlacementChangedOpType),
+                    nullptr) != 0);
 
     // If we are resuming a single-collection stream, the resume token should always contain a
     // UUID unless the token is from endOfTransaction event or a high water mark.

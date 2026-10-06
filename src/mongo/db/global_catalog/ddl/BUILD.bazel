@@ -162,6 +162,15 @@ idl_generator(
 )
 
 idl_generator(
+    name = "migration_blocking_operation_coordinator_v2_gen",
+    src = "migration_blocking_operation_coordinator_v2.idl",
+    deps = [
+        "//src/mongo/db:basic_types_gen",
+        "//src/mongo/db/global_catalog/ddl:sharding_coordinator_gen",
+    ],
+)
+
+idl_generator(
     name = "move_primary_coordinator_document_gen",
     src = "move_primary_coordinator_document.idl",
     deps = [
@@ -528,6 +537,7 @@ mongo_cc_library(
         "//src/mongo/db/pipeline:sharded_agg_helpers",
         "//src/mongo/db/pipeline/process_interface:shardsvr_process_interface",
         "//src/mongo/db/repl:change_stream_oplog_notification",
+        "//src/mongo/db/repl:intent_registry",
         "//src/mongo/db/repl:read_concern_args",
         "//src/mongo/db/repl:repl_coordinator_interface",
         "//src/mongo/db/repl:replica_set_aware_service",

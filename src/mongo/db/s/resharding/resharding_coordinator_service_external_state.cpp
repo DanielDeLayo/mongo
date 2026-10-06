@@ -184,7 +184,10 @@ ReshardingCoordinatorExternalStateImpl::calculateParticipantShardsAndChunks(
         const SplitPolicyParams splitParams{coordinatorDoc.getReshardingUUID(),
                                             *donorShardIds.begin()};
 
-        if (shardKey.hasHashedPrefix()) {
+        // Evenly distributing one chunk per shard is only correct when the caller has not asked for
+        // a specific placement. 'SplitPointsBasedSplitPolicy' is not zone or shard distribution
+        // aware, so it would silently ignore those constraints.
+        if (!parsedZones && !coordinatorDoc.getShardDistribution() && shardKey.hasHashedPrefix()) {
             auto initialSplitter = SplitPointsBasedSplitPolicy(boost::none /* availableShardIds */);
             splitResult = initialSplitter.createFirstChunks(opCtx, shardKey, splitParams);
         } else if (const auto& shardDistribution = coordinatorDoc.getShardDistribution()) {
@@ -744,11 +747,14 @@ void ReshardingCoordinatorExternalStateImpl::stopMigrations(
 void ReshardingCoordinatorExternalStateImpl::resumeMigrations(
     OperationContext* opCtx,
     const NamespaceString& nss,
-    const UUID& expectedCollectionUUID,
     ReshardingAuthoritativeMetadataAccessLevelEnum authoritativeMetadataLevel,
     std::function<OperationSessionInfo()> osiGenerator) {
-    sharding_ddl_util::resumeMigrations(
-        opCtx, nss, expectedCollectionUUID, osiGenerator, convert(authoritativeMetadataLevel));
+    // Re-enable chunk operations on the source namespace, regardless of the collection's UUID.
+    sharding_ddl_util::resumeMigrations(opCtx,
+                                        nss,
+                                        boost::none /* expectedCollectionUUID */,
+                                        osiGenerator,
+                                        convert(authoritativeMetadataLevel));
 }
 
 std::unique_ptr<CausalityBarrier> ReshardingCoordinatorExternalStateImpl::buildCausalityBarrier(

@@ -65,6 +65,50 @@ idl_generator(
     src = "replicated_fast_count_max_oplog_scan_lag_secs.idl",
 )
 
+idl_generator(
+    name = "repair_replicated_metadata_gen",
+    src = "repair_replicated_metadata.idl",
+    deps = [
+        "//src/mongo/db:basic_types_gen",
+        "//src/mongo/idl:generic_argument_gen",
+    ],
+)
+
+mongo_cc_library(
+    name = "repair_replicated_metadata_idl",
+    srcs = [
+        ":repair_replicated_metadata_gen",
+    ],
+    deps = [
+        "//src/mongo:base",
+        "//src/mongo/db:server_base",
+        "//src/mongo/idl:idl_parser",
+    ],
+)
+
+mongo_cc_library(
+    name = "repair_replicated_metadata_command",
+    srcs = [
+        "repair_replicated_metadata_command.cpp",
+    ],
+    deps = [
+        "repair_replicated_metadata_idl",
+        "replicated_fast_count_uncommitted_changes",
+        "//src/mongo/db:commands",
+        "//src/mongo/db:server_base",
+        "//src/mongo/db/admission/execution_control:execution_admission_context",
+        "//src/mongo/db/admission/ticketing:admission_context",
+        "//src/mongo/db/auth",
+        "//src/mongo/db/op_observer",
+        "//src/mongo/db/repl:repl_coordinator_interface",
+        "//src/mongo/db/shard_role",
+        "//src/mongo/db/shard_role/lock_manager",
+        "//src/mongo/db/shard_role/lock_manager:exception_util",
+        "//src/mongo/db/shard_role/shard_catalog:collection_catalog",
+        "//src/mongo/db/storage:write_unit_of_work",
+    ],
+)
+
 mongo_cc_library(
     name = "replicated_fast_count_manager",
     srcs = [
@@ -203,7 +247,6 @@ mongo_cc_library(
         "replicated_fast_count_advance_checkpoint",
         "replicated_fast_count_metrics",
         "replicated_fast_count_streaming_oplog_delta_accumulator",
-        "size_count_checkpoint_buffer",
         "size_count_store",
         "size_count_timestamp_store",
         "//src/mongo/db/shard_role",
@@ -360,6 +403,7 @@ mongo_cc_unit_test(
     ],
     deps = [
         "replicated_fast_count_init",
+        "replicated_fast_count_test_helpers",
         "size_count_timestamp_store",
         "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
         "//src/mongo/db/storage:storage_engine_impl",
@@ -455,6 +499,7 @@ mongo_cc_unit_test(
         "//src/mongo/db/repl:mock_repl_coord_server_fixture",
         "//src/mongo/db/repl:oplog_entry",
         "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/storage:record_store_write_conflict_fail_points",
         "//src/mongo/db/storage:recovery_unit_base",
         "//src/mongo/db/transaction",
     ],
@@ -475,7 +520,24 @@ mongo_cc_unit_test(
         "//src/mongo/db:record_id_helpers",
         "//src/mongo/db/repl:oplog",
         "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/storage:record_store_write_conflict_fail_points",
+        "//src/mongo/otel/metrics:metrics_test_util",
+        "//src/mongo/unittest:server_parameter_guard",
         "//src/mongo/util:fail_point",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "replicated_metadata_test",
+    srcs = [
+        "replicated_metadata_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_fifth_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "//src/mongo/db:server_base",
     ],
 )
 
@@ -491,6 +553,31 @@ mongo_cc_unit_test(
     deps = [
         "replicated_fast_count_test_helpers",
         "size_count_checkpoint_buffer",
+        "//src/mongo/unittest:server_parameter_guard",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "size_count_checkpoint_flusher_test",
+    srcs = [
+        "size_count_checkpoint_flusher_test.cpp",
+    ],
+    tags = [
+        "mongo_unittest_fifth_group",
+        "server-collection-write-path",
+    ],
+    deps = [
+        "replicated_fast_count_init",
+        "replicated_fast_count_metrics",
+        "replicated_fast_count_test_helpers",
+        "size_count_checkpoint_flusher",
+        "size_count_store",
+        "size_count_timestamp_store",
+        "//src/mongo/db/repl:oplog",
+        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
+        "//src/mongo/db/storage:record_store_write_conflict_fail_points",
+        "//src/mongo/otel/metrics:metrics_test_util",
+        "//src/mongo/util:fail_point",
     ],
 )
 

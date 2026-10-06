@@ -3,11 +3,6 @@
 
 #include "mongo/db/router_role/routing_cache/catalog_cache_test_fixture.h"
 
-#include <absl/container/node_hash_map.h>
-#include <boost/move/utility_core.hpp>
-#include <boost/none.hpp>
-#include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "cxxabi.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/connection_string.h"
@@ -28,7 +23,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/sharding_environment/grid.h"
 #include "mongo/db/sharding_environment/shard_id.h"
-#include "mongo/db/sharding_environment/shard_ref.h"
 #include "mongo/db/sharding_environment/sharding_feature_flags_gen.h"
 #include "mongo/db/versioning_protocol/chunk_version.h"
 #include "mongo/db/versioning_protocol/database_version.h"
@@ -45,6 +39,12 @@
 #include <iterator>
 #include <system_error>
 #include <utility>
+
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
 
 namespace mongo {
 
@@ -105,7 +105,7 @@ std::vector<ShardType> CoreCatalogCacheTestFixture::setupNShards(int numShards) 
         HostAndPort host(str::stream() << "Host" << i << ":12345");
 
         ShardType shard;
-        shard.setHandle(ShardHandle{ShardId(name.toString()), boost::none});
+        shard.setName(name.toString());
         shard.setHost(host.toString());
         shards.emplace_back(std::move(shard));
 
@@ -132,8 +132,7 @@ CollectionRoutingInfo CoreCatalogCacheTestFixture::makeCollectionRoutingInfo(
     size_t chunksPerShard) {
     ChunkVersion version({OID::gen(), Timestamp(42)}, {1, 0});
 
-    DatabaseType db(
-        nss.dbName(), ShardRef{std::string{"0"}}, DatabaseVersion(UUID::gen(), Timestamp()));
+    DatabaseType db(nss.dbName(), {"0"}, DatabaseVersion(UUID::gen(), Timestamp()));
 
     const auto uuid = UUID::gen();
     const BSONObj collectionBSON = [&]() {
@@ -177,7 +176,7 @@ CollectionRoutingInfo CoreCatalogCacheTestFixture::makeCollectionRoutingInfo(
                                                               false),
              shardKeyPattern.getKeyPattern().extendRangeBound(splitPointsIncludingEnds[i], false)},
             version,
-            ShardRef{std::string(str::stream() << shardIndex)});
+            ShardId{str::stream() << shardIndex});
         chunk.setName(OID::gen());
 
         initialChunks.push_back(chunk.toConfigBSON());
@@ -216,8 +215,7 @@ CollectionRoutingInfo CoreCatalogCacheTestFixture::makeUnshardedCollectionRoutin
 CollectionRoutingInfo CoreCatalogCacheTestFixture::makeUntrackedCollectionRoutingInfo(
     const NamespaceString& nss) {
     setupNShards(1);
-    DatabaseType db(
-        nss.dbName(), ShardRef{std::string{"0"}}, DatabaseVersion(UUID::gen(), Timestamp()));
+    DatabaseType db(nss.dbName(), {"0"}, DatabaseVersion(UUID::gen(), Timestamp()));
 
     auto future = scheduleRoutingInfoUnforcedRefresh(nss);
     expectFindSendBSONObjVector(kConfigHostAndPort, {db.toBSON()});
@@ -227,9 +225,7 @@ CollectionRoutingInfo CoreCatalogCacheTestFixture::makeUntrackedCollectionRoutin
 
 void CoreCatalogCacheTestFixture::expectGetDatabase(NamespaceString nss, std::string shardId) {
     expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
-        DatabaseType db(nss.dbName(),
-                        ShardRef{std::string{shardId}},
-                        DatabaseVersion(UUID::gen(), Timestamp()));
+        DatabaseType db(nss.dbName(), {shardId}, DatabaseVersion(UUID::gen(), Timestamp()));
         return std::vector<BSONObj>{db.toBSON()};
     }());
 }
@@ -301,17 +297,13 @@ ChunkManager CoreCatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoSha
     expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
         ChunkVersion version({epoch, timestamp}, {1, 0});
 
-        ChunkType chunk1(uuid,
-                         {shardKeyPattern.getKeyPattern().globalMin(), BSON("_id" << 0)},
-                         version,
-                         ShardRef{"0"});
+        ChunkType chunk1(
+            uuid, {shardKeyPattern.getKeyPattern().globalMin(), BSON("_id" << 0)}, version, {"0"});
         chunk1.setName(OID::gen());
         version.incMinor();
 
-        ChunkType chunk2(uuid,
-                         {BSON("_id" << 0), shardKeyPattern.getKeyPattern().globalMax()},
-                         version,
-                         ShardRef{"1"});
+        ChunkType chunk2(
+            uuid, {BSON("_id" << 0), shardKeyPattern.getKeyPattern().globalMax()}, version, {"1"});
         chunk2.setName(OID::gen());
         version.incMinor();
 

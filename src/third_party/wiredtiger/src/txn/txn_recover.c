@@ -186,6 +186,7 @@ __txn_system_op_apply(WT_RECOVERY *r, WT_LSN *lsnp, const uint8_t **pp, const ui
             __wt_verbose_multi(session, WT_VERB_RECOVERY_ALL,
               "Backup ID: LSN [%s]: Clearing slot %" PRIu32, lsn_str, index);
             /* This is the result of a force stop, clear the entry. */
+            __wt_free(session, blk->id_str);
             WT_CLEAR(*blk);
         }
     } else
@@ -986,11 +987,9 @@ __recovery_file_scan(WT_RECOVERY *r)
       "scanning metadata to find the largest file ID");
 
     /*
-     * Scan through all files and tiered entries in the metadata and gather information about each
-     * entry for recovery.
+     * Scan through all files in the metadata and gather information about each entry for recovery.
      */
-    WT_RET(__recovery_metadata_scan_prefix(r, "file:", ".wtobj", __recovery_setup_file));
-    WT_RET(__recovery_metadata_scan_prefix(r, "tiered:", NULL, __recovery_setup_file));
+    WT_RET(__recovery_metadata_scan_prefix(r, "file:", NULL, __recovery_setup_file));
 
     /*
      * Set the connection level file id tracker, as such upon creation of a new file we'll begin

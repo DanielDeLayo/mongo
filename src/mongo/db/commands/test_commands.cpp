@@ -110,6 +110,10 @@ public:
         LOGV2(20505, "Test-only command 'godinsert' invoked", "collection"_attr = nss.coll());
         BSONObj obj = cmdObj["obj"].embeddedObjectUserCheck();
 
+        // The insert below runs under an UnreplicatedWritesBlock, so no oplog entry is logged and
+        // nothing supplies a commit timestamp, even though the target collection is replicated.
+        shard_role_details::allowOneUntimestampedWrite(opCtx);
+
         AutoGetDb autodb(
             opCtx,
             dbName,
@@ -252,10 +256,10 @@ MONGO_REGISTER_COMMAND(DurableHistoryReplicatedTestCmd).testOnly().forShard();
 
 // TODO SERVER-110189: Make testing this command resilient to releases or update the name of this
 // command.
-class CommandFeatureFlaggedOnLatestFCVTestCmd83 : public BasicCommand {
+class CommandFeatureFlaggedOnLatestFCVTestCmd91 : public BasicCommand {
 public:
-    CommandFeatureFlaggedOnLatestFCVTestCmd83()
-        : BasicCommand("testCommandFeatureFlaggedOnLatestFCV83") {}
+    CommandFeatureFlaggedOnLatestFCVTestCmd91()
+        : BasicCommand("testCommandFeatureFlaggedOnLatestFCV91") {}
 
     bool adminOnly() const override {
         return false;
@@ -288,12 +292,12 @@ public:
              const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        LOGV2(10044800, "Test-only command 'testCommandFeatureFlaggedOnLatestFCV83' invoked");
+        LOGV2(10044800, "Test-only command 'testCommandFeatureFlaggedOnLatestFCV91' invoked");
         return true;
     }
 };
 
-MONGO_REGISTER_COMMAND(CommandFeatureFlaggedOnLatestFCVTestCmd83)
+MONGO_REGISTER_COMMAND(CommandFeatureFlaggedOnLatestFCVTestCmd91)
     .testOnly()
     .requiresFeatureFlag(feature_flags::gFeatureFlagBlender)
     .forShard();
@@ -404,9 +408,11 @@ public:
     BOOL_FIELD_BUILDER_FN(supportsPersistentOplogCapMaintainerThread)        \
     BOOL_FIELD_BUILDER_FN(supportsAsyncOplogMarkerGeneration)                \
     BOOL_FIELD_BUILDER_FN(supportsOplogSampling)                             \
+    BOOL_FIELD_BUILDER_FN(supportsOplogScanning)                             \
     BOOL_FIELD_BUILDER_FN(supportsPreservingPreparedTxnInPreciseCheckpoints) \
     BOOL_FIELD_BUILDER_FN(supportsTableLogging)                              \
     BOOL_FIELD_BUILDER_FN(supportsUnstableCheckpoints)                       \
+    BOOL_FIELD_BUILDER_FN(supportsVersionCursor)                             \
     BOOL_FIELD_BUILDER_FN(supportsColdCollections)
 
         // For each method listed in PERSISTENCE_PROVIDER_BOOL_CAPABILITIES, call the method and

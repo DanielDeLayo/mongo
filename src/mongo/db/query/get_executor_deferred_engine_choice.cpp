@@ -3,15 +3,6 @@
 
 #include "mongo/db/query/get_executor_deferred_engine_choice.h"
 
-#include <boost/container/flat_set.hpp>
-#include <boost/container/small_vector.hpp>
-#include <boost/container/vector.hpp>
-#include <boost/cstdint.hpp>
-#include <boost/none.hpp>
-#include <boost/optional.hpp>
-#include <boost/optional/optional.hpp>
-#include <boost/smart_ptr/intrusive_ptr.hpp>
-// IWYU pragma: no_include "ext/alloc_traits.h"
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/exec/classic/cached_plan.h"
@@ -40,6 +31,16 @@
 
 #include <utility>
 
+#include <boost/container/flat_set.hpp>
+#include <boost/container/small_vector.hpp>
+#include <boost/container/vector.hpp>
+#include <boost/cstdint.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 namespace mongo::exec_deferred_engine_choice {
@@ -62,6 +63,10 @@ getExecutorFindDeferredEngineChoice(OperationContext* opCtx,
     if (rankerResult.expressExecutor) {
         return {std::move(rankerResult.expressExecutor)};
     }
+
+    // Past this path's own express decision; see the matching call in getExecutorFind().
+    markShedEligibleIfFindCommand(opCtx);
+
     // If we replanned and the old plan and new plan are the same, update the counter.
     const auto replanningData = rankerResult.plannerParams->replanningData;
     if (replanningData && !rankerResult.solutions.empty()) {

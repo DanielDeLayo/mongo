@@ -18,6 +18,7 @@ import {
     describeWriteCmdQueryStatsCrossShardTests,
     describeWriteCmdQueryStatsReplicaSetTests,
     describeWriteCmdQueryStatsShardedTests,
+    retryDeleteMetricTestOnWriteConflict,
 } from "jstests/libs/query/query_stats_write_cmd_utils.js";
 
 function testSingleDelete(testDB, coll, collName) {
@@ -84,10 +85,16 @@ function testMultiDelete(testDB, coll, collName) {
             comment: "running multi delete!!",
         }),
     );
+
+    // Write-conflict retries can re-examine documents without a fixed upper bound. Pass the
+    // observed value to the remaining exact metric assertions.
+    const entry = getLatestQueryStatsEntry(testDB.getMongo(), {collName: coll.getName()});
+    const docsExamined = getQueryExecMetrics(entry.metrics).docsExamined.sum;
+    assert.gte(docsExamined, 8, "docsExamined is smaller than expected", {entry});
     assertWriteCmdQueryStatsSingleExec(testDB, coll, {
         command: "delete",
         keysExamined: 0,
-        docsExamined: 8,
+        docsExamined,
         writes: {
             nMatched: 0,
             nUpserted: 0,
@@ -165,28 +172,38 @@ describeWriteCmdQueryStatsReplicaSetTests(
     (ctxFn) => {
         describe("delete types", function () {
             it("should record single delete metrics", function () {
-                const {testDB, coll, collName} = ctxFn();
-                testSingleDelete(testDB, coll, collName);
+                retryDeleteMetricTestOnWriteConflict(ctxFn, () => {
+                    const {testDB, coll, collName} = ctxFn();
+                    testSingleDelete(testDB, coll, collName);
+                });
             });
 
             it("should record simple _id delete metrics", function () {
-                const {testDB, coll, collName} = ctxFn();
-                testIdDelete(testDB, coll, collName);
+                retryDeleteMetricTestOnWriteConflict(ctxFn, () => {
+                    const {testDB, coll, collName} = ctxFn();
+                    testIdDelete(testDB, coll, collName);
+                });
             });
 
             it("should record multi delete metrics", function () {
-                const {testDB, coll, collName} = ctxFn();
-                testMultiDelete(testDB, coll, collName);
+                retryDeleteMetricTestOnWriteConflict(ctxFn, () => {
+                    const {testDB, coll, collName} = ctxFn();
+                    testMultiDelete(testDB, coll, collName);
+                });
             });
 
             it("should record delete metrics when no documents match the filter", function () {
-                const {testDB, coll, collName} = ctxFn();
-                testDeleteNoMatches(testDB, coll, collName);
+                retryDeleteMetricTestOnWriteConflict(ctxFn, () => {
+                    const {testDB, coll, collName} = ctxFn();
+                    testDeleteNoMatches(testDB, coll, collName);
+                });
             });
 
             it("should record multi delete metrics for partial successes", function () {
-                const {testDB, coll, collName} = ctxFn();
-                testMultiDeletePartialSuccess(testDB, coll, collName, testDB.getMongo());
+                retryDeleteMetricTestOnWriteConflict(ctxFn, () => {
+                    const {testDB, coll, collName} = ctxFn();
+                    testMultiDeletePartialSuccess(testDB, coll, collName, testDB.getMongo());
+                });
             });
         });
 
@@ -305,23 +322,31 @@ describeWriteCmdQueryStatsReplicaSetTests(
 describeWriteCmdQueryStatsShardedTests("query stats delete command metrics (sharded)", (ctxFn) => {
     describe("delete types", function () {
         it("should record single delete metrics", function () {
-            const {testDB, coll, collName} = ctxFn();
-            testSingleDelete(testDB, coll, collName);
+            retryDeleteMetricTestOnWriteConflict(ctxFn, () => {
+                const {testDB, coll, collName} = ctxFn();
+                testSingleDelete(testDB, coll, collName);
+            });
         });
 
         it("should record simple _id delete metrics", function () {
-            const {testDB, coll, collName} = ctxFn();
-            testIdDelete(testDB, coll, collName);
+            retryDeleteMetricTestOnWriteConflict(ctxFn, () => {
+                const {testDB, coll, collName} = ctxFn();
+                testIdDelete(testDB, coll, collName);
+            });
         });
 
         it("should record multi delete metrics", function () {
-            const {testDB, coll, collName} = ctxFn();
-            testMultiDelete(testDB, coll, collName);
+            retryDeleteMetricTestOnWriteConflict(ctxFn, () => {
+                const {testDB, coll, collName} = ctxFn();
+                testMultiDelete(testDB, coll, collName);
+            });
         });
 
         it("should record multi delete metrics when no documents match the filter", function () {
-            const {testDB, coll, collName, st} = ctxFn();
-            testDeleteNoMatches(testDB, coll, collName);
+            retryDeleteMetricTestOnWriteConflict(ctxFn, () => {
+                const {testDB, coll, collName} = ctxFn();
+                testDeleteNoMatches(testDB, coll, collName);
+            });
         });
     });
 });

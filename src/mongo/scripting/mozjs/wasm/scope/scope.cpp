@@ -90,6 +90,11 @@ WasmtimeImplScope::~WasmtimeImplScope() {
 }
 
 void WasmtimeImplScope::reset() {
+    // A live scope always holds its shared engine context: getWasmEngineContext() memoizes and
+    // returns the process-wide context, and it is only cleared when the scope is parked/destroyed.
+    // reset() must never rebuild it (a no-op now that the context is shared).
+    invariant(_wasmEngineCtx);
+
     // Clear the decoration under the Client lock before tearing down _bridge, so a racing
     // interrupt() cannot call kill() on a dangling bridge.
     unregisterOperation();
@@ -116,18 +121,6 @@ void WasmtimeImplScope::reset() {
         }
         _bridge = nullptr;
         _emitSetupBytes = 0;
-
-        // Only recreate WasmEngineContext when a kill was pending. kill() calls
-        // Engine::increment_epoch(), which is engine-wide state — a fresh Engine+Component avoids
-        // epoch contamination on the next Store instantiation. For non-kill resets the existing
-        // Engine is clean and a new Store can be safely created from it.
-        if (wasKillPending || !_wasmEngineCtx) {
-            _wasmEngineCtx.reset();
-            if (auto* engine = getGlobalScriptEngine()) {
-                _wasmEngineCtx =
-                    static_cast<WasmtimeScriptEngine*>(engine)->createWasmEngineContext();
-            }
-        }
         // Handles from the old bridge are invalid after recreation — must recompile.
         _cachedFunctions.clear();
     }
@@ -476,6 +469,10 @@ void WasmtimeImplScope::setFunction(const char* field, const char* code) {
     _bridge->setGlobalValue(field, BSON("" << BSONCode(code)));
 }
 
+void WasmtimeImplScope::deleteGlobal(std::string_view name) {
+    _bridge->deleteGlobal(name);
+}
+
 int WasmtimeImplScope::type(const char* field) {
     BSONObj result = _resolveGlobal(field);
     BSONElement val = result[kReturnValueField];
@@ -528,19 +525,27 @@ std::string WasmtimeImplScope::getError() {
 }
 
 void WasmtimeImplScope::registerOperation(OperationContext* opCtx) {
-    _opCtx.store(opCtx, std::memory_order_release);
-    if (auto* engine = getGlobalScriptEngine()) {
-        static_cast<WasmtimeScriptEngine*>(engine)->registerOperation(
-            opCtx, this, [this] { _opCtx.store(nullptr, std::memory_order_release); });
+    tassert(13286901, "must have an operation context", opCtx);
+    auto* engine = dynamic_cast<WasmtimeScriptEngine*>(getGlobalScriptEngine());
+    if (!engine) {
+        // Store no pointer when there is no WASM engine to register with. This avoids dangling
+        // '_opCtx', since the cleanup for each scope's operation context happens inside the
+        // destructor of 'WasmtimeScopeRegistry' which exists inside the engine.
+        return;
     }
+
+    _opCtx.store(opCtx, std::memory_order_release);
+    engine->registerOperation(
+        opCtx, this, [this] { _opCtx.store(nullptr, std::memory_order_release); });
 }
+
 void WasmtimeImplScope::unregisterOperation() {
     // Atomically take ownership of _opCtx so we call engine->unregisterOperation() exactly once,
     // even if the onTeardown callback races with us from the OperationContext's destructor.
     auto* opCtx = _opCtx.exchange(nullptr, std::memory_order_acq_rel);
     if (opCtx) {
-        if (auto* engine = getGlobalScriptEngine()) {
-            static_cast<WasmtimeScriptEngine*>(engine)->unregisterOperation(opCtx);
+        if (auto* engine = dynamic_cast<WasmtimeScriptEngine*>(getGlobalScriptEngine())) {
+            engine->unregisterOperation(opCtx, this);
         }
     }
 }

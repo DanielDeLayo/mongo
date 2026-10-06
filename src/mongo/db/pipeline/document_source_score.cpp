@@ -38,9 +38,7 @@ using boost::intrusive_ptr;
  * avoids hitting QueryFeatureNotAllowed and duplicate parser map errors in $scoreFusion tests
  * ($scoreFusion is gated behind the same feature flag).
  */
-REGISTER_LITE_PARSED_DOCUMENT_SOURCE(score,
-                                     ScoreLiteParsed::parse,
-                                     AllowedWithApiStrict::kNeverInVersion1);
+REGISTER_LITE_PARSED_DOCUMENT_SOURCE(score, ScoreLiteParsed::parse, AllowedWithApiStrict::kAlways);
 
 REGISTER_DOCUMENT_SOURCE_CONTAINER_WITH_STAGE_PARAMS_DEFAULT(score,
                                                              DocumentSourceScore,
@@ -393,13 +391,6 @@ std::list<boost::intrusive_ptr<DocumentSource>> constructDesugaredOutput(
 
 std::list<boost::intrusive_ptr<DocumentSource>> DocumentSourceScore::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
-    uassert(
-        ErrorCodes::QueryFeatureNotAllowed,
-        "$score is not allowed in the current configuration. You may need to enable the "
-        "corresponding feature flag",
-        feature_flags::gFeatureFlagSearchHybridScoringFull.isEnabledUseLatestFCVWhenUninitialized(
-            VersionContext::getDecoration(pExpCtx->getOperationContext()),
-            serverGlobalParams.featureCompatibility.acquireFCVSnapshot()));
     uassert(ErrorCodes::FailedToParse,
             str::stream() << "The " << kStageName
                           << " stage specification must be an object, found "

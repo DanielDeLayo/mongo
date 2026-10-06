@@ -3,24 +3,12 @@
 
 #include "mongo/db/query/planner_access.h"
 
-#include "mongo/db/exec/collection_scan_common.h"
-#include "mongo/db/matcher/expression_type.h"
-#include "mongo/db/query/canonical_query.h"
-#include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/util/assert_util.h"
-
-#include <memory>
-
-#include <s2cellid.h>
-
-#include <boost/optional/optional.hpp>
-// IWYU pragma: no_include "ext/alloc_traits.h"
-
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/exec/collection_scan_common.h"
 #include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/fts/fts_index_format.h"
 #include "mongo/db/fts/fts_query.h"
@@ -32,9 +20,12 @@
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/matcher/expression_reordering.h"
 #include "mongo/db/matcher/expression_text_base.h"
 #include "mongo/db/matcher/expression_tree.h"
+#include "mongo/db/matcher/expression_type.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/compiler/logical_model/projection/projection.h"
 #include "mongo/db/query/compiler/optimizer/index_bounds_builder/index_bounds_builder.h"
@@ -53,7 +44,9 @@
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_request_helper.h"
+#include "mongo/db/query/record_id_bound.h"
 #include "mongo/db/query/record_id_range.h"
+#include "mongo/db/query/record_id_range_list.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/record_id_helpers.h"
 #include "mongo/db/repl/optime.h"
@@ -78,6 +71,7 @@
 
 #include <boost/move/utility_core.hpp>
 #include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
@@ -546,10 +540,18 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeCollectionScan(
     const NamespaceString& nss = query.nss();
     const bool isOplog = nss.isOplog();
 
+    // Restricted to the change stream oplog scan for now: its filter is a large disjunction
+    // evaluated against every oplog entry on the server, the vast majority of which do not match,
+    // so the order of the branches dominates the cost.
+    auto clonedFilter = root->clone();
+    if (isOplog && tailable && query.getExpCtx()->getChangeStreamSpec()) {
+        allowReordering(query.getOpCtx(), clonedFilter.get());
+    }
+
     // Make the (only) node, a collection scan.
     auto csn = std::make_unique<CollectionScanNode>();
     csn->nss = nss;
-    csn->filter = root->clone();
+    csn->filter = std::move(clonedFilter);
     csn->tailable = tailable;
     csn->shouldTrackLatestOplogTimestamp =
         params.mainCollectionInfo.options & QueryPlannerParams::TRACK_LATEST_OPLOG_TS;
@@ -594,15 +596,19 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeCollectionScan(
         // collection. Not compatible with resumeScanPoint, so we do not optimize in that case.
         if (!csn->resumeScanPoint) {
             auto [minTs, maxTs] = extractTsRange(root);
+            boost::optional<RecordIdBound> minBound, maxBound;
             if (minTs) {
-                assignRecordIdFromTimestamp(*minTs, &csn->minRecord);
+                assignRecordIdFromTimestamp(*minTs, &minBound);
                 if (assertMinTsHasNotFallenOffOplog) {
                     csn->assertTsHasNotFallenOff = *minTs;
                 }
             }
             if (maxTs) {
-                assignRecordIdFromTimestamp(*maxTs, &csn->maxRecord);
+                assignRecordIdFromTimestamp(*maxTs, &maxBound);
             }
+            RecordIdRange oplogRange;
+            oplogRange.intersectRange(minBound, maxBound);
+            csn->rangeList = RecordIdRangeList(oplogRange);
         }
 
         // If the query is just a lower bound on "ts" on a forward scan, every document in the
@@ -638,14 +644,14 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeCollectionScan(
 
     if (csn->isClustered && !csn->resumeScanPoint) {
         // This is a clustered collection. Attempt to perform an efficient, bounded collection scan
-        // via minRecord and maxRecord if applicable. During this process, we will check if the
-        // query is guaranteed to exclude values of the cluster key which are affected by collation.
+        // via rangeList if applicable. During this process, we will check if the query is
+        // guaranteed to exclude values of the cluster key which are affected by collation.
         // If so, then even if the query and collection collations differ, the collation difference
         // won't affect the query results. In that case, we can say hasCompatibleCollation is true.
 
         RecordIdRange recordRange;
-        // min/max records may have been set if oplog.
-        recordRange.intersectRange(csn->minRecord, csn->maxRecord);
+        // Seed from any existing rangeList bounds (e.g. oplog timestamp bounds set above).
+        recordRange.intersectRange(csn->rangeList.outerBounds());
         bool compatibleCollation = handleRIDRangeScan(
             csn->filter.get(),
             queryCollator,
@@ -657,21 +663,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeCollectionScan(
 
         handleRIDRangeMinMax(query, csn->direction, queryCollator, collCollator, recordRange);
 
-        csn->minRecord = recordRange.getMin();
-        csn->maxRecord = recordRange.getMax();
-
-        switch (csn->direction) {
-            case CollectionScanParams::Direction::FORWARD:
-                csn->boundInclusion = CollectionScanParams::makeInclusion(
-                    recordRange.isMinInclusive(), recordRange.isMaxInclusive());
-                break;
-            case CollectionScanParams::Direction::BACKWARD:
-                csn->boundInclusion = CollectionScanParams::makeInclusion(
-                    recordRange.isMaxInclusive(), recordRange.isMinInclusive());
-                break;
-            default:
-                MONGO_UNREACHABLE;
-        }
+        csn->rangeList = RecordIdRangeList(recordRange);
     }
 
     if (canSimplifyFilter) {

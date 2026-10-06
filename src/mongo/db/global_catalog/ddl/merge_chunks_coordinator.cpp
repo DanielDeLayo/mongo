@@ -14,7 +14,6 @@
 #include "mongo/db/router_role/routing_cache/catalog_cache.h"
 #include "mongo/db/s/chunk_operation_precondition_checks.h"
 #include "mongo/db/sharding_environment/grid.h"
-#include "mongo/db/sharding_environment/shard_ref.h"
 #include "mongo/db/topology/shard_registry.h"
 #include "mongo/db/topology/sharding_state.h"
 #include "mongo/db/topology/vector_clock/vector_clock_mutable.h"
@@ -137,7 +136,7 @@ std::vector<BSONObj> commitToGlobalCatalog(OperationContext* opCtx,
                                            OperationSessionInfo session) {
     ConfigSvrCommitMergeChunksRequest request(nss);
     request.setDbName(DatabaseName::kAdmin);
-    request.setShard(ShardRef(shardId));
+    request.setShard(shardId);
     request.setChunkRange(chunkRange);
     request.setShardVersionPreMerge(shardVersionPreMerge);
     generic_argument_util::setMajorityWriteConcern(request);
@@ -267,6 +266,7 @@ ExecutorFuture<void> MergeChunksCoordinator::_runImpl(
     };
 
     return ExecutorFuture<void>(**executor)
+        .then([this, anchor = shared_from_this()] { _checkCriticalSection(); })
         .then(_buildPhaseHandler(
             Phase::kCheckPreconditions,
             [this, anchor = shared_from_this()](auto* opCtx) {
@@ -402,6 +402,12 @@ ExecutorFuture<void> MergeChunksCoordinator::_runImpl(
             }
 
             const auto phase = _doc.getPhase();
+
+            // If the phase is unset, there's no persisted document, so there is nothing to cleanup.
+            if (phase == Phase::kUnset) {
+                uassertStatusOK(status);
+                MONGO_UNREACHABLE_TASSERT(13380601);
+            }
 
             // Before the kGlobalCatalogCommit phase the merge has not been committed anywhere, so
             // a non-retryable error is safe to abort on. Persist an abort reason so the critical

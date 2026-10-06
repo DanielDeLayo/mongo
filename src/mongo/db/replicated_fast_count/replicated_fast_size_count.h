@@ -10,8 +10,27 @@
 #include <cstdint>
 
 #include <absl/container/flat_hash_map.h>
+#include <boost/container/flat_map.hpp>
+#include <boost/optional/optional.hpp>
 
 namespace mongo {
+
+inline constexpr int64_t kEmptyCollectionValidationHash = 0;
+
+/**
+ * Combines two validation hashes with XOR, which is its own inverse: folding a contribution in and
+ * back out again restores the original value, and the order of the contributions does not matter.
+ *
+ * An absent operand makes the result absent, since a value that is missing one of its contributions
+ * is indistinguishable from a wrong one.
+ */
+[[MONGO_MOD_PUBLIC]] inline boost::optional<int64_t> combineValidationHashes(
+    const boost::optional<int64_t>& lhs, const boost::optional<int64_t>& rhs) {
+    if (!lhs || !rhs) {
+        return boost::none;
+    }
+    return *lhs ^ *rhs;
+}
 
 /**
  * Stores the last committed size and count values for a collection.
@@ -40,9 +59,45 @@ inline std::ostream& operator<<(std::ostream& s, const CollectionSizeCount& coll
 }
 
 /**
+ * Stores a collection's size and count along with the validation hash accumulated over the same
+ * operations.
+ */
+struct [[MONGO_MOD_PUBLIC]] CollectionReplicatedMetadata {
+    CollectionSizeCount sizeCount;
+
+    boost::optional<int64_t> hash;
+
+    bool operator==(const CollectionReplicatedMetadata&) const = default;
+
+    CollectionReplicatedMetadata operator+(const CollectionReplicatedMetadata& other) const {
+        return CollectionReplicatedMetadata{sizeCount + other.sizeCount,
+                                            combineValidationHashes(hash, other.hash)};
+    }
+    CollectionReplicatedMetadata operator-(const CollectionReplicatedMetadata& other) const {
+        // XOR is its own inverse, so removing a hash contribution is the same operation as adding
+        // it.
+        return CollectionReplicatedMetadata{sizeCount - other.sizeCount,
+                                            combineValidationHashes(hash, other.hash)};
+    }
+
+    std::string toString() const {
+        str::stream s;
+        s << sizeCount.toString();
+        if (hash) {
+            s << ", hash: " << *hash;
+        }
+        return s;
+    }
+};
+
+inline std::ostream& operator<<(std::ostream& s, const CollectionReplicatedMetadata& metadata) {
+    return (s << metadata.toString());
+}
+
+/**
  * Indicates whether a collection had been created or dropped since the last checkpoint.
  */
-enum class DDLState {
+enum class [[MONGO_MOD_PUBLIC]] DDLState {
     /**
      * Indicates the collection has been created for the first time.
      */
@@ -67,14 +122,15 @@ enum class DDLState {
 };
 
 /**
- * Stores the size and count values for a collection along with state indicating whether the
- * collection had been created or dropped.
+ * Stores the size, count, and validation hash values for a collection along with state indicating
+ * whether the collection had been created or dropped.
  */
-struct SizeCountDelta {
-    CollectionSizeCount sizeCount{0, 0};
+struct [[MONGO_MOD_PUBLIC]] ReplicatedMetadataDelta {
+    CollectionReplicatedMetadata metadata{.sizeCount = CollectionSizeCount{.size = 0, .count = 0},
+                                          .hash = boost::none};
     DDLState state{DDLState::kNone};
 
-    bool operator==(const SizeCountDelta&) const = default;
+    bool operator==(const ReplicatedMetadataDelta&) const = default;
 
     std::string toString() const {
         auto stateStr = [&] {
@@ -90,23 +146,23 @@ struct SizeCountDelta {
             }
             MONGO_UNREACHABLE;
         }();
-        return fmt::format("sizeCount: {}, state: {}", sizeCount.toString(), stateStr);
+        return fmt::format("metadata: {}, state: {}", metadata.toString(), stateStr);
     }
 };
 
-inline std::ostream& operator<<(std::ostream& s, const SizeCountDelta& delta) {
+inline std::ostream& operator<<(std::ostream& s, const ReplicatedMetadataDelta& delta) {
     return (s << delta.toString());
 }
 
 namespace replicated_fast_count {
 
 /**
- * Data structure mapping collection UUIDs to their size and count deltas.
+ * Data structure mapping collection UUIDs to their replicated-metadata deltas.
  *
- * Useful for tracking changes to collections' size and count while scanning the oplog during
- * both checkpoints and size/count lookups.
+ * Useful for tracking changes to collections' size, count, and hash while scanning the oplog during
+ * checkpoints.
  */
-using SizeCountDeltas = absl::flat_hash_map<UUID, SizeCountDelta>;
+using ReplicatedMetadataDeltas = absl::flat_hash_map<UUID, ReplicatedMetadataDelta>;
 
 }  // namespace replicated_fast_count
 

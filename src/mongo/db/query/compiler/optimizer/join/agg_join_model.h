@@ -4,7 +4,9 @@
 #pragma once
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/op_debug.h"
 #include "mongo/db/query/compiler/optimizer/join/join_graph.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/modules.h"
 
 namespace mongo::join_ordering {
@@ -36,20 +38,23 @@ public:
      * connected component to be used for implicit edge finding.
      */
     static StatusWith<AggJoinModel> constructJoinModel(const Pipeline& pipeline,
-                                                       AggModelBuildParams buildParams);
+                                                       AggModelBuildParams buildParams,
+                                                       OpDebug::JoinOptimizationMetrics& metrics);
 
     AggJoinModel(JoinGraph graph,
                  std::vector<ResolvedPath> resolvedPaths,
                  std::unique_ptr<Pipeline> prefix,
                  std::unique_ptr<Pipeline> suffix,
                  std::vector<BSONObj> accessPathsBackingBson,
-                 boost::intrusive_ptr<ExpressionContext> joinExpCtx)
+                 boost::intrusive_ptr<ExpressionContext> joinExpCtx,
+                 absl::flat_hash_set<NamespaceString> distinctNamespaces)
         : graph{std::move(graph)},
           resolvedPaths{std::move(resolvedPaths)},
           prefix{std::move(prefix)},
           suffix{std::move(suffix)},
           accessPathsBackingBson{std::move(accessPathsBackingBson)},
-          _joinExpCtx{std::move(joinExpCtx)} {}
+          _joinExpCtx{std::move(joinExpCtx)},
+          _distinctNamespaces{std::move(distinctNamespaces)} {}
 
     AggJoinModel(AggJoinModel&& other)
         : graph{std::move(other.graph)},
@@ -57,7 +62,8 @@ public:
           prefix{std::move(other.prefix)},
           suffix{std::move(other.suffix)},
           accessPathsBackingBson{std::move(other.accessPathsBackingBson)},
-          _joinExpCtx{std::move(other._joinExpCtx)} {}
+          _joinExpCtx{std::move(other._joinExpCtx)},
+          _distinctNamespaces{std::move(other._distinctNamespaces)} {}
 
     AggJoinModel& operator=(AggJoinModel&& other) {
         graph = std::move(other.graph);
@@ -66,6 +72,7 @@ public:
         suffix = std::move(other.suffix);
         accessPathsBackingBson = std::move(other.accessPathsBackingBson);
         _joinExpCtx = std::move(other._joinExpCtx);
+        _distinctNamespaces = std::move(other._distinctNamespaces);
         return *this;
     }
 
@@ -103,6 +110,12 @@ public:
     const std::vector<BSONObj>& getAccessPathsBackingBson() const {
         return accessPathsBackingBson;
     }
+    /**
+     * The distinct namespaces of the join graph's nodes, collected during model construction.
+     */
+    const absl::flat_hash_set<NamespaceString>& getDistinctNamespaces() const {
+        return _distinctNamespaces;
+    }
 
 private:
     JoinGraph graph;
@@ -119,6 +132,9 @@ private:
 
     // Clone of the original pipeline's ExpressionContext used throughout join optimization.
     boost::intrusive_ptr<ExpressionContext> _joinExpCtx;
+
+    // Distinct namespaces of the join graph's nodes.
+    absl::flat_hash_set<NamespaceString> _distinctNamespaces;
 };
 
 }  // namespace mongo::join_ordering

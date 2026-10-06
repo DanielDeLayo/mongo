@@ -3,7 +3,6 @@
 
 #include "mongo/db/query/client_cursor/cursor_manager.h"
 
-// IWYU pragma: no_include "boost/align/detail/aligned_alloc_posix.hpp"
 #include "mongo/base/error_codes.h"
 #include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/db/auth/authorization_checks.h"
@@ -39,6 +38,7 @@
 #include <type_traits>
 
 #include <boost/none.hpp>
+// IWYU pragma: no_include "boost/align/detail/aligned_alloc_posix.hpp"
 
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
@@ -148,6 +148,38 @@ std::size_t CursorManager::timeoutCursors(OperationContext* opCtx, Date_t now) {
     return toDisposeWithoutMutex.size();
 }
 
+std::size_t CursorManager::disposeIdleMongotCursorsForShutdown(OperationContext* opCtx) {
+    std::vector<std::unique_ptr<ClientCursor, ClientCursor::Deleter>> toDisposeWithoutMutex;
+
+    for (size_t partitionId = 0; partitionId < kNumPartitions; ++partitionId) {
+        auto lockedPartition = _cursorMap->lockOnePartitionById(partitionId);
+        for (auto it = lockedPartition->begin(); it != lockedPartition->end();) {
+            auto* cursor = it->second;
+            if (cursor->_operationUsingCursor || !cursor->mayHoldMongotTaskExecutor()) {
+                ++it;
+                continue;
+            }
+
+            toDisposeWithoutMutex.emplace_back(cursor);
+            ++it;
+            removeCursorFromMap(lockedPartition, cursor);
+        }
+    }
+
+    // Be careful not to dispose of cursors while holding the partition lock.
+    for (auto&& cursor : toDisposeWithoutMutex) {
+        cursor->dispose(opCtx, boost::none);
+    }
+
+    if (!toDisposeWithoutMutex.empty()) {
+        LOGV2(12984900,
+              "Disposed idle cursors holding mongot task executor references during shutdown",
+              "numDisposed"_attr = toDisposeWithoutMutex.size());
+    }
+
+    return toDisposeWithoutMutex.size();
+}
+
 std::vector<CursorId> CursorManager::getCursorIdsForNamespace(const NamespaceString& nss) {
     std::vector<CursorId> cursorIds;
 
@@ -221,11 +253,6 @@ StatusWith<ClientCursorPin> CursorManager::pinCursor(
     // Pass along 'usesOptimizedUpdateLookup' so it detects IFR flag change at runtime.
     CurOp::get(opCtx)->debug().usesOptimizedUpdateLookup = cursor->_usesOptimizedUpdateLookup;
 
-    cursor->_operationUsingCursor = opCtx;
-    cursor->_commandUsingCursor = std::string{commandName};
-
-    // We use pinning of a cursor as a proxy for active, user-initiated use of a cursor.  Therefore,
-    // we pass down to the logical session cache and vivify the record (updating last use).
     if (cursor->getSessionId()) {
         auto vivifyCursorStatus =
             LogicalSessionCache::get(opCtx)->vivify(opCtx, cursor->getSessionId().value());
@@ -233,6 +260,13 @@ StatusWith<ClientCursorPin> CursorManager::pinCursor(
             return vivifyCursorStatus;
         }
     }
+
+    // Attribute the OperationContext to the cursor only now that every early-return check above
+    // (including the vivify above) has passed. Setting these before those checks would leave the
+    // cursor pinned to an 'opCtx' that is destroyed when the command unwinds on an early return,
+    // producing a dangling pointer that a later killCursors would dereference.
+    cursor->_operationUsingCursor = opCtx;
+    cursor->_commandUsingCursor = std::string{commandName};
 
     LOGV2_DEBUG(8928404, 2, "Pinning cursor", "cursorId"_attr = cursor->cursorid());
     auto pin = ClientCursorPin(opCtx, cursor, this);
@@ -383,8 +417,6 @@ ClientCursorPin CursorManager::registerCursor(OperationContext* opCtx,
 
     std::unique_ptr<ClientCursor, ClientCursor::Deleter> clientCursor(
         new ClientCursor(std::move(cursorParams), cursorId, opCtx, now));
-    clientCursor->_memoryUsageTracker =
-        OperationMemoryUsageTracker::moveFromOpCtxIfAvailable(opCtx);
 
     // Transfer ownership of the cursor to '_cursorMap'.
     auto partition = _cursorMap->lockOnePartition(cursorId);

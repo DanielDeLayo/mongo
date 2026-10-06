@@ -14,6 +14,7 @@
 #include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
 #include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/db/throttle_cursor.h"
+#include "mongo/db/validate/concurrent_progress_meter.h"
 #include "mongo/db/validate/validate_results.h"
 #include "mongo/db/validate/validate_state.h"
 #include "mongo/util/modules.h"
@@ -28,6 +29,8 @@
 #include <utility>
 #include <vector>
 
+#include <absl/container/flat_hash_set.h>
+
 namespace mongo {
 
 class IndexCatalogEntry;
@@ -35,32 +38,29 @@ class IndexCatalogEntry;
 /**
  * Contains all the index information and stats throughout the validation.
  */
-struct IndexInfo {
-    IndexInfo(const IndexCatalogEntry& descriptor);
-    // Index name.
-    const std::string indexName;
-    // Contains the indexes key pattern.
-    const BSONObj keyPattern;
-    // Contains the pre-computed hash of the index name.
-    const uint32_t indexNameHash;
-    // More efficient representation of the ordering of the descriptor's key pattern.
-    const Ordering ord;
-    // The number of index entries belonging to the index.
+class IndexInfo {
+public:
+    explicit IndexInfo(const IndexCatalogEntry& entry);
+
+    const IndexCatalogEntry& getEntry() const {
+        return *_entry;
+    }
+    uint32_t indexNameHash() const {
+        return _indexNameHash;
+    }
+    const Ordering& ord() const {
+        return _ord;
+    }
     int64_t numKeys = 0;
-    // The number of records that have a key in their document that referenced back to the this
-    // index.
     int64_t numRecords = 0;
-    // A hashed set of indexed multikey paths (applies to $** indexes only).
-    std::set<uint32_t> hashedMultikeyMetadataPaths;
-    // Indicates whether or not there are documents that make this index multikey.
+    absl::flat_hash_set<uint32_t> hashedMultikeyMetadataPaths;
     bool multikeyDocs = false;
-    // The set of multikey paths generated from all documents. Only valid when multikeyDocs is also
-    // set and an index tracks path-level information.
     MultikeyPaths docMultikeyPaths;
-    // Indicates whether key entries must be unique.
-    const bool unique;
-    // Index access method pointer.
-    const IndexAccessMethod* accessMethod;
+
+private:
+    std::shared_ptr<const IndexCatalogEntry> _entry;
+    uint32_t _indexNameHash = 0;
+    Ordering _ord;
 };
 
 /**
@@ -113,12 +113,23 @@ public:
     void setSecondPhase();
 
     /**
+     * Whether partial results accumulated by separate instances can be combined with merge().
+     *
+     * Only first-phase state is mergeable: once validation advances to the second phase it records
+     * missing and extra index entries, which have ordering dependencies that merge() rejects. A
+     * caller that wants to accumulate results in parallel must check this first.
+     */
+    bool canMergeResults() const {
+        return _phase == Phase::kFirst;
+    }
+
+    /**
      * Traverses the column-store index via 'cursor' and accumulates the traversal results.
      */
     int64_t traverseIndex(OperationContext* opCtx,
-                          const IndexCatalogEntry* index,
-                          ProgressMeterHolder& _progress,
-                          ValidateResults* results);
+                          const IndexCatalogEntry& index,
+                          ConcurrentProgressMeterHolder& progress,
+                          ValidateResults& results);
 
     /**
      * Traverses all paths in a single record from the row-store via the given {'recordId','record'}
@@ -126,10 +137,10 @@ public:
      */
     void traverseRecord(OperationContext* opCtx,
                         const CollectionPtr& coll,
-                        const IndexCatalogEntry* index,
+                        const IndexCatalogEntry& index,
                         const RecordId& recordId,
                         const BSONObj& recordBson,
-                        ValidateResults* results);
+                        ValidateResults& results);
 
     /**
      * Returns true if any value in the `_indexKeyCount` map is not equal to 0, otherwise return
@@ -140,24 +151,24 @@ public:
     /**
      * If repair mode enabled, try inserting _missingIndexEntries into indexes.
      */
-    void repairIndexEntries(OperationContext* opCtx, ValidateResults* results);
+    void repairIndexEntries(OperationContext* opCtx, ValidateResults& results);
 
     /**
      * Records the errors gathered from the second phase of index validation into the provided
      * ValidateResultsMap and ValidateResults.
      */
-    void addIndexEntryErrors(OperationContext* opCtx, ValidateResults* results);
+    void addIndexEntryErrors(OperationContext* opCtx, ValidateResults& results);
 
     /**
      * Sets up this instance to limit memory usage in the second phase of index
      * validation. Returns whether the memory limit is sufficient to report at least one index entry
      * inconsistency and continue with the second phase of validation.
      */
-    bool limitMemoryUsageForSecondPhase(ValidateResults* result);
+    bool limitMemoryUsageForSecondPhase(ValidateResults& results);
 
     void validateIndexKeyCount(OperationContext* opCtx,
-                               const IndexCatalogEntry* index,
-                               long long* numRecords,
+                               const IndexCatalogEntry& index,
+                               long long& numRecords,
                                IndexValidateResults& results);
 
     uint64_t getTotalIndexKeys() {
@@ -237,9 +248,9 @@ private:
      */
     void addDocKey(OperationContext* opCtx,
                    const key_string::Value& ks,
-                   IndexInfo* indexInfo,
+                   IndexInfo& indexInfo,
                    const RecordId& recordId,
-                   ValidateResults* results);
+                   ValidateResults& results);
 
     /**
      * During the first phase of validation, given the index entry's KeyString, decrement the
@@ -248,16 +259,16 @@ private:
      * inconsistent hash buckets during the first phase of validation to document keys.
      */
     void addIndexKey(OperationContext* opCtx,
-                     const IndexCatalogEntry* entry,
+                     const IndexCatalogEntry& entry,
                      const key_string::Value& ks,
-                     IndexInfo* indexInfo,
+                     IndexInfo& indexInfo,
                      const RecordId& recordId,
-                     ValidateResults* results);
+                     ValidateResults& results);
 
     /**
      * During the first phase of validation, tracks the multikey paths for every observed document.
      */
-    void addDocumentMultikeyPaths(IndexInfo* indexInfo, const MultikeyPaths& multikeyPaths);
+    void addDocumentMultikeyPaths(IndexInfo& indexInfo, const MultikeyPaths& multikeyPaths);
 
     /**
      * To validate $** multikey metadata paths, we first scan the collection and add a hash of all
@@ -265,9 +276,9 @@ private:
      * entries and remove any path encountered. As we expect the index to contain a super-set of
      * the collection paths, a non-empty set represents an invalid index.
      */
-    void addMultikeyMetadataPath(const key_string::Value& ks, IndexInfo* indexInfo);
-    void removeMultikeyMetadataPath(const key_string::Value& ks, IndexInfo* indexInfo);
-    size_t getMultikeyMetadataPathCount(IndexInfo* indexInfo);
+    void addMultikeyMetadataPath(const key_string::Value& ks, IndexInfo& indexInfo);
+    void removeMultikeyMetadataPath(const key_string::Value& ks, IndexInfo& indexInfo);
+    size_t getMultikeyMetadataPathCount(IndexInfo& indexInfo);
 
     /**
      * Generates information about missing/extra index entries for the second phase of validation

@@ -24,9 +24,10 @@
 #include "mongo/db/query/plan_explainer_factory.h"
 #include "mongo/db/query/plan_explainer_impl.h"
 #include "mongo/db/query/plan_insert_listener.h"
+#include "mongo/db/query/plan_ranking/plan_selection_strategy.h"
 #include "mongo/db/query/plan_yield_policy_impl.h"
 #include "mongo/db/query/query_execution_knobs_gen.h"
-#include "mongo/db/query/write_conflict_storm.h"
+#include "mongo/db/query/write_conflict_backoff.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/shard_role/shard_catalog/shard_filtering_util.h"
@@ -66,11 +67,6 @@ logv2::SeveritySuppressor longCollectionScanLogSeveritySuppressor{
 }  // namespace
 
 
-int32_t PlanExecutorImpl::getWriteConflictRetryWaiterCount_forTest() {
-    return wceWaitersCount();
-}
-
-
 const OperationContext::Decoration<boost::optional<repl::OpTime>> clientsLastKnownCommittedOpTime =
     OperationContext::declareDecoration<boost::optional<repl::OpTime>>();
 
@@ -92,16 +88,23 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
                                    PlanYieldPolicy::YieldPolicy yieldPolicy,
                                    boost::optional<size_t> cachedPlanHash,
                                    boost::optional<std::string> replanReason,
-                                   boost::optional<PlanExplainerData> maybeExplainData)
+                                   boost::optional<PlanExplainerData> maybeExplainData,
+                                   boost::optional<PlanSelectionStrategy> planSelectionStrategy)
     : _opCtx(opCtx),
       _cq(std::move(cq)),
       _expCtx(_cq ? _cq->getExpCtx() : expCtx),
       _workingSet(std::move(ws)),
       _qs(std::move(qs)),
       _root(std::move(rt)),
-      _planExplainer(plan_explainer_factory::make(
-          _root.get(), cachedPlanHash, std::move(replanReason), std::move(maybeExplainData))),
+      _planExplainer(
+          plan_explainer_factory::make(_root.get(),
+                                       cachedPlanHash,
+                                       std::move(replanReason),
+                                       std::move(maybeExplainData),
+                                       _cq && _cq->getExplain().has_value() /* isExplain */,
+                                       planSelectionStrategy)),
       _mustReturnOwnedBson(returnOwnedBson),
+      _mustSetRecordIdMetadata(_cq && _cq->metadataDeps()[DocumentMetadataFields::kRecordId]),
       // Read value of 'operationResponseMaxMS' query knob once, here at construction, where the
       // knob configuration is resolved and available. The knob is fixed for the query's lifetime,
       // so the value is cached and reused rather than re-read on every reattach (see header).
@@ -322,8 +325,8 @@ void PlanExecutorImpl::logWriteConflictAndBackoff(size_t numAttempts) {
     if (MONGO_unlikely(planExecutorHangBeforeLogAndBackoff.shouldFail())) {
         planExecutorHangBeforeLogAndBackoff.pauseWhileSet(_opCtx);
     }
-    mongo::logWriteConflictAndBackoff(
-        numAttempts, "plan execution", ""sv, NamespaceStringOrUUID(_nss));
+    write_conflict_backoff::logAndBackoff(
+        _opCtx, numAttempts, "plan execution", ""sv, NamespaceStringOrUUID(_nss));
 }
 
 /**
@@ -333,7 +336,7 @@ void PlanExecutorImpl::doWaitDuringYield() {
     // If we yielded because we encountered a sharding critical section, wait for the critical
     // section to end before continuing. By waiting for the critical section to be exited we avoid
     // busy spinning immediately and encountering the same critical section again. It is important
-    // that this wait happens after having released the lock hierarchy -- otherwise deadlocks could
+    // that this wait happens after having released the lock hierarchy - otherwise deadlocks could
     // happen, or the very least, locks would be unnecessarily held while waiting.
     const auto& shardingCriticalSection = planExecutorShardingState(_opCtx).criticalSectionFuture;
     if (shardingCriticalSection) {
@@ -383,7 +386,8 @@ void PlanExecutorImpl::_waitForAllEarlierOplogWritesToBeVisible() {
 }
 
 PlanExecutor::ExecState PlanExecutorImpl::getNext(BSONObj* objOut, RecordId* dlOut) {
-    ExecState state = _getNextImpl(&_docOutput, dlOut);
+    auto* docOut = objOut ? &_docOutput : nullptr;
+    ExecState state = _getNextImpl(docOut, dlOut);
 
     if (objOut && state == ExecState::ADVANCED) {
         const bool includeMetadata = _expCtx && _expCtx->getNeedsMerge();
@@ -412,16 +416,18 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Document* objOut, RecordI
         return PlanExecutor::ADVANCED;
     }
 
-    // Per-call retry state: streak counters and the RAII gauge guard. Counters are incremented
-    // on every WriteConflict or TemporarilyUnavailable error accordingly, and reset to 0 on any
-    // successful call to _root->work. The guard's destructor releases the gauge if still held on
-    // any function-exit path (return / EOF / exception).
+    // Per-call retry state: streak counters incremented on every WriteConflict or
+    // TemporarilyUnavailable error accordingly, and reset to 0 on any successful call to
+    // _root->work.
     WriteConflictRetryState retryState;
 
-    // Capped insert data; declared outside the loop so we hold a shared pointer to the capped
-    // insert notifier the entire time we are in the loop.  Holding a shared pointer to the
-    // capped insert notifier is necessary for the notifierVersion to advance.
-    auto notifier = makeNotifier();
+    // Capped insert notifier; declared outside the loop so that it (and thus the capped-insert
+    // version tracking) persists across the two-EOF wait handshake in _handleEOFAndExit(). It is
+    // created lazily on the first EOF that actually needs to wait, rather than on every call, to
+    // avoid allocating a notifier on the common path where _getNextImpl returns a document without
+    // ever waiting. Holding the shared pointer while we wait is what allows the notifier version
+    // to advance; that requirement is only relevant once we are blocking.
+    std::unique_ptr<insert_listener::Notifier> notifier;
 
     // This callback is used by the yielding code once all storage resources are released.
     const auto afterSnapshotAndLocksRelinquishedCb = [&]() {
@@ -453,16 +459,13 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Document* objOut, RecordI
         PlanStage::StageState code = _root->work(&id);
 
         if (code != PlanStage::NEED_YIELD) {
-            // A successful work() step (or NEED_TIME / IS_EOF) ends any WCE streak. release()
-            // is idempotent and is a no-op if no streak was active.
-            retryState.streakGuard.release();
             retryState.writeConflictsInARow = 0;
             retryState.tempUnavailErrorsInARow = 0;
         }
 
         if (PlanStage::ADVANCED == code) {
             WorkingSetMember* member = _workingSet->get(id);
-            if (_cq && _cq->metadataDeps()[DocumentMetadataFields::kRecordId]) {
+            if (_mustSetRecordIdMetadata) {
                 member->metadata().setRecordId(member->recordId);
             }
             bool hasRequestedData = true;
@@ -476,7 +479,8 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Document* objOut, RecordI
                         *objOut = Document{member->keyData[0].keyData};
                     }
                 } else if (member->hasObj()) {
-                    std::swap(*objOut, member->doc.value());
+                    using std::swap;
+                    swap(*objOut, member->doc.value());
                 } else {
                     _workingSet->free(id);
                     hasRequestedData = false;
@@ -491,8 +495,8 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Document* objOut, RecordI
             if (hasRequestedData) {
                 // transfer the metadata from the WSM to Document.
                 if (objOut) {
-                    if (_mustReturnOwnedBson) {
-                        *objOut = objOut->getOwned();
+                    if (_mustReturnOwnedBson && !objOut->isOwned()) {
+                        *objOut = std::move(*objOut).getOwned();
                     }
 
                     if (member->metadata()) {
@@ -529,14 +533,6 @@ BSONObj makeBsonWithMetadata(Document& doc, WorkingSetMember* member) {
     return doc.toBsonWithMetaData();
 }
 }  // namespace
-
-std::unique_ptr<insert_listener::Notifier> PlanExecutorImpl::makeNotifier() {
-    if (insert_listener::shouldListenForInserts(_opCtx, _cq.get())) {
-        // We always construct the insert_listener::Notifier for awaitData cursors.
-        return insert_listener::getCappedInsertNotifier(_opCtx, _collection, _yieldPolicy.get());
-    }
-    return nullptr;
-}
 
 boost::optional<Date_t> PlanExecutorImpl::_calculateResponseDeadlineValue() const {
     if (_responseDeadlineType == ResponseDeadlineType::kNone || !_opCtx) {
@@ -627,9 +623,7 @@ void PlanExecutorImpl::_handleNeedYield(WriteConflictRetryState& retryState) {
             retryState.writeConflictsInARow);
     } else if (!_oplogWaitConfig || !_oplogWaitConfig->waitedForOplogVisiblity()) {
         // If we didn't wait for oplog visibility, then we must be yielding because of a
-        // WriteConflictException. Oplog-visibility yields and TUE yields (handled above) do
-        // not contribute to the retry-limit gauge -- only the WCE path below acquires the
-        // streak guard.
+        // WriteConflictException.
         if (!_yieldPolicy->canAutoYield() ||
             MONGO_unlikely(skipWriteConflictRetries.shouldFail())) {
             throwWriteConflictException(
@@ -639,23 +633,20 @@ void PlanExecutorImpl::_handleNeedYield(WriteConflictRetryState& retryState) {
 
         retryState.writeConflictsInARow++;
 
-        checkWriteConflictStorm(_opCtx, retryState.streakGuard, retryState.writeConflictsInARow);
-
-        // Fall back to the legacy hold-ticket sleep path once the op has hit the threshold.
-        // Holding the ticket during the sleep throttles concurrent ops entering the conflict
-        // zone, which helps under a write-conflict storm.
-        const bool releaseTicketEnabled =
-            internalQueryEnableWriteConflictBackoffWithoutTicket.loadRelaxed();
-        const bool fallbackToHoldTicket = releaseTicketEnabled &&
-            static_cast<int64_t>(retryState.writeConflictsInARow) >
-                gInternalQueryWriteConflictBackoffMaxReleaseTicketCycles.loadRelaxed();
-
-        if (releaseTicketEnabled && !fallbackToHoldTicket) {
+        if (internalQueryEnableWriteConflictBackoffWithoutTicket.loadRelaxed()) {
             // Defer the logAndBackoff() call to the yield handler.
             _writeConflictsInARowToLog = retryState.writeConflictsInARow;
         } else {
-            // Do the log and backoff immediately, while we're holding the ticket.
-            logWriteConflictAndBackoff(retryState.writeConflictsInARow);
+            // Log and backoff immediately, while holding the ticket. Use the legacy stepped
+            // schedule here: the exponential ramp sleeps up to ~2x capMs, far too long to
+            // hold a ticket through.
+            if (MONGO_unlikely(planExecutorHangBeforeLogAndBackoff.shouldFail())) {
+                planExecutorHangBeforeLogAndBackoff.pauseWhileSet(_opCtx);
+            }
+            mongo::logWriteConflictAndBackoff(retryState.writeConflictsInARow,
+                                              "plan execution",
+                                              ""sv,
+                                              NamespaceStringOrUUID(_nss));
         }
     }
 
@@ -676,15 +667,26 @@ bool PlanExecutorImpl::_handleEOFAndExit(PlanStage::StageState code,
             PlanStage::IS_EOF == code);
     hangBeforeShouldWaitForInsertsIfFailpointEnabled(this);
 
-    // The !notifier check is necessary because shouldWaitForInserts can return 'true' when
-    // shouldListenForInserts returned 'false' (above) in the case of a deadline becoming
-    // "unexpired" due to the system clock going backwards.
-    if (!notifier ||
-        !insert_listener::shouldWaitForInserts(_opCtx, _cq.get(), _yieldPolicy.get())) {
+    if (!insert_listener::shouldListenForInserts(_opCtx, _cq.get())) {
+        return true;
+    }
+
+    if (!insert_listener::shouldWaitForInserts(_opCtx, _cq.get(), _yieldPolicy.get())) {
         // Time to exit.
         return true;
     }
 
+    // Create the notifier lazily the first time we are about to wait, and reuse it on subsequent
+    // EOFs within this call so the two-EOF version comparison works. Because shouldWaitForInserts
+    // implies shouldListenForInserts, makeNotifier() is guaranteed to return a non-null notifier
+    // here, so the previous separate !notifier guard (which existed only to handle construction
+    // and the wait-decision happening at different times) is no longer needed.
+    if (!notifier) {
+        notifier =
+            insert_listener::getCappedInsertNotifier(_opCtx, _collection, _yieldPolicy.get());
+    }
+
+    invariant(notifier);
     insert_listener::waitForInserts(_opCtx, _yieldPolicy.get(), notifier);
     return false;
 }
@@ -703,14 +705,16 @@ size_t PlanExecutorImpl::getNextBatch(size_t batchSize, AppendBSONObjFn append) 
     const auto whileYieldingFn = [this]() {
         return doWaitDuringYield();
     };
-    auto notifier = makeNotifier();
+
+    // Capped insert notifier; created lazily in _handleEOFAndExit() the first time we actually
+    // need to wait, rather than on every call. See the comment in _getNextImpl().
+    std::unique_ptr<insert_listener::Notifier> notifier;
 
     WorkingSetID id = WorkingSet::INVALID_ID;
 
-    // Per-call retry state: streak counters and the RAII gauge guard. Counters are incremented
-    // on every WriteConflict or TemporarilyUnavailable error accordingly, and reset to 0 on any
-    // successful call to _root->work. The guard's destructor releases the gauge if still held on
-    // any function-exit path (return / EOF / exception / stashResult-break).
+    // Per-call retry state: streak counters incremented on every WriteConflict or
+    // TemporarilyUnavailable error accordingly, and reset to 0 on any successful call to
+    // _root->work.
     WriteConflictRetryState retryState;
 
     size_t numResults = 0;
@@ -732,9 +736,6 @@ size_t PlanExecutorImpl::getNextBatch(size_t batchSize, AppendBSONObjFn append) 
         PlanStage::StageState code = _root->work(&id);
 
         if (code != PlanStage::NEED_YIELD) {
-            // A successful work() step (or NEED_TIME / IS_EOF) ends any WCE streak. release()
-            // is idempotent and is a no-op if no streak was active.
-            retryState.streakGuard.release();
             retryState.writeConflictsInARow = 0;
             retryState.tempUnavailErrorsInARow = 0;
         }

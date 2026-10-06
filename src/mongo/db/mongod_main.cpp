@@ -61,6 +61,7 @@
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/logical_session_cache_factory_mongod.h"
 #include "mongo/db/logical_time_validator.h"
+#include "mongo/db/memory_tracking/query_memory_load_shedding.h"
 #include "mongo/db/mirror_maestro.h"
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/mongod_options_general_gen.h"
@@ -82,6 +83,7 @@
 #include "mongo/db/pipeline/process_interface/replica_set_node_process_interface.h"
 #include "mongo/db/profile_filter_impl.h"
 #include "mongo/db/query/client_cursor/clientcursor.h"
+#include "mongo/db/query/client_cursor/cursor_manager.h"
 #include "mongo/db/query/compiler/stats/stats_cache_loader_impl.h"
 #include "mongo/db/query/compiler/stats/stats_catalog.h"
 #include "mongo/db/query/query_execution_knobs_gen.h"
@@ -586,6 +588,12 @@ ExitCode _initAndListen(ServiceContext* serviceContext) {
     StorageControl::startStorageControls(
         serviceContext, false, rss.getPersistenceProvider().makeCheckpointSchedulePolicy());
 
+    // Start the RSS pressure sampler here because: (1) its only dependency, the PeriodicRunner, is
+    // now set up; (2) it precedes accepting connections, so it is live (and primed) before any
+    // sheddable query; and (3) storage is up, so the first sample reflects the real allocated
+    // footprint. A no-op if RSS monitoring is disabled.
+    startQueryMemoryRssMonitor(serviceContext);
+
     auto logStartupStats = std::make_unique<ScopeGuard<std::function<void()>>>([&] {
         initAndListenTotalTimer = {};
         startupInfoBuilder.append("Startup from clean shutdown?",
@@ -630,6 +638,13 @@ ExitCode _initAndListen(ServiceContext* serviceContext) {
         LOGV2_ERROR(20534,
                     "Running the selected storage engine with profiling is not supported",
                     "storageEngine"_attr = storageGlobalParams.engine);
+        exitCleanly(ExitCode::badOptions);
+    }
+    if (!rss.getPersistenceProvider().supportsProfilingLevel(serverGlobalParams.defaultProfile)) {
+        LOGV2_ERROR(13170500,
+                    "Profile level is not supported in this storage mode",
+                    "profilingLevel"_attr = serverGlobalParams.defaultProfile,
+                    "storageMode"_attr = rss.getPersistenceProvider().name());
         exitCleanly(ExitCode::badOptions);
     }
 
@@ -678,7 +693,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext) {
         exitCleanly(ExitCode::fail);
     }
 
-    if (storageGlobalParams.validate || storageGlobalParams.validateParallel) {
+    if (storageGlobalParams.validate) {
         LOGV2(9437302, "Finished validating collections");
         exitCleanly(ExitCode::clean);
     }
@@ -1707,6 +1722,13 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         LOGV2_OPTIONS(
             4784905, {LogComponent::kNetwork}, "Shutting down the global connection pool");
         globalConnPool.shutdown();
+    }
+
+    if (auto cursorManager = CursorManager::get(serviceContext)) {
+        SectionScopedTimer scopedTimer(serviceContext->getFastClockSource(),
+                                       TimedSectionId::disposeIdleMongotCursors,
+                                       &shutdownTimeElapsedBuilder);
+        cursorManager->disposeIdleMongotCursorsForShutdown(opCtx);
     }
 
     {

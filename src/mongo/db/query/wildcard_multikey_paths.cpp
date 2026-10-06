@@ -1,14 +1,8 @@
 // Copyright (c) MongoDB, Inc.
 // SPDX-License-Identifier: SSPL-1.0
 
-#include <cstddef>
-#include <iterator>
-#include <memory>
-#include <string_view>
-#include <utility>
+#include "mongo/db/query/wildcard_multikey_paths.h"
 
-#include <boost/container/small_vector.hpp>
-// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
 #include "mongo/base/checked_cast.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
@@ -26,7 +20,6 @@
 #include "mongo/db/query/compiler/optimizer/index_bounds_builder/index_bounds_builder.h"
 #include "mongo/db/query/compiler/physical_model/index_bounds/index_bounds.h"
 #include "mongo/db/query/compiler/physical_model/interval/interval.h"
-#include "mongo/db/query/wildcard_multikey_paths.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/record_id_helpers.h"
 #include "mongo/db/service_context.h"
@@ -42,7 +35,15 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
+#include <cstddef>
+#include <iterator>
+#include <memory>
+#include <string_view>
+#include <utility>
+
+#include <boost/container/small_vector.hpp>
 #include <boost/none.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
 
 /**
  * A wildcard index contains an unbounded set of multikey paths, therefore, it was decided to store
@@ -129,40 +130,48 @@ static void scanWildcardMetadataKeys(OperationContext* opCtx,
     auto cursor = wam->newCursor(opCtx, ru);
 
     constexpr int kForward = 1;
+    const auto* sortedDataInterface = wam->getSortedDataInterface();
     IndexBoundsChecker checker(&indexBounds, keyPattern, kForward);
     IndexSeekPoint seekPoint;
     if (!checker.getStartSeekPoint(&seekPoint)) {
         return;
     }
 
-    key_string::Builder builder(wam->getSortedDataInterface()->getKeyStringVersion(),
-                                wam->getSortedDataInterface()->getOrdering());
+    key_string::Builder builder(sortedDataInterface->getKeyStringVersion(),
+                                sortedDataInterface->getOrdering());
 
-    auto entry = cursor->seek(
+    auto view = cursor->seekForKeyValueView(
         ru, IndexEntryComparison::makeKeyStringFromSeekPointForSeek(seekPoint, kForward, builder));
 
     ++stats->numSeeks;
-    while (entry) {
+    while (!view.isEmpty()) {
         ++stats->keysExamined;
 
-        switch (checker.checkKey(entry->key, &seekPoint)) {
+        BSONObj dehydratedKey = key_string::toBson(view.getKeyStringWithoutRecordIdView(),
+                                                   sortedDataInterface->getOrdering(),
+                                                   view.getTypeBitsView(),
+                                                   view.getVersion());
+
+        switch (checker.checkKey(dehydratedKey, &seekPoint)) {
             case IndexBoundsChecker::VALID:
-                multikeyPaths->emplace(extractMultikeyPathFromIndexKey(*entry));
-                entry = cursor->next(ru);
+                multikeyPaths->emplace(extractMultikeyPathFromIndexKey(
+                    {.key = dehydratedKey, .loc = *view.getRecordId()}));
+                view = cursor->nextKeyValueView(ru);
                 break;
 
             case IndexBoundsChecker::MUST_ADVANCE: {
                 ++stats->numSeeks;
-                key_string::Builder builder(wam->getSortedDataInterface()->getKeyStringVersion(),
-                                            wam->getSortedDataInterface()->getOrdering());
-                entry = cursor->seek(ru,
-                                     IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
-                                         seekPoint, kForward, builder));
+                key_string::Builder builder(sortedDataInterface->getKeyStringVersion(),
+                                            sortedDataInterface->getOrdering());
+                view = cursor->seekForKeyValueView(
+                    ru,
+                    IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+                        seekPoint, kForward, builder));
                 break;
             }
 
             case IndexBoundsChecker::DONE:
-                entry = boost::none;
+                view.reset();
                 break;
 
             default:
